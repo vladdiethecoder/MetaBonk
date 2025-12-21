@@ -1,0 +1,50 @@
+# MetaBonk Apex Dependencies
+# Core ML Stack
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+
+# Gymnasium RL
+gymnasium>=0.29.0
+
+# HTTP/API
+fastapi>=0.100.0
+uvicorn>=0.23.0
+httpx>=0.24.0
+websockets>=11.0
+
+# Data/Schemas
+pydantic>=2.0.0
+pyyaml>=6.0.0
+
+# Vision
+ultralytics>=8.0.0  # YOLO
+Pillow>=10.0.0
+
+# AV-RL / CLIP (optional, for real visual anomaly rewards)
+# open_clip_torch>=2.24.0
+# transformers>=4.45.0
+
+# VLM Support (optional - for UI navigation)
+ollama>=0.1.0  # Local LLM/VLM
+
+# Apex Protocol (optional - DreamerV3/JAX migration)
+# jax>=0.4.30
+# jaxlib>=0.4.30
+# flax>=0.8.0
+# optax>=0.2.0
+
+# Probabilistic Programming (Active Inference)
+# pymdp  # Install separately: pip install inferactively-pymdp
+
+# Async
+aiofiles>=23.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.65.0
+rich>=13.0.0
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

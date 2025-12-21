@@ -1,0 +1,44 @@
+{
+  "events": {
+    "EpisodeEnd": [
+      "biome",
+      "end_reason",
+      "stage"
+    ],
+    "Eureka": [],
+    "Heal": [
+      "item_name"
+    ],
+    "LootDrop": [
+      "chest_rarity",
+      "item_name",
+      "rarity",
+      "source"
+    ],
+    "NewBestRunClip": [],
+    "NewMaxHit": [],
+    "Overcrit": [],
+    "Telemetry": [
+      "biome",
+      "boss_visible",
+      "charge_is_max",
+      "stage"
+    ]
+  },
+  "payload_keys_any": [
+    "clearing_dps",
+    "duration_s",
+    "episode_t",
+    "final_reward",
+    "health_ratio",
+    "incoming_dps",
+    "max_hit",
+    "overcrit_tier",
+    "score"
+  ],
+  "counters": [],
+  "notes": [
+    "Generated from configs/feats.megabonk.json using feats.extract_requirements.",
+    "Event payload keys listed are required for feat predicates; values should match expected enums."
+  ]
+}

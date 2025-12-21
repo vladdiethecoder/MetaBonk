@@ -1,0 +1,33 @@
+# Ultralytics YOLO dataset definition for MegaBonk.
+#
+# Update `path`, `train`, and `val` to point at your labeled dataset.
+#
+# Class order MUST match `src/worker/perception.py`.
+
+path: /abs/path/to/megabonk_dataset
+train: images/train
+val: images/val
+
+names:
+  0: btn_confirm
+  1: btn_action
+  2: btn_negative
+  3: card_offer
+  4: slot_char
+  5: prompt_interact
+  6: icon_shrine
+  7: icon_chest
+  8: icon_boss
+  9: obj_shrine
+  10: obj_chest
+  11: obj_merchant
+  12: portal
+  13: char_tile
+  14: lock_icon
+  15: panel_info
+  16: map_card
+  17: tier_checkbox
+  18: btn_challenges
+  19: minimap_icon_green
+  20: minimap_icon_yellow
+  21: minimap_icon_red

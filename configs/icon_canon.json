@@ -1,0 +1,714 @@
+{
+  "icons": [
+    {
+      "index": 0,
+      "key": "borgar",
+      "label": "Borgar",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 1,
+      "key": "big_bonk",
+      "label": "Big Bonk",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 2,
+      "key": "tome_agility",
+      "label": "Tome: Agility",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 3,
+      "key": "tome_damage",
+      "label": "Tome: Damage",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 4,
+      "key": "tome_cooldown",
+      "label": "Tome: Cooldown",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 5,
+      "key": "tome_gold",
+      "label": "Tome: Gold",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 6,
+      "key": "tome_xp",
+      "label": "Tome: XP",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 7,
+      "key": "tome_luck",
+      "label": "Tome: Luck",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 8,
+      "key": "tome_duration",
+      "label": "Tome: Duration",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 9,
+      "key": "tome_evasion",
+      "label": "Tome: Evasion",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 10,
+      "key": "tome_regen",
+      "label": "Tome: Regen",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 11,
+      "key": "tome_shield",
+      "label": "Tome: Shield",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 12,
+      "key": "tome_cursed",
+      "label": "Tome: Cursed",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 13,
+      "key": "tome_random",
+      "label": "Tome: Random",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 14,
+      "key": "tome_mastery",
+      "label": "Tome: Mastery",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 15,
+      "key": "charge_shrine",
+      "label": "Charge Shrine",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 16,
+      "key": "beacon_zone",
+      "label": "Beacon Zone",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 17,
+      "key": "loot_chest",
+      "label": "Loot Chest",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 18,
+      "key": "loot_goblin",
+      "label": "Loot Goblin",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 19,
+      "key": "rarity_star",
+      "label": "Rarity Star",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 20,
+      "key": "currency_coins",
+      "label": "Coins",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 21,
+      "key": "bonk_bucks",
+      "label": "Bonk Bucks",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 22,
+      "key": "projectiles",
+      "label": "Projectiles",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 23,
+      "key": "aoe",
+      "label": "Area of Effect",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 24,
+      "key": "crit",
+      "label": "Critical",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 25,
+      "key": "overcrit",
+      "label": "Overcrit",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 26,
+      "key": "bloodmark",
+      "label": "Bloodmark",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 27,
+      "key": "poison",
+      "label": "Poison",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 28,
+      "key": "burn",
+      "label": "Burn",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 29,
+      "key": "freeze",
+      "label": "Freeze",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 30,
+      "key": "shock",
+      "label": "Shock",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 31,
+      "key": "stun_knockback",
+      "label": "Stun/Knockback",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 32,
+      "key": "boss",
+      "label": "Boss",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 33,
+      "key": "elite",
+      "label": "Elite",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 34,
+      "key": "swarm",
+      "label": "Swarm",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 35,
+      "key": "danger",
+      "label": "Danger",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 36,
+      "key": "health",
+      "label": "Health",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 37,
+      "key": "heartbreak",
+      "label": "Death",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 38,
+      "key": "speed",
+      "label": "Speed",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 39,
+      "key": "dps",
+      "label": "DPS",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 40,
+      "key": "score",
+      "label": "Score",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 41,
+      "key": "level",
+      "label": "Level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 42,
+      "key": "time",
+      "label": "Time",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 43,
+      "key": "record_wr",
+      "label": "World Record",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 44,
+      "key": "rank_up",
+      "label": "Rank Up",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 45,
+      "key": "rank_down",
+      "label": "Rank Down",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 46,
+      "key": "focus",
+      "label": "Focus",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 47,
+      "key": "replay",
+      "label": "Replay",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 48,
+      "key": "moment",
+      "label": "Moment",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 49,
+      "key": "hall_of_fame",
+      "label": "Hall of Fame",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 50,
+      "key": "wall_of_shame",
+      "label": "Wall of Shame",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 51,
+      "key": "hype",
+      "label": "Hype",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 52,
+      "key": "shame",
+      "label": "Shame",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 53,
+      "key": "policy",
+      "label": "Policy",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 54,
+      "key": "mutation",
+      "label": "Mutation",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 55,
+      "key": "planning",
+      "label": "Planning",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 56,
+      "key": "training",
+      "label": "Training",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 57,
+      "key": "no_gpu_feed",
+      "label": "No GPU Feed",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 58,
+      "key": "menu_stuck",
+      "label": "Menu Stuck",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 59,
+      "key": "warning",
+      "label": "Warning",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 60,
+      "key": "info",
+      "label": "Info",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 61,
+      "key": "settings",
+      "label": "Settings",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 62,
+      "key": "refresh",
+      "label": "Refresh",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "index": 63,
+      "key": "unknown",
+      "label": "Unknown",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    }
+  ],
+  "variants": [
+    "normal",
+    "active",
+    "alert",
+    "disabled"
+  ]
+}

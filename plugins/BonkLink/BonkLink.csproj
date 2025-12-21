@@ -1,0 +1,79 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>BonkLink</AssemblyName>
+    <RootNamespace>BonkLink</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <OutputType>Library</OutputType>
+    <!--
+      Build requires game/BepInEx references.
+
+      Override these on the command line, e.g.
+        dotnet build -c Release \
+          /p:BepInExCoreDir=".../BepInEx/core" \
+          /p:UnityManagedDir=".../Megabonk_Data/Managed"
+    -->
+    <!-- Repo-local fallback (useful for CI / development). -->
+    <BepInExCoreDir Condition="'$(BepInExCoreDir)'=='' and Exists('$(MSBuildProjectDirectory)/bin/Release/net6.0/BepInEx.Core.dll')">$(MSBuildProjectDirectory)/bin/Release/net6.0</BepInExCoreDir>
+    <!-- Optional: set to your game's *_Data/Managed folder to compile against real UnityEngine modules. -->
+    <UnityManagedDir Condition="'$(UnityManagedDir)'=='' and Exists('$(MSBuildProjectDirectory)/bin/Release/net6.0/UnityEngine.CoreModule.dll')">$(MSBuildProjectDirectory)/bin/Release/net6.0</UnityManagedDir>
+  </PropertyGroup>
+
+  <Target Name="ValidateBonkLinkRefs" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(BepInExCoreDir)/BepInEx.Core.dll')"
+           Text="Missing BepInEx references. Build with /p:BepInExCoreDir=&quot;.../BepInEx/core&quot; (or run python scripts/update_plugins.py --game-dir &quot;.../Megabonk&quot;)." />
+    <Error Condition="!Exists('$(BepInExCoreDir)/BepInEx.Unity.IL2CPP.dll')"
+           Text="Missing BepInEx.Unity.IL2CPP.dll in $(BepInExCoreDir)." />
+    <Error Condition="!Exists('$(BepInExCoreDir)/Il2CppInterop.Runtime.dll')"
+           Text="Missing Il2CppInterop.Runtime.dll in $(BepInExCoreDir)." />
+  </Target>
+
+  <ItemGroup>
+    <!-- BepInEx 6 IL2CPP core references -->
+    <Reference Include="BepInEx.Core">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Unity.IL2CPP.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Common">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Unity.Common.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInExCoreDir)/0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(BepInExCoreDir)/Il2CppInterop.Runtime.dll</HintPath>
+    </Reference>
+
+    <!-- IL2CPP interop base class library (only present when using BepInEx/interop as UnityManagedDir) -->
+    <Reference Include="Il2Cppmscorlib" Condition="Exists('$(UnityManagedDir)/Il2Cppmscorlib.dll')">
+      <HintPath>$(UnityManagedDir)/Il2Cppmscorlib.dll</HintPath>
+    </Reference>
+
+    <!-- UnityEngine module references (IL2CPP games still ship these in *_Data/Managed) -->
+    <Reference Include="UnityEngine.CoreModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.CoreModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.ImageConversionModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.ImageConversionModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.ScreenCaptureModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.ScreenCaptureModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.InputLegacyModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.InputModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.InputModule.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <!-- If compiling against real UnityEngine modules, exclude stubs to avoid type conflicts. -->
+  <ItemGroup Condition="Exists('$(UnityManagedDir)/UnityEngine.CoreModule.dll')">
+    <Compile Remove="UnityStubs.cs" />
+  </ItemGroup>
+
+</Project>

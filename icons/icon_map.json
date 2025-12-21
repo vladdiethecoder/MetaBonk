@@ -1,0 +1,787 @@
+{
+  "sheet": {
+    "cols": 8,
+    "rows": 8,
+    "order": "row-major",
+    "index_range": [
+      0,
+      63
+    ]
+  },
+  "icons": [
+    {
+      "i": 0,
+      "key": "borgar",
+      "label": "Borgar (healing burger drop)",
+      "hud": "badge/count: burgers spawned or picked up",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 1,
+      "key": "big_bonk",
+      "label": "Big Bonk proc (20\u00d7 hit)",
+      "hud": "badge/count: procs this run",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 2,
+      "key": "tome_agility",
+      "label": "Agility Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 3,
+      "key": "tome_damage",
+      "label": "Damage Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 4,
+      "key": "tome_cooldown",
+      "label": "Cooldown Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 5,
+      "key": "tome_gold",
+      "label": "Gold Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 6,
+      "key": "tome_xp",
+      "label": "XP Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 7,
+      "key": "tome_luck",
+      "label": "Luck Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 8,
+      "key": "tome_duration",
+      "label": "Duration Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 9,
+      "key": "tome_evasion",
+      "label": "Evasion Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 10,
+      "key": "tome_regen",
+      "label": "Regen/Healing Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 11,
+      "key": "tome_shield",
+      "label": "Shield/Armor Tome",
+      "hud": "pill: tome level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 12,
+      "key": "tome_cursed",
+      "label": "Cursed Tome",
+      "hud": "flag: curse/difficulty-up enabled",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 13,
+      "key": "tome_random",
+      "label": "Random Tome",
+      "hud": "flag: random boost active",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 14,
+      "key": "tome_mastery",
+      "label": "Tome Mastery (total tome levels)",
+      "hud": "pill: sum of tome levels",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 15,
+      "key": "charge_shrine",
+      "label": "Charge Shrine / Interactable",
+      "hud": "flag: shrine active / progress",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 16,
+      "key": "beacon_zone",
+      "label": "Healing Zone / Beacon effect",
+      "hud": "flag: heal-zone active",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 17,
+      "key": "loot_chest",
+      "label": "Chest / Loot drop",
+      "hud": "badge/count: opened",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 18,
+      "key": "loot_goblin",
+      "label": "Loot Goblin / Runner event",
+      "hud": "flag: present / target",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 19,
+      "key": "rarity_star",
+      "label": "Rarity / Quality",
+      "hud": "pill: rarity tier",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 20,
+      "key": "currency_coins",
+      "label": "Coins / Gold pickup",
+      "hud": "pill: current coins",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 21,
+      "key": "bonk_bucks",
+      "label": "Bonk Bucks (stream economy)",
+      "hud": "pill: balance / pool",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 22,
+      "key": "projectiles",
+      "label": "Projectile Count / Multi-shot",
+      "hud": "pill: modifier",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 23,
+      "key": "aoe",
+      "label": "AoE / Splash radius",
+      "hud": "pill: modifier",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 24,
+      "key": "crit",
+      "label": "Crit (rate or multiplier)",
+      "hud": "pill: crit% or crit\u00d7",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 25,
+      "key": "overcrit",
+      "label": "Overcrit / Spike event",
+      "hud": "badge/count: overcrits",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 26,
+      "key": "bloodmark",
+      "label": "Bloodmark / Lifesteal",
+      "hud": "pill: % or stacks",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 27,
+      "key": "poison",
+      "label": "Poison / DoT",
+      "hud": "pill: stacks/chance",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 28,
+      "key": "burn",
+      "label": "Burn / Ignite",
+      "hud": "pill: stacks/chance",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 29,
+      "key": "freeze",
+      "label": "Freeze / Chill",
+      "hud": "flag: chilled/frozen",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 30,
+      "key": "shock",
+      "label": "Shock / Lightning",
+      "hud": "flag: shocked/energized",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 31,
+      "key": "stun_knockback",
+      "label": "Stun / Knockback",
+      "hud": "flag: CC-heavy build",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 32,
+      "key": "boss",
+      "label": "Boss present",
+      "hud": "flag: boss fight",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 33,
+      "key": "elite",
+      "label": "Elite present",
+      "hud": "flag: elite on screen",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 34,
+      "key": "swarm",
+      "label": "Swarm / Wave density",
+      "hud": "pill: intensity",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 35,
+      "key": "danger",
+      "label": "Danger meter",
+      "hud": "pill: danger% / risk",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 36,
+      "key": "health",
+      "label": "HP / Survivability",
+      "hud": "pill: current HP or %",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 37,
+      "key": "heartbreak",
+      "label": "Death / Downed",
+      "hud": "event: run ended / KO",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 38,
+      "key": "speed",
+      "label": "Move speed / Pace",
+      "hud": "pill: speed or pace \u0394",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 39,
+      "key": "dps",
+      "label": "DPS / Output",
+      "hud": "pill: DPS",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 40,
+      "key": "score",
+      "label": "Score",
+      "hud": "pill: score",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 41,
+      "key": "level",
+      "label": "Level",
+      "hud": "pill: level",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 42,
+      "key": "time",
+      "label": "Run timer",
+      "hud": "pill: mm:ss",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 43,
+      "key": "record_wr",
+      "label": "WR / PB pace line",
+      "hud": "flag: ahead/behind",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 44,
+      "key": "rank_up",
+      "label": "Rank up / Overtake",
+      "hud": "event: gained rank",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 45,
+      "key": "rank_down",
+      "label": "Rank down / Overtaken",
+      "hud": "event: lost rank",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 46,
+      "key": "focus",
+      "label": "Focus camera",
+      "hud": "state: featured tile",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 47,
+      "key": "replay",
+      "label": "Replay available",
+      "hud": "button/state: show replay",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 48,
+      "key": "moment",
+      "label": "Moment captured",
+      "hud": "event: highlight card",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 49,
+      "key": "hall_of_fame",
+      "label": "Hall of Fame",
+      "hud": "panel: best runs",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 50,
+      "key": "wall_of_shame",
+      "label": "Wall of Shame",
+      "hud": "panel: worst runs",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 51,
+      "key": "hype",
+      "label": "Hype state",
+      "hud": "flag: hype# / momentum",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 52,
+      "key": "shame",
+      "label": "Shame state",
+      "hud": "flag: shame# / penalty",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 53,
+      "key": "policy",
+      "label": "Policy/Brain (PPO)",
+      "hud": "tag: policy name/id",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 54,
+      "key": "mutation",
+      "label": "PBT Mutation / Evolution",
+      "hud": "event: new genome/weights",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 55,
+      "key": "planning",
+      "label": "Planner (MCTS/Deliberation)",
+      "hud": "flag: deliberative mode",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 56,
+      "key": "training",
+      "label": "Training update / Step",
+      "hud": "pill: steps or upd/s",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 57,
+      "key": "no_gpu_feed",
+      "label": "No GPU feed",
+      "hud": "state: feed offline",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 58,
+      "key": "menu_stuck",
+      "label": "Menu stuck",
+      "hud": "state: recovery needed",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 59,
+      "key": "warning",
+      "label": "Warning / Alert",
+      "hud": "event: alert",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 60,
+      "key": "info",
+      "label": "Info / Legend",
+      "hud": "tooltip/legend",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 61,
+      "key": "settings",
+      "label": "Settings",
+      "hud": "panel button",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 62,
+      "key": "refresh",
+      "label": "Refresh / Reroll",
+      "hud": "button: refresh/reroll",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    },
+    {
+      "i": 63,
+      "key": "unknown",
+      "label": "Unknown / Placeholder",
+      "hud": "fallback",
+      "variants": [
+        "normal",
+        "active",
+        "alert",
+        "disabled"
+      ]
+    }
+  ],
+  "variants": [
+    "normal",
+    "active",
+    "alert",
+    "disabled"
+  ]
+}

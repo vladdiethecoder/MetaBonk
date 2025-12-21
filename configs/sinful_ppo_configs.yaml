@@ -1,0 +1,129 @@
+# SinZero PPO hyperparameter presets.
+#
+# These presets are authored to match the "Seven Deadly Sins" personalities.
+# The learner/orchestrator load this file to seed default hparams and bias knobs.
+#
+# Keys largely follow CleanRL/SB3 PPO naming:
+#   learning_rate, num_steps, minibatch_size, gamma, gae_lambda, clip_coef,
+#   ent_coef, vf_coef, max_grad_norm, target_kl
+#
+# Additional blocks (reward_shaping, aux_loss, risk_distortion) are consumed by
+# environment / SinZero logic when available.
+
+defaults: &defaults
+  algo: "PPO"
+  total_timesteps: 10000000
+  learning_rate: 3.0e-4
+  num_steps: 256
+  minibatch_size: 64
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  clip_vloss: true
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: null
+
+  reward_shaping:
+    time_penalty: 0.0
+    velocity_penalty: 0.0
+    curiosity_beta: 0.0
+    imitation_beta: 0.0
+    risk_sensitive: false
+
+  risk_distortion: "neutral"   # neutral, cvar_bottom_X, cvar_top_X, optimistic
+
+
+greed:
+  <<: *defaults
+  learning_rate: 3.5e-4
+  gamma: 0.995
+  ent_coef: 0.002
+  vf_coef: 0.7
+  reward_shaping:
+    gold_multiplier: 2.0
+    time_penalty: 0.1
+  risk_distortion: "neutral"
+
+
+wrath:
+  <<: *defaults
+  learning_rate: 6.0e-4
+  clip_coef: 0.3
+  ent_coef: 0.04
+  max_grad_norm: 1.0
+  reward_shaping:
+    damage_dealt_mult: 2.0
+    proximity_bonus: 0.5
+  risk_distortion: "optimistic"
+
+
+gluttony:
+  <<: *defaults
+  learning_rate: 3.0e-4
+  gamma: 0.98
+  ent_coef: 0.03
+  reward_shaping:
+    curiosity_beta: 0.25
+    visit_count_bonus: true
+  aux_loss:
+    representation_weight: 1.0
+
+
+lust:
+  <<: *defaults
+  ent_coef: 0.02
+  gamma: 0.99
+  reward_shaping:
+    combo_multiplier: 1.5
+    style_points: true
+  risk_distortion: "cvar_top_20"
+
+
+pride:
+  <<: *defaults
+  learning_rate: 1.5e-4
+  clip_coef: 0.1
+  ent_coef: 0.001
+  vf_coef: 1.0
+  target_kl: 0.01
+  reward_shaping:
+    consistency_bonus: true
+  risk_distortion: "neutral"
+
+
+envy:
+  <<: *defaults
+  learning_rate: 3.0e-4
+  ent_coef: 0.015
+  reward_shaping:
+    imitation_beta: 0.5
+    copy_best_action: true
+  risk_distortion: "neutral"
+
+
+sloth:
+  <<: *defaults
+  learning_rate: 2.5e-4
+  num_epochs: 2
+  gamma: 0.995
+  gae_lambda: 0.98
+  ent_coef: 0.005
+  reward_shaping:
+    velocity_penalty: 0.05
+    action_cost: 0.01
+    efficiency_bonus: true
+  aux_loss:
+    value_stability: 0.1
+
+
+generalist:
+  <<: *defaults
+  learning_rate: 4.0e-4
+  ent_coef: 0.05
+  architecture:
+    type: "mixture_of_experts"
+    num_experts: 7
+    gating_mechanism: "soft_router"
+

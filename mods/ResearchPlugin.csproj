@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>IL2CPP</DefineConstants>
+    <AssemblyName>ResearchPlugin</AssemblyName>
+    <RootNamespace>MegabonkResearch</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <!-- Pass -p:MEGABONK_DIR=/path/to/MegaBonk at build time -->
+  <PropertyGroup>
+    <MEGABONK_DIR Condition="'$(MEGABONK_DIR)'==''">$(MSBuildThisFileDirectory)..</MEGABONK_DIR>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="ResearchPluginIL2CPP.cs" />
+    <Compile Include="ResearchPlugin.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- BepInEx / Harmony -->
+    <Reference Include="BepInEx.Core">
+      <HintPath>$(MEGABONK_DIR)/BepInEx/core/BepInEx.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP">
+      <HintPath>$(MEGABONK_DIR)/BepInEx/core/BepInEx.Unity.IL2CPP.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(MEGABONK_DIR)/BepInEx/core/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- UnityEngine managed assemblies (for compile-time API) -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.RenderingModule">
+      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.RenderingModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
+

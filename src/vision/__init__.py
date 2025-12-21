@@ -1,0 +1,2 @@
+"""Vision service package (YOLO)."""
+

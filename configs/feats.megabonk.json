@@ -1,0 +1,2425 @@
+[
+  {
+    "id": "goal.m01",
+    "name": "Break a pot and collect the drop",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "pot"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m02",
+    "name": "Break a silver pot",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "silver_pot"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m03",
+    "name": "First XP shard level-up",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "item_name": "xp_shard"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m04",
+    "name": "Reach a small gold threshold",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            10
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m05",
+    "name": "Bank silver coins",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "rarity": "silver"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m06",
+    "name": "Open first paid chest",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "paid_chest"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m07",
+    "name": "Open a free gold chest",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "free_chest",
+          "chest_rarity": "gold"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m08",
+    "name": "Stop paid chests when price spikes",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "chest_rarity": "spike"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m09",
+    "name": "Capture a Sanctuary/Altar",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "altar"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m10",
+    "name": "Capture a Golden Altar",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "golden_altar"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m11",
+    "name": "Activate a Moai statue",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "moai"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m12",
+    "name": "Use a Moai reroll",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "moai_reroll"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m13",
+    "name": "Complete a Trial (Swords)",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "trial_swords"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m14",
+    "name": "Trigger a Magnet shrine",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "magnet_shrine"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m15",
+    "name": "Use a dropped buff well",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "Heal",
+        {
+          "item_name": "buff_well"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m16",
+    "name": "Buy from a vendor",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "vendor"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m17",
+    "name": "Buy from yellow-hat vendor",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "vendor_yellow"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m18",
+    "name": "Use Shady Guy exchange",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "shady_exchange"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m19",
+    "name": "Finish a Charge Shrine",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "Telemetry",
+        {
+          "charge_is_max": true
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m20",
+    "name": "Activate Greed Sanctuary",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "greed_sanctuary"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m21",
+    "name": "Activate Boss Curse statue",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "boss_curse"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m22",
+    "name": "Kill an elite cleanly",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Overcrit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "overcrit_tier",
+            1
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m23",
+    "name": "Kill a gold skeleton",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "rarity": "gold"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m24",
+    "name": "Kill a silver skeleton",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "rarity": "silver"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m25",
+    "name": "Pick a build-correct upgrade",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "Eureka",
+        {}
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m26",
+    "name": "Level a weapon once",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "NewMaxHit",
+        {}
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m27",
+    "name": "Weapon to level 5",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            250
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m28",
+    "name": "Weapon to level 10",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            500
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m29",
+    "name": "Tome to level 5",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Overcrit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "overcrit_tier",
+            1
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m30",
+    "name": "Stack enough speed to kite",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "payload_gte": [
+        "clearing_dps",
+        30
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m31",
+    "name": "30s circle-kite vs boss",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "boss_visible": true
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            30
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m32",
+    "name": "Dodge spike-line telegraph",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "payload_gte": [
+        "health_ratio",
+        0.8
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m33",
+    "name": "Bait a tracking attack",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "payload_gte": [
+        "incoming_dps",
+        10
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m34",
+    "name": "Survive knockback chaos",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "duration_s",
+            60
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m35",
+    "name": "Defeat a stage boss",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m36",
+    "name": "Activate boss portal on F1-2",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "stage": 1
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m37",
+    "name": "Kill the 7:00 boss",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "boss_visible": true
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            420
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m38",
+    "name": "Kill the 2:00 boss",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "boss_visible": true
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            120
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m39",
+    "name": "Survive Floor 1 timer",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "stage": 1
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            600
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m40",
+    "name": "Survive Floor 2 timer",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "stage": 2
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            540
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m41",
+    "name": "Survive Floor 3 timer",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "stage": 3
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            480
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m42",
+    "name": "Vacuum XP after boss",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "boss_xp"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m43",
+    "name": "Open a cage with a golden key",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "gold_key_cage"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m44",
+    "name": "Trigger Suspicious Bush and live",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "suspicious_bush"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m45",
+    "name": "Trigger Boss Generator and live",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "boss_generator"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m46",
+    "name": "Use desert tornado safely",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "Telemetry",
+        {
+          "biome": "desert"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m47",
+    "name": "Kill while airborne",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "Overcrit",
+        {}
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m48",
+    "name": "Clone an item with Microwave",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "microwave_clone"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m49",
+    "name": "No-hit loop of interactables",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "payload_gte": [
+            "health_ratio",
+            0.9
+          ]
+        },
+        {
+          "event_happened": [
+            "LootDrop",
+            {
+              "source": "altar"
+            }
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.m50",
+    "name": "End run via portal",
+    "tier": "minor",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "portal"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 12,
+      "post_s": 6,
+      "speed": 3.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M01",
+    "name": "Defeat Lil Bark",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 1,
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M02",
+    "name": "Clear Forest T2 Stage 1",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 1,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M03",
+    "name": "Clear Forest T2 Stage 2",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 2,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M04",
+    "name": "Complete Forest Tier 3 run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 3,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M05",
+    "name": "Defeat Bark Vader",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 3,
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M06",
+    "name": "Bark Vader with weapon disable",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Overcrit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "overcrit_tier",
+            2
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M07",
+    "name": "Bark Vader pylon phases",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            1500
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M08",
+    "name": "Win with Boss Curse active",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "LootDrop",
+          {
+            "source": "boss_curse"
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "clear"
+          }
+        ],
+        3600
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M09",
+    "name": "Unlock Desert via CL4NK",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 2,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M10",
+    "name": "Unlock Revolver",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            200
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M11",
+    "name": "Defeat Anubis",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "desert",
+          "stage": 1,
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M12",
+    "name": "Unlock Desert Tier 2",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "desert",
+          "stage": 1,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M13",
+    "name": "Unlock Desert Tier 3",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "desert",
+          "stage": 2,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M14",
+    "name": "Clear Desert Tier 3 run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "desert",
+          "stage": 3,
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M15",
+    "name": "Defeat hidden boss Bush",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "forest",
+          "stage": 2,
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M16",
+    "name": "Defeat hidden boss Bandit",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "biome": "desert",
+          "stage": 2,
+          "end_reason": "boss"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M17",
+    "name": "Defeat all 6 bosses",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewBestRunClip",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "score",
+            300
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M18",
+    "name": "Unlock XP Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "pot"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M19",
+    "name": "Unlock Cursed Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "Telemetry",
+          {
+            "boss_visible": true
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "boss"
+          }
+        ],
+        300
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M20",
+    "name": "Unlock Chaos Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "Telemetry",
+          {
+            "charge_is_max": true
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "clear"
+          }
+        ],
+        3600
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M21",
+    "name": "Unlock Attraction Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "succ_shrine"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M22",
+    "name": "Unlock Armor Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            250
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M23",
+    "name": "Unlock Bloody Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            400
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M24",
+    "name": "Unlock Duration Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            600
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M25",
+    "name": "Unlock Thorns Tome",
+    "tier": "major",
+    "scope": "lifetime",
+    "predicate": {
+      "payload_gte": [
+        "incoming_dps",
+        50
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once"
+  },
+  {
+    "id": "goal.M26",
+    "name": "Unlock Quantity Tome",
+    "tier": "major",
+    "scope": "lifetime",
+    "predicate": {
+      "payload_gte": [
+        "clearing_dps",
+        100
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once"
+  },
+  {
+    "id": "goal.M27",
+    "name": "Obtain Luck Tome",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "rarity": "legendary",
+          "item_name": "luck_tome"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M28",
+    "name": "Reach tome level 99",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Overcrit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "overcrit_tier",
+            3
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M29",
+    "name": "Reach weapon level 40",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            2000
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M30",
+    "name": "Beat final boss under 10 min",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "Telemetry",
+          {
+            "boss_visible": true
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "boss"
+          }
+        ],
+        600
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M31",
+    "name": "Unlock Boss Buster",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "Telemetry",
+          {
+            "boss_visible": true
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "boss"
+          }
+        ],
+        30
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M32",
+    "name": "Unlock Bob (Dead)",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Telemetry",
+            {
+              "boss_visible": true
+            }
+          ]
+        },
+        {
+          "payload_gte": [
+            "episode_t",
+            120
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M33",
+    "name": "Unlock Chonkplate",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            500
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M34",
+    "name": "Unlock Bloody Cleaver",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            500
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M35",
+    "name": "Unlock Cursed Doll",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "death"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M36",
+    "name": "Unlock Echo Shard",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "item_name": "xp_tome"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M37",
+    "name": "Unlock Eagle Claw",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "EpisodeEnd",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "final_reward",
+            600
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M38",
+    "name": "Unlock Dragonfire",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "Overcrit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "overcrit_tier",
+            2
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M39",
+    "name": "Unlock Brass Knuckles",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewMaxHit",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "max_hit",
+            800
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M40",
+    "name": "Unlock +2 stat roll reward",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_then_within": [
+        [
+          "LootDrop",
+          {
+            "source": "trial_swords"
+          }
+        ],
+        [
+          "EpisodeEnd",
+          {
+            "end_reason": "clear"
+          }
+        ],
+        3600
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M41",
+    "name": "Activate all radios",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "radio"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M42",
+    "name": "Execute Microwave clone build",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "source": "microwave_clone"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M43",
+    "name": "Build a chest economy route",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "LootDrop",
+        {
+          "chest_rarity": "spike"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M44",
+    "name": "Win an Aura-centered run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "clear",
+          "biome": "forest"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M45",
+    "name": "Win a Dice-centered run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "clear",
+          "biome": "forest"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M46",
+    "name": "Win an Aegis-centered run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "clear",
+          "biome": "forest"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M47",
+    "name": "Win a Katana run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M48",
+    "name": "Win a Dexecutioner run",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "event_happened": [
+        "EpisodeEnd",
+        {
+          "end_reason": "clear"
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M49",
+    "name": "Post a leaderboard score",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewBestRunClip",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "score",
+            200
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  },
+  {
+    "id": "goal.M50",
+    "name": "Earn all 102 achievements",
+    "tier": "major",
+    "scope": "run",
+    "predicate": {
+      "and": [
+        {
+          "event_happened": [
+            "NewBestRunClip",
+            {}
+          ]
+        },
+        {
+          "payload_gte": [
+            "score",
+            500
+          ]
+        }
+      ]
+    },
+    "clip": {
+      "pre_s": 18,
+      "post_s": 8,
+      "speed": 2.0
+    },
+    "hall": "fame",
+    "dedupe": "once_per_run"
+  }
+]

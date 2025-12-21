@@ -1,0 +1,235 @@
+version: '3.8'
+
+# High-Throughput RL Infrastructure for Megabonk
+# Supports 10 parallel instances with GPU-accelerated training
+
+services:
+  # ═══════════════════════════════════════════════════════════════════
+  # LEARNER: PyTorch/Sample Factory training process
+  # ═══════════════════════════════════════════════════════════════════
+  learner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.learner
+    image: megabonk-rl-learner:latest
+    
+    # IPC for shared memory performance
+    ipc: host
+    pid: host
+    
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, compute]
+    
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      # FP8 settings
+      - NVIDIA_TF32_OVERRIDE=1
+      - TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+      # Sample Factory
+      - SF_NUM_WORKERS=10
+      - SF_BATCH_SIZE=16384
+      - SF_DEVICE=cuda
+    
+    volumes:
+      - /dev/shm:/dev/shm
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+    
+    networks:
+      - megabonk-net
+    
+    command: >
+      python -m src.scripts.train_high_throughput
+      --num-workers 10
+      --batch-size 16384
+      --use-fp8
+      --use-pbt
+
+  # ═══════════════════════════════════════════════════════════════════
+  # BACKGROUND WORKERS: Headless game instances (x9)
+  # ═══════════════════════════════════════════════════════════════════
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: megabonk-env:latest
+    
+    ipc: host
+    
+    # Scale to 9 background workers
+    deploy:
+      replicas: 9
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 3G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [graphics, compute, video]
+    
+    environment:
+      - DISPLAY=:99
+      - RENDER_MODE=headless
+      - RENDER_RESOLUTION=640x480
+      - OBS_RESOLUTION=84x84
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=graphics,compute
+      # Xvfb for headless
+      - XDG_RUNTIME_DIR=/tmp/runtime
+      # Unity settings
+      - UNITY_BATCH_MODE=1
+      - UNITY_FORCE_VULKAN=1
+    
+    volumes:
+      - /dev/shm:/dev/shm
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./game:/app/game:ro
+      - ./mods:/app/mods:ro
+    
+    entrypoint: ["/app/scripts/start_worker.sh"]
+    
+    networks:
+      - megabonk-net
+    
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ═══════════════════════════════════════════════════════════════════
+  # STREAMABLE WORKER: High-res observable instance (x1)
+  # ═══════════════════════════════════════════════════════════════════
+  streamer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    image: megabonk-env:latest
+    
+    ipc: host
+    
+    ports:
+      - "8080:80"     # WebRTC stream
+      - "8081:8081"   # Debug API
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [graphics, compute, video]
+    
+    environment:
+      - DISPLAY=:99
+      - RENDER_MODE=streamable
+      - RENDER_RESOLUTION=1920x1080
+      - OBS_RESOLUTION=84x84
+      - STREAM_ENABLED=1
+      - STREAM_BITRATE=8000
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    
+    volumes:
+      - /dev/shm:/dev/shm
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./game:/app/game:ro
+      - ./mods:/app/mods:ro
+    
+    entrypoint: ["/app/scripts/start_streamer.sh"]
+    
+    networks:
+      - megabonk-net
+
+  # ═══════════════════════════════════════════════════════════════════
+  # ORCHESTRATOR: Manages all instances
+  # ═══════════════════════════════════════════════════════════════════
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    image: megabonk-orchestrator:latest
+    
+    ports:
+      - "8000:8000"   # REST API
+      - "8001:8001"   # WebSocket
+    
+    environment:
+      - NUM_WORKERS=10
+      - LEARNER_HOST=learner
+      - REDIS_URL=redis://redis:6379
+    
+    volumes:
+      - ./logs:/app/logs
+      - ./checkpoints:/app/checkpoints
+    
+    depends_on:
+      - redis
+      - learner
+    
+    networks:
+      - megabonk-net
+
+  # ═══════════════════════════════════════════════════════════════════
+  # REDIS: Shared state and metrics
+  # ═══════════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis-data:/data
+    
+    command: redis-server --appendonly yes
+    
+    networks:
+      - megabonk-net
+
+  # ═══════════════════════════════════════════════════════════════════
+  # WATCHDOG: Monitors and restarts failed instances
+  # ═══════════════════════════════════════════════════════════════════
+  watchdog:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    image: megabonk-orchestrator:latest
+    
+    environment:
+      - WATCHDOG_MODE=1
+      - HEARTBEAT_TIMEOUT=10
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/app/logs
+    
+    depends_on:
+      - orchestrator
+    
+    networks:
+      - megabonk-net
+    
+    entrypoint: ["python", "-m", "src.orchestrator.watchdog"]
+
+networks:
+  megabonk-net:
+    driver: bridge
+
+volumes:
+  redis-data:

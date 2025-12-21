@@ -1,0 +1,10 @@
+{
+  "greed": ["Midas", "Hoarder", "GoldenEye", "Silvertongue", "Vault"],
+  "lust": ["Explorer", "Cartographer", "Wanderer", "Seeker", "Nova"],
+  "wrath": ["Berserker", "Ragnarok", "Reaper", "Fury", "Scourge"],
+  "sloth": ["Bastion", "Hibernate", "IdleKing", "CouchMage", "Moss"],
+  "gluttony": ["Gourmand", "Collector", "XPFiend", "Magnetar", "Feast"],
+  "envy": ["Mirror", "Echo", "Imitator", "Shadow", "Copycat"],
+  "pride": ["Apex", "Paragon", "Sovereign", "Invictus", "Zenith"],
+  "default": ["BonkBot", "Phopper", "Megachad", "Sidecar", "Cortex"]
+}

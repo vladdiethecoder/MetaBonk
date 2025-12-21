@@ -1,0 +1,74 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>MetabonkPlugin</AssemblyName>
+    <RootNamespace>Metabonk</RootNamespace>
+    <OutputType>Library</OutputType>
+    <!--
+      Build requires game/BepInEx references.
+
+      Override these on the command line, e.g.
+        dotnet build -c Release \
+          /p:BepInExCoreDir=".../BepInEx/core" \
+          /p:UnityManagedDir=".../Megabonk_Data/Managed"
+    -->
+    <BepInExCoreDir Condition="'$(BepInExCoreDir)'==''"></BepInExCoreDir>
+    <UnityManagedDir Condition="'$(UnityManagedDir)'==''"></UnityManagedDir>
+  </PropertyGroup>
+
+  <!--
+    Recovery note:
+    This project must be built against your local MegaBonk + BepInEx IL2CPP
+    install. Add references to:
+      - BepInEx.Core.dll
+      - BepInEx.Unity.IL2CPP.dll
+      - HarmonyLib.dll
+      - Unity.MLAgents.dll
+      - UnityEngine*.dll
+      - BepInEx/interop/Assembly-CSharp.dll (proxy)
+    You can keep these as HintPath items in a local Directory.Build.props.
+  -->
+
+  <ItemGroup>
+    <!-- BepInEx 6 IL2CPP core references -->
+    <Reference Include="BepInEx.Core" Condition="Exists('$(BepInExCoreDir)/BepInEx.Core.dll')">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP" Condition="Exists('$(BepInExCoreDir)/BepInEx.Unity.IL2CPP.dll')">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Unity.IL2CPP.dll</HintPath>
+    </Reference>
+    <Reference Include="BepInEx.Unity.Common" Condition="Exists('$(BepInExCoreDir)/BepInEx.Unity.Common.dll')">
+      <HintPath>$(BepInExCoreDir)/BepInEx.Unity.Common.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony" Condition="Exists('$(BepInExCoreDir)/0Harmony.dll')">
+      <HintPath>$(BepInExCoreDir)/0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Include="Il2CppInterop.Runtime" Condition="Exists('$(BepInExCoreDir)/Il2CppInterop.Runtime.dll')">
+      <HintPath>$(BepInExCoreDir)/Il2CppInterop.Runtime.dll</HintPath>
+    </Reference>
+
+    <!-- IL2CPP interop base class library -->
+    <Reference Include="Il2Cppmscorlib" Condition="Exists('$(UnityManagedDir)/Il2Cppmscorlib.dll')">
+      <HintPath>$(UnityManagedDir)/Il2Cppmscorlib.dll</HintPath>
+    </Reference>
+
+    <!-- Unity + ML-Agents -->
+    <Reference Include="Unity.MLAgents" Condition="Exists('$(UnityManagedDir)/Unity.MLAgents.dll')">
+      <HintPath>$(UnityManagedDir)/Unity.MLAgents.dll</HintPath>
+    </Reference>
+
+    <Reference Include="UnityEngine.CoreModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.CoreModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.ImageConversionModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.ImageConversionModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.ScreenCaptureModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.ScreenCaptureModule.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.ScreenCaptureModule.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
