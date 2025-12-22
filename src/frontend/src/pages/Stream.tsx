@@ -18,6 +18,7 @@ import iconSheetUrl from "../assets/icon_sheet.png";
 import { iconIndex, iconVariantClass, type IconKey, type IconVariant } from "../lib/icon_map";
 import { PROGRESS_GOALS, type GoalTier, type ProgressGoal } from "../lib/megabonk_progress";
 import { UI_TOKENS } from "../lib/ui_tokens";
+import { timeAgo } from "../lib/format";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
