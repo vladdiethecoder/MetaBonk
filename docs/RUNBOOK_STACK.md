@@ -18,6 +18,7 @@ Options:
 - `METABONK_SMOKE_UI=0`
 - `METABONK_SMOKE_INPUT=1`
 - `METABONK_SMOKE_FAILOVER=1`
+- `METABONK_SMOKE_GAME_FAILOVER=1`
 
 ## Verify (Manual)
 - API: `curl -s http://127.0.0.1:8040/status`
@@ -99,4 +100,12 @@ Enable automatic worker restart if a worker exits unexpectedly:
 export METABONK_SUPERVISE_WORKERS=1
 export METABONK_WORKER_RESTART_MAX=3
 export METABONK_WORKER_RESTART_BACKOFF_S=2.0
+```
+
+## Game Auto-Restart
+Restart game process if it crashes (requires MEGABONK_CMD/TEMPLATE set):
+```bash
+export METABONK_GAME_RESTART=1
+export METABONK_GAME_RESTART_MAX=3
+export METABONK_GAME_RESTART_BACKOFF_S=5.0
 ```

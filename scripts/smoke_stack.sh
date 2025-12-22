@@ -13,6 +13,7 @@ GO2RTC_MODE="${METABONK_SMOKE_GO2RTC_MODE:-fifo}"
 UI_ENABLED="${METABONK_SMOKE_UI:-0}"
 INPUT_CHECK="${METABONK_SMOKE_INPUT:-0}"
 FAILOVER_CHECK="${METABONK_SMOKE_FAILOVER:-0}"
+GAME_FAILOVER_CHECK="${METABONK_SMOKE_GAME_FAILOVER:-0}"
 
 LOG_DIR="${REPO_ROOT}/temp/smoke"
 mkdir -p "${LOG_DIR}"
@@ -259,6 +260,64 @@ if not new_pid:
     raise SystemExit("[smoke] failover: worker did not restart")
 
 print(f"[smoke] failover: worker restarted pid={new_pid}")
+PY
+fi
+
+if [[ "${GAME_FAILOVER_CHECK}" == "1" ]]; then
+  python - <<'PY'
+import json
+import os
+import signal
+import time
+import urllib.request
+
+orch = os.environ.get("METABONK_SMOKE_ORCH_URL", "http://127.0.0.1:8040").rstrip("/")
+
+def _get_json(url: str, timeout: float = 2.0):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+workers = _get_json(f"{orch}/workers", timeout=2.0)
+target = None
+for hb in workers.values():
+    cu = (hb.get("control_url") or "").rstrip("/")
+    if not cu:
+        continue
+    try:
+        status = _get_json(f"{cu}/status", timeout=2.0)
+    except Exception:
+        continue
+    pid = status.get("launcher_pid")
+    iid = status.get("instance_id")
+    if pid and iid:
+        target = (cu, int(pid), str(iid))
+        break
+if not target:
+    print("[smoke] game failover: no launcher_pid found; skipping")
+    raise SystemExit(0)
+
+base, pid, iid = target
+print(f"[smoke] game failover: killing launcher for {iid} pid={pid}")
+os.kill(pid, signal.SIGTERM)
+
+deadline = time.time() + 90
+new_pid = None
+while time.time() < deadline:
+    try:
+        status = _get_json(f"{base}/status", timeout=2.0)
+    except Exception:
+        time.sleep(1.0)
+        continue
+    cur = status.get("launcher_pid")
+    alive = status.get("launcher_alive")
+    if cur and int(cur) != pid and alive:
+        new_pid = int(cur)
+        break
+    time.sleep(1.0)
+
+if not new_pid:
+    raise SystemExit("[smoke] game failover: launcher did not restart")
+print(f"[smoke] game failover: launcher restarted pid={new_pid}")
 PY
 fi
 

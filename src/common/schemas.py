@@ -96,6 +96,10 @@ class Heartbeat(MBBaseModel):
     stream_fps: Optional[float] = None
     stream_frame_var: Optional[float] = None
     stream_black_since_s: Optional[float] = None
+    launcher_pid: Optional[int] = None
+    launcher_alive: Optional[bool] = None
+    game_restart_count: Optional[int] = None
+    game_restart_failed: Optional[bool] = None
     # Optional FIFO/go2rtc distribution metadata (Metabonk).
     fifo_stream_enabled: Optional[bool] = None
     fifo_stream_path: Optional[str] = None

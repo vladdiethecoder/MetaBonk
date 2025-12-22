@@ -91,6 +91,15 @@ if app:
         pass
 
 
+def _game_restart_possible() -> bool:
+    return bool(
+        os.environ.get("MEGABONK_CMD")
+        or os.environ.get("MEGABONK_COMMAND")
+        or os.environ.get("MEGABONK_CMD_TEMPLATE")
+        or os.environ.get("MEGABONK_COMMAND_TEMPLATE")
+    )
+
+
 class WorkerService:
     def __init__(
         self,
@@ -165,6 +174,11 @@ class WorkerService:
         self._last_frame_var_ts: float = 0.0
         self._last_frame_var: Optional[float] = None
         self._black_frame_since: float = 0.0
+        self._game_restart_enabled = os.environ.get("METABONK_GAME_RESTART", "1") in ("1", "true", "True")
+        self._game_restart_possible = _game_restart_possible()
+        self._game_restart_count = 0
+        self._last_game_restart_ts = 0.0
+        self._game_restart_failed = False
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
 
@@ -1286,6 +1300,51 @@ class WorkerService:
         next_retry = 0.0
         while not self._stop.is_set():
             now = time.time()
+            launcher_proc = getattr(self.launcher, "proc", None)
+            launcher_pid = None
+            launcher_alive = False
+            try:
+                if launcher_proc is not None:
+                    launcher_pid = int(getattr(launcher_proc, "pid", 0) or 0) or None
+                    launcher_alive = getattr(launcher_proc, "poll", lambda: 0)() is None
+            except Exception:
+                launcher_pid = None
+                launcher_alive = False
+            if (
+                self._game_restart_enabled
+                and self._game_restart_possible
+                and not launcher_alive
+                and not self._game_restart_failed
+            ):
+                try:
+                    max_restarts = int(os.environ.get("METABONK_GAME_RESTART_MAX", "3"))
+                except Exception:
+                    max_restarts = 3
+                try:
+                    backoff_s = float(os.environ.get("METABONK_GAME_RESTART_BACKOFF_S", "5.0"))
+                except Exception:
+                    backoff_s = 5.0
+                if max_restarts < 0:
+                    max_restarts = 0
+                if backoff_s < 0.5:
+                    backoff_s = 0.5
+                if self._game_restart_count >= max_restarts:
+                    self._game_restart_failed = True
+                elif (now - self._last_game_restart_ts) >= backoff_s:
+                    self._last_game_restart_ts = now
+                    self._game_restart_count += 1
+                    try:
+                        self.launcher.launch()
+                        self._bind_input_window()
+                        # Force PipeWire target rediscovery after game restart.
+                        try:
+                            os.environ.pop("PIPEWIRE_NODE", None)
+                            self._pipewire_node_ok = False
+                            self._pipewire_node = None
+                        except Exception:
+                            pass
+                    except Exception:
+                        self._game_restart_failed = True
             # Opportunistically refresh PipeWire selection; gamescope may initially expose only
             # `gamescope:capture_*` then later publish a concrete node id in logs.
             try:
@@ -1437,6 +1496,10 @@ class WorkerService:
                 learned_reward_device=learned_reward_device or None,
                 reward_device=reward_device or None,
                 worker_pid=os.getpid(),
+                launcher_pid=launcher_pid,
+                launcher_alive=launcher_alive,
+                game_restart_count=self._game_restart_count,
+                game_restart_failed=self._game_restart_failed,
                 control_url=self.control_url(),
             )
             if requests:
