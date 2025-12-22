@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -48,6 +49,40 @@ class PPOConfig:
     use_lstm: bool = False
     seq_len: int = 32
     burn_in: int = 8
+
+
+def apply_env_overrides(cfg: PPOConfig) -> PPOConfig:
+    """Apply env overrides to PPOConfig for custom action spaces."""
+    try:
+        cont_dim = os.environ.get("METABONK_PPO_CONTINUOUS_DIM")
+        if cont_dim:
+            cfg.continuous_dim = max(1, int(cont_dim))
+    except Exception:
+        pass
+    try:
+        branches = os.environ.get("METABONK_PPO_DISCRETE_BRANCHES")
+        if branches:
+            parts = [p.strip() for p in branches.split(",") if p.strip()]
+            vals = [int(p) for p in parts if int(p) > 0]
+            cfg.discrete_branches = tuple(vals)
+        else:
+            # Auto-configure binary discrete branches when using OS-level input injection.
+            if str(os.environ.get("METABONK_INPUT_BACKEND", "")).strip().lower() == "uinput":
+                raw = (
+                    os.environ.get("METABONK_INPUT_BUTTONS")
+                    or os.environ.get("METABONK_INPUT_KEYS")
+                    or os.environ.get("METABONK_BUTTON_KEYS")
+                    or ""
+                )
+                items = [s.strip() for s in str(raw).split(",") if s.strip()]
+                if items:
+                    cfg.discrete_branches = tuple([2] * len(items))
+                else:
+                    # Keep a single dummy branch so action sampling stays well-defined.
+                    cfg.discrete_branches = (1,)
+    except Exception:
+        pass
+    return cfg
 
 
 class ActorCritic(nn.Module):
@@ -205,6 +240,30 @@ class PolicyLearner:
         self.dream_opt: Optional[optim.Optimizer] = None
         self._dream_latent_dim: Optional[int] = None
         self._dream_action_dim: Optional[int] = None
+        # Running stats for dream reward normalization.
+        self._dream_return_mean: float = 0.0
+        self._dream_return_var: float = 0.0
+        self._dream_return_count: int = 0
+
+    def _update_dream_return_stats(self, returns: torch.Tensor) -> Tuple[float, float]:
+        """Update running mean/variance of dream returns. Returns (mean, std)."""
+        if returns.numel() == 0:
+            return self._dream_return_mean, 1.0
+        x = float(returns.detach().float().mean().item())
+        self._dream_return_count += 1
+        if self._dream_return_count == 1:
+            self._dream_return_mean = x
+            self._dream_return_var = 0.0
+        else:
+            delta = x - self._dream_return_mean
+            self._dream_return_mean += delta / float(self._dream_return_count)
+            delta2 = x - self._dream_return_mean
+            self._dream_return_var += delta * delta2
+        denom = max(1, self._dream_return_count - 1)
+        std = float(math.sqrt(self._dream_return_var / denom)) if denom > 0 else 1.0
+        if std == 0.0:
+            std = 1.0
+        return self._dream_return_mean, std
 
     def _ensure_dream_actor(self, latent_dim: int, action_dim: int) -> None:
         """Create/update latent-space dream actor used for imagined rollouts."""
@@ -534,9 +593,28 @@ class PolicyLearner:
         disc = 1.0
         actions_cont_list: List[torch.Tensor] = []
         obs_pred_list: List[torch.Tensor] = []
+        reward_pred_list: List[torch.Tensor] = []
 
         noise_scale = float(os.environ.get("METABONK_DREAM_ACTION_NOISE", "0.0"))
+        reward_clip = float(os.environ.get("METABONK_DREAM_REWARD_CLIP", "0.0"))
+        use_symlog = bool(int(os.environ.get("METABONK_DREAM_SYMLOG", "0")))
+        norm_rewards = bool(int(os.environ.get("METABONK_DREAM_RET_NORM", "0")))
+        deterministic = bool(int(os.environ.get("METABONK_DREAM_DETERMINISTIC", "0")))
+        stop_on_nan = bool(int(os.environ.get("METABONK_DREAM_STOP_ON_NAN", "1")))
 
+        def _symlog(x: torch.Tensor) -> torch.Tensor:
+            return torch.sign(x) * torch.log1p(torch.abs(x))
+
+        def _reward_norm(x: torch.Tensor) -> torch.Tensor:
+            if self._dream_return_count < 2:
+                return x
+            denom = max(1, self._dream_return_count - 1)
+            std = float(math.sqrt(self._dream_return_var / denom)) if denom > 0 else 1.0
+            if std <= 0.0:
+                return x
+            return (x - float(self._dream_return_mean)) / float(std)
+
+        had_nan = False
         for _t in range(max(1, horizon)):
             feat = torch.cat([h, z], dim=-1)  # latent state
             a_cont = dream_actor(feat)
@@ -555,13 +633,33 @@ class PolicyLearner:
             else:
                 a_flat = a_cont[:, : world_model.cfg.action_dim]
 
-            h, z, _ = world_model.rssm.imagine(a_flat, h, z, deterministic=False)
+            h, z, _ = world_model.rssm.imagine(a_flat, h, z, deterministic=deterministic)
             feat_next = torch.cat([h, z], dim=-1)
             r_pred = world_model.reward_head(feat_next).squeeze(-1)
+            if reward_clip > 0.0:
+                r_pred = r_pred.clamp(-reward_clip, reward_clip)
+            if use_symlog:
+                r_pred = _symlog(r_pred)
+            if norm_rewards:
+                r_pred = _reward_norm(r_pred)
+            if stop_on_nan and not torch.isfinite(r_pred).all():
+                had_nan = True
+                break
             ret = ret + disc * r_pred
             disc = disc * gamma
 
             obs_pred_list.append(world_model.obs_decoder(feat_next))
+            reward_pred_list.append(r_pred)
+
+        if had_nan or (stop_on_nan and not torch.isfinite(ret).all()):
+            return {
+                "dream_loss": 0.0,
+                "dream_return": 0.0,
+                "dream_horizon": int(horizon),
+                "dream_starts": int(starts),
+                "dream_distill_loss": 0.0,
+                "dream_nan": 1.0,
+            }
 
         loss = -ret.mean()
         dream_opt.zero_grad(set_to_none=True)
@@ -591,12 +689,29 @@ class PolicyLearner:
             self.net.eval()
             distill_loss_val = float(distill_loss.detach().item())
 
+        mean_ret, std_ret = self._update_dream_return_stats(ret)
+        action_std = 0.0
+        if actions_cont_list:
+            action_std = float(torch.cat(actions_cont_list, dim=0).std().detach().item())
+        reward_mean = 0.0
+        reward_std = 0.0
+        if reward_pred_list:
+            cat_r = torch.cat(reward_pred_list, dim=0)
+            reward_mean = float(cat_r.mean().detach().item())
+            reward_std = float(cat_r.std().detach().item())
+
         return {
             "dream_loss": float(loss.detach().item()),
             "dream_return": float(ret.detach().mean().item()),
             "dream_horizon": int(horizon),
             "dream_starts": int(starts),
             "dream_distill_loss": distill_loss_val,
+            "dream_return_mean": float(mean_ret),
+            "dream_return_std": float(std_ret),
+            "dream_reward_mean": float(reward_mean),
+            "dream_reward_std": float(reward_std),
+            "dream_action_std": float(action_std),
+            "dream_nan": 0.0,
         }
 
 

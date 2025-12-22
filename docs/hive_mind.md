@@ -45,6 +45,28 @@ curl -X POST http://127.0.0.1:8061/merge_policies \
   }'
 ```
 
+Optional safeguards and dry-run:
+
+```bash
+curl -X POST http://127.0.0.1:8061/merge_policies \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_policies": ["Scout","Speedrunner"],
+    "target_policy": "God",
+    "method": "ties",
+    "topk": 0.2,
+    "dry_run": true,
+    "min_cosine": 0.01,
+    "min_sign_agreement": 0.02
+  }'
+```
+
+Env overrides:
+- `METABONK_MERGE_MIN_COSINE`
+- `METABONK_MERGE_MIN_SIGN_AGREEMENT`
+- `METABONK_MERGE_FORCE=1` (bypass gating)
+- `METABONK_MERGE_SAVE_VECTOR=1` (persist merged vector to `METABONK_SKILL_DB_PATH`)
+
 ### Merge sidecar
 
 Script: `scripts/federated_merge.py`
@@ -69,4 +91,3 @@ python scripts/federated_merge.py \
 1. Move role rewards from env vars → true per‑role dense rewards using game memory (velocity/DPS/synergy).
 2. Add automatic headless spawning/reset via Gamescope + BepInEx.
 3. Promote merged “God” policy to a dedicated evaluation worker and feed its deltas back into the skill DB.
-

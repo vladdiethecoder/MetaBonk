@@ -19,6 +19,11 @@ try:
 except Exception as e:  # pragma: no cover
     raise RuntimeError("Pillow is required for menu classifier inference") from e
 
+try:
+    from src.worker.ocr import ocr_text
+except Exception:  # pragma: no cover
+    ocr_text = None  # type: ignore
+
 
 MENU_CLASSES = ["menu", "combat", "reward", "selection"]
 MENU_MODE_SET = {"menu", "reward", "selection"}
@@ -92,3 +97,60 @@ def load_menu_classifier(
     model.load_state_dict(state, strict=False)
     model.to(dev)
     return MenuClassifier(model=model, classes=classes, device=dev, threshold=threshold)
+
+
+def heuristic_menu_metrics(image: "Image.Image") -> Dict[str, object]:
+    """Lightweight OCR-based menu detector (fallback when no weights)."""
+    if ocr_text is None:
+        return {}
+    try:
+        from PIL import ImageOps
+
+        img = image.convert("RGB")
+        # Downscale to speed up OCR while keeping text legible.
+        if img.width > 960:
+            ratio = 960.0 / float(img.width)
+            img = img.resize((960, max(1, int(img.height * ratio))))
+        text = ocr_text(img, psm=6).lower()
+        if not text:
+            text = ocr_text(ImageOps.invert(img.convert("L")), psm=6).lower()
+    except Exception:
+        return {}
+    if not text:
+        return {}
+    menu_keywords = [
+        "play",
+        "confirm",
+        "settings",
+        "exit",
+        "map selection",
+        "character selection",
+        "credits",
+        "continue",
+        "start",
+        "forest",
+        "tier",
+    ]
+    gameplay_keywords = [
+        "lvl",
+        "level",
+        "find the boss",
+        "boss portal",
+        "hp",
+        "health",
+        "time",
+    ]
+    menu_hits = sum(1 for k in menu_keywords if k in text)
+    gameplay_hits = sum(1 for k in gameplay_keywords if k in text)
+    if menu_hits == 0 and gameplay_hits == 0:
+        return {}
+    menu_mode = menu_hits >= max(1, gameplay_hits)
+    conf = min(1.0, 0.5 + 0.1 * abs(menu_hits - gameplay_hits))
+    state = "menu" if menu_mode else "combat"
+    return {
+        "menu_state": state,
+        "menu_conf": float(conf),
+        "menu_probs": {"menu": float(conf), "combat": float(1.0 - conf)},
+        "menu_mode": bool(menu_mode),
+        "menu_source": "heuristic",
+    }

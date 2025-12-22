@@ -76,6 +76,77 @@ def _peek_npz_shape(path: Path) -> Tuple[Tuple[int, int, int, int], int]:
     return (T, H, W, C), A
 
 
+def _compute_action_stats(paths: List[Path], *, max_files: int = 0) -> Dict[str, Any]:
+    if max_files and len(paths) > max_files:
+        paths = paths[:max_files]
+    count = 0
+    mean = None
+    m2 = None
+    max_abs = 0.0
+    for p in paths:
+        try:
+            with np.load(p, allow_pickle=True) as d:
+                acts = np.asarray(d["actions"], dtype=np.float32)
+        except Exception:
+            continue
+        if acts.ndim != 2 or acts.size == 0:
+            continue
+        max_abs = max(max_abs, float(np.max(np.abs(acts))))
+        if mean is None:
+            mean = acts.mean(axis=0)
+            m2 = np.zeros_like(mean)
+            count = acts.shape[0]
+        else:
+            # Welford update on mean/var per-dim.
+            n2 = acts.shape[0]
+            delta = acts.mean(axis=0) - mean
+            mean = mean + delta * (n2 / max(1, count + n2))
+            m2 = m2 + acts.var(axis=0) * n2
+            count += n2
+    if mean is None or m2 is None or count <= 1:
+        return {"count": int(count), "mean": None, "std": None, "max_abs": float(max_abs)}
+    std = np.sqrt(m2 / max(1, count))
+    return {
+        "count": int(count),
+        "mean": mean.astype(np.float32).tolist(),
+        "std": std.astype(np.float32).tolist(),
+        "max_abs": float(max_abs),
+    }
+
+
+def _validate_npz(paths: List[Path], *, max_files: int = 0, min_seq_len: int = 2) -> Dict[str, Any]:
+    if max_files and len(paths) > max_files:
+        paths = paths[:max_files]
+    ok = 0
+    skipped = []
+    for p in paths:
+        try:
+            with np.load(p, allow_pickle=True) as d:
+                if "observations" not in d.files or "actions" not in d.files:
+                    skipped.append({"file": p.name, "reason": "missing_keys"})
+                    continue
+                obs = np.asarray(d["observations"])
+                acts = np.asarray(d["actions"])
+        except Exception as e:
+            skipped.append({"file": p.name, "reason": f"load_error:{type(e).__name__}"})
+            continue
+        if obs.ndim != 4 or obs.shape[-1] != 3:
+            skipped.append({"file": p.name, "reason": f"bad_obs_shape:{obs.shape}"})
+            continue
+        if acts.ndim != 2:
+            skipped.append({"file": p.name, "reason": f"bad_action_shape:{acts.shape}"})
+            continue
+        T = min(int(obs.shape[0]), int(acts.shape[0]))
+        if T < min_seq_len:
+            skipped.append({"file": p.name, "reason": f"too_short:T={T}"})
+            continue
+        if not np.isfinite(obs).all() or not np.isfinite(acts).all():
+            skipped.append({"file": p.name, "reason": "non_finite"})
+            continue
+        ok += 1
+    return {"checked": int(len(paths)), "ok": int(ok), "skipped": skipped}
+
+
 class NPZSeqDataset(torch.utils.data.Dataset):
     """Random sampler over a directory of .npz trajectory files."""
 
@@ -86,11 +157,13 @@ class NPZSeqDataset(torch.utils.data.Dataset):
         seq_len: int,
         samples_per_epoch: int,
         seed: int = 0,
+        action_norm: Optional[Dict[str, Any]] = None,
     ):
         self.paths = list(paths)
         self.seq_len = int(seq_len)
         self.samples_per_epoch = int(samples_per_epoch)
         self.seed = int(seed)
+        self.action_norm = action_norm or {}
 
         if not self.paths:
             raise ValueError("no .npz files provided")
@@ -126,9 +199,32 @@ class NPZSeqDataset(torch.utils.data.Dataset):
             ft = torch.from_numpy(frames).to(dtype=torch.float32) / 255.0
             ft = ft.permute(0, 3, 1, 2).contiguous()
             at = torch.from_numpy(actions).to(dtype=torch.float32).contiguous()
+            at = self._normalize_actions(at)
             return ft, at
 
         raise RuntimeError("failed to sample a valid sequence (dataset may be empty/corrupt)")
+
+    def _normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        mode = str(self.action_norm.get("mode", "none"))
+        if mode == "none":
+            return actions
+        if mode == "standardize":
+            mean = self.action_norm.get("mean")
+            std = self.action_norm.get("std")
+            eps = float(self.action_norm.get("eps", 1e-6))
+            if mean is None or std is None:
+                return actions
+            mean_t = torch.tensor(mean, device=actions.device, dtype=actions.dtype)
+            std_t = torch.tensor(std, device=actions.device, dtype=actions.dtype).clamp(min=eps)
+            return (actions - mean_t) / std_t
+        if mode == "maxabs":
+            max_abs = float(self.action_norm.get("max_abs", 0.0))
+            if max_abs <= 0.0:
+                return actions
+            return actions / max_abs
+        if mode == "tanh":
+            return torch.tanh(actions)
+        return actions
 
 
 class NPZFrameDataset(torch.utils.data.Dataset):
@@ -189,7 +285,7 @@ def main() -> int:
     ap.add_argument("--npz-dir", default="rollouts/video_demos_labeled", help="Directory of labeled .npz demos")
     ap.add_argument("--out", default="checkpoints/gwm.pt", help="Checkpoint path")
     ap.add_argument("--device", default="cuda", help="cuda|cpu")
-    ap.add_argument("--phase", choices=["tokenizer", "transformer", "all"], default="all")
+    ap.add_argument("--phase", choices=["validate", "tokenizer", "transformer", "all"], default="all")
     ap.add_argument("--seq-len", type=int, default=8, help="Frames per training window (<= max_context_frames)")
     ap.add_argument("--batch-size", type=int, default=6)
     ap.add_argument("--tokenizer-steps", type=int, default=2000)
@@ -205,6 +301,9 @@ def main() -> int:
     ap.add_argument("--probe-mc", type=int, default=3)
     ap.add_argument("--probe-action-perturb", type=int, default=3)
     ap.add_argument("--probe-action-noise", type=float, default=0.15)
+    ap.add_argument("--action-norm", choices=["none", "standardize", "maxabs", "tanh"], default="none")
+    ap.add_argument("--action-norm-eps", type=float, default=1e-6)
+    ap.add_argument("--validate-min-len", type=int, default=2)
     args = ap.parse_args()
 
     npz_dir = Path(args.npz_dir)
@@ -246,8 +345,30 @@ def main() -> int:
         f"(tokens_per_frame={int(model.cfg.tokens_per_frame)})"
     )
 
+    # Optional dataset validation.
+    if args.phase == "validate":
+        report = _validate_npz(paths, max_files=int(args.max_files) or 0, min_seq_len=int(args.validate_min_len))
+        print(json_dumps({"validate": report}))
+        return 0
+
+    action_stats = _compute_action_stats(paths, max_files=int(args.max_files) or 0)
+    action_norm = {
+        "mode": str(args.action_norm),
+        "mean": action_stats.get("mean"),
+        "std": action_stats.get("std"),
+        "max_abs": action_stats.get("max_abs", 0.0),
+        "eps": float(args.action_norm_eps),
+    }
+    print(f"[gwm] action_norm={action_norm['mode']} max_abs={action_norm['max_abs']}")
+
     # Data
-    seq_ds = NPZSeqDataset(paths, seq_len=int(args.seq_len), samples_per_epoch=int(args.samples_per_epoch), seed=0)
+    seq_ds = NPZSeqDataset(
+        paths,
+        seq_len=int(args.seq_len),
+        samples_per_epoch=int(args.samples_per_epoch),
+        seed=0,
+        action_norm=action_norm,
+    )
     seq_dl = torch.utils.data.DataLoader(seq_ds, batch_size=int(args.batch_size), shuffle=False, num_workers=0, pin_memory=(dev.type == "cuda"))
 
     frame_ds = NPZFrameDataset(paths, samples_per_epoch=int(args.samples_per_epoch), seed=1)
@@ -274,7 +395,17 @@ def main() -> int:
                     f"loss={metrics.get('tokenizer_loss', 0.0):.4f} recon={metrics.get('recon_loss', 0.0):.4f} vq={metrics.get('vq_loss', 0.0):.4f}"
                 )
             if int(args.save_every) and (step + 1) % int(args.save_every) == 0:
-                _save_ckpt(trainer, out_path, {"phase": "tokenizer", "step": int(step + 1), "cfg": asdict(cfg)})
+                _save_ckpt(
+                    trainer,
+                    out_path,
+                    {
+                        "phase": "tokenizer",
+                        "step": int(step + 1),
+                        "cfg": asdict(cfg),
+                        "action_stats": action_stats,
+                        "action_norm": action_norm,
+                    },
+                )
 
     # Phase: transformer
     if args.phase in ("transformer", "all"):
@@ -318,9 +449,29 @@ def main() -> int:
                 except Exception as e:
                     print(f"[gwm] intrinsic probe failed: {type(e).__name__}: {e}")
             if int(args.save_every) and (step + 1) % int(args.save_every) == 0:
-                _save_ckpt(trainer, out_path, {"phase": "transformer", "step": int(step + 1), "cfg": asdict(cfg)})
+                _save_ckpt(
+                    trainer,
+                    out_path,
+                    {
+                        "phase": "transformer",
+                        "step": int(step + 1),
+                        "cfg": asdict(cfg),
+                        "action_stats": action_stats,
+                        "action_norm": action_norm,
+                    },
+                )
 
-    _save_ckpt(trainer, out_path, {"phase": "done", "step": int(trainer.step), "cfg": asdict(cfg)})
+    _save_ckpt(
+        trainer,
+        out_path,
+        {
+            "phase": "done",
+            "step": int(trainer.step),
+            "cfg": asdict(cfg),
+            "action_stats": action_stats,
+            "action_norm": action_norm,
+        },
+    )
     print(f"[gwm] saved: {out_path}")
     return 0
 

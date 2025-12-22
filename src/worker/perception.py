@@ -15,6 +15,7 @@ in `CLASS_NAMES` and `INTERACTABLE_IDS` once the YOLO dataset is finalized.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -223,6 +224,81 @@ def build_ui_elements(
     return ui, mask, interact_count
 
 
+def build_grid_ui_elements(
+    frame_size: Optional[Tuple[int, int]],
+    *,
+    max_elements: int = 32,
+    rows: int = 4,
+    cols: int = 4,
+) -> Tuple[List[List[float]], List[int]]:
+    """Build a generic grid of click targets as UI candidates.
+
+    This is a fallback for menus when no interactable detections are available.
+    Targets are evenly spaced across the frame and do not encode button semantics.
+    """
+    ui: List[List[float]] = []
+    mask: List[int] = [0] * (max_elements + 1)
+    if not frame_size:
+        mask[-1] = 1
+        return ui, mask
+
+    rows = max(1, int(rows))
+    cols = max(1, int(cols))
+    cell_w = 1.0 / float(cols)
+    cell_h = 1.0 / float(rows)
+    idx = 0
+    for r in range(rows):
+        for c in range(cols):
+            if idx >= max_elements:
+                break
+            cx = (c + 0.5) * cell_w
+            cy = (r + 0.5) * cell_h
+            ui.append([cx, cy, cell_w, cell_h, -2.0, 1.0])
+            mask[idx] = 1
+            idx += 1
+        if idx >= max_elements:
+            break
+
+    while len(ui) < max_elements:
+        ui.append([0.0, 0.0, 0.0, 0.0, -1.0, 0.0])
+    mask[-1] = 1
+    return ui, mask
+
+
+def build_ui_candidates(
+    dets: List[ParsedDet],
+    frame_size: Optional[Tuple[int, int]] = None,
+    *,
+    max_elements: int = 32,
+    menu_hint: Optional[bool] = None,
+) -> Tuple[List[List[float]], List[int], int]:
+    """Return UI elements + action mask with a menu-mode fallback grid."""
+    ui, mask, interact_count = build_ui_elements(dets, frame_size, max_elements)
+    want_grid = bool(menu_hint)
+    if not want_grid:
+        want_grid = str(os.environ.get("METABONK_UI_GRID_FALLBACK", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    if want_grid and interact_count <= 0:
+        grid = str(os.environ.get("METABONK_MENU_GRID", "4x4") or "4x4").lower()
+        try:
+            parts = grid.split("x")
+            rows = int(parts[0])
+            cols = int(parts[1]) if len(parts) > 1 else rows
+        except Exception:
+            rows, cols = 4, 4
+        ui, mask = build_grid_ui_elements(
+            frame_size,
+            max_elements=max_elements,
+            rows=rows,
+            cols=cols,
+        )
+    return ui, mask, interact_count
+
+
 def derive_state_onehot(dets: List[ParsedDet], num_states: int = 4) -> List[float]:
     """Derive discrete game state from detection bag."""
     classes = {d.cls for d in dets}
@@ -251,6 +327,9 @@ def construct_observation(
     obs_dim: int,
     frame_size: Optional[Tuple[int, int]] = None,
     max_elements: int = 32,
+    menu_hint: Optional[bool] = None,
+    ui_override: Optional[List[List[float]]] = None,
+    action_mask_override: Optional[List[int]] = None,
 ) -> Tuple[List[float], List[int]]:
     """Construct flat obs vector and action mask.
 
@@ -264,8 +343,24 @@ def construct_observation(
       7: map_select screen present (0/1)
     """
     dets = parse_detections(raw_detections)
-    ui, mask, _ = build_ui_elements(dets, frame_size, max_elements)
+    if ui_override is not None and action_mask_override is not None:
+        ui = ui_override
+        mask = action_mask_override
+    else:
+        ui, mask, _ = build_ui_candidates(
+            dets,
+            frame_size=frame_size,
+            max_elements=max_elements,
+            menu_hint=menu_hint,
+        )
     state_oh = derive_state_onehot(dets)
+    if menu_hint is not None:
+        mapping = {"menu": 0, "combat": 1, "level_up": 2, "dead": 3}
+        state = "menu" if menu_hint else "combat"
+        onehot = [0.0] * len(state_oh)
+        if state in mapping and mapping[state] < len(onehot):
+            onehot[mapping[state]] = 1.0
+        state_oh = onehot
 
     global_feats = [0.0] * 8
 

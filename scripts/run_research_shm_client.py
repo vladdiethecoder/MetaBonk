@@ -8,7 +8,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+
+def _add_repo_root() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+
+_add_repo_root()
 
 from src.bridge.research_shm import ResearchSharedMemoryClient
 
@@ -16,9 +27,13 @@ from src.bridge.research_shm import ResearchSharedMemoryClient
 def main() -> int:
     parser = argparse.ArgumentParser(description="ResearchPlugin SHM client")
     parser.add_argument("--instance-id", required=True)
+    parser.add_argument("--obs-width", type=int, default=None)
+    parser.add_argument("--obs-height", type=int, default=None)
     args = parser.parse_args()
 
-    shm = ResearchSharedMemoryClient(args.instance_id)
+    shm = ResearchSharedMemoryClient(
+        args.instance_id, obs_width=args.obs_width, obs_height=args.obs_height
+    )
     if not shm.open():
         print("Failed to open shared memory. Is the ResearchPlugin running?")
         return 1
@@ -47,4 +62,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

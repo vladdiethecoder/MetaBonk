@@ -70,3 +70,44 @@ def ocr_crop(
         img = ImageOps.invert(img)
     return ocr_text(img, whitelist=whitelist, psm=psm)
 
+
+def ocr_boxes(
+    img: Image.Image,
+    min_conf: int = 40,
+    min_len: int = 2,
+    psm: int = 6,
+) -> list[dict]:
+    """Return OCR text boxes for a PIL image."""
+    if pytesseract is None:
+        return []
+    try:
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config=f"--psm {psm}")
+    except Exception:
+        return []
+    results: list[dict] = []
+    try:
+        n = len(data.get("text", []))
+    except Exception:
+        return results
+    for i in range(n):
+        try:
+            text = str(data["text"][i]).strip()
+            conf = int(float(data["conf"][i]))
+            if conf < min_conf or len(text) < min_len:
+                continue
+            x = int(data["left"][i])
+            y = int(data["top"][i])
+            w = int(data["width"][i])
+            h = int(data["height"][i])
+            if w <= 2 or h <= 2:
+                continue
+            results.append(
+                {
+                    "bbox": (x, y, x + w, y + h),
+                    "text": text,
+                    "conf": conf,
+                }
+            )
+        except Exception:
+            continue
+    return results

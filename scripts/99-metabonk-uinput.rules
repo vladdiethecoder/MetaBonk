@@ -1,0 +1,2 @@
+# MetaBonk uinput access (keyboard/mouse injection)
+KERNEL=="uinput", MODE="0660", GROUP="input"

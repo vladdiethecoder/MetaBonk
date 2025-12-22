@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.common.device import resolve_device
-from src.learner.ppo import ActorCritic, PPOConfig
+from src.learner.ppo import ActorCritic, PPOConfig, apply_env_overrides
 
 
 @dataclass
@@ -38,6 +38,7 @@ class Trainer:
 
     def __post_init__(self):
         self.device = resolve_device(self.device, context="worker policy")
+        self.cfg = apply_env_overrides(self.cfg)
         if "use_lstm" in (self.hparams or {}):
             try:
                 self.cfg.use_lstm = bool(self.hparams.get("use_lstm"))

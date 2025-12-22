@@ -13,10 +13,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
 import threading
 import time
 from collections import deque
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 try:
     import requests
@@ -45,12 +46,26 @@ from .nvenc_streamer import NVENCConfig, NVENCStreamer
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
 
+if TYPE_CHECKING:
+    from src.control.menu_reasoner import MenuAction
+
 try:
     from src.bridge.unity_bridge import UnityBridge, BridgeConfig, GameFrame
 except Exception:  # pragma: no cover
     UnityBridge = None  # type: ignore
     BridgeConfig = None  # type: ignore
     GameFrame = None  # type: ignore
+
+try:
+    from src.input.uinput_backend import UInputBackend, UInputError
+except Exception:  # pragma: no cover
+    UInputBackend = None  # type: ignore
+    UInputError = Exception  # type: ignore
+try:
+    from src.input.xdotool_backend import XDoToolBackend, XDoToolError
+except Exception:  # pragma: no cover
+    XDoToolBackend = None  # type: ignore
+    XDoToolError = Exception  # type: ignore
 
 
 app: Optional["FastAPI"] = FastAPI(title="MetaBonk Worker") if FastAPI else None
@@ -145,6 +160,8 @@ class WorkerService:
         self._last_policy_warn_ts: float = 0.0
         self._last_stream_ok_ts: float = 0.0
         self._last_stream_heal_ts: float = 0.0
+        self._last_menu_mode: Optional[bool] = None
+        self._last_menu_mode_log: Optional[bool] = None
 
         # Optional UnityBridge embodiment (BepInEx plugin).
         self._use_bridge = os.environ.get("METABONK_USE_UNITY_BRIDGE", "0") in ("1", "true", "True")
@@ -160,9 +177,34 @@ class WorkerService:
             # agent can actually move without requiring extra glue code.
             self._bridge_action_map = "wasd"
         self._bridge_held_keys: set[str] = set()
+        # Optional OS-level input backend (uinput) for real keyboard/mouse injection.
+        self._input_backend_name = str(os.environ.get("METABONK_INPUT_BACKEND", "") or "").strip().lower()
+        self._input_backend = None
+        self._input_buttons: List[dict] = []
+        self._input_held_keys: set[str] = set()
+        self._input_held_mouse: set[str] = set()
+        self._input_cursor_pos: Optional[tuple[int, int]] = None
+        try:
+            self._input_mouse_scale = float(os.environ.get("METABONK_INPUT_MOUSE_SCALE", "100.0"))
+        except Exception:
+            self._input_mouse_scale = 100.0
+        self._input_mouse_mode = str(os.environ.get("METABONK_INPUT_MOUSE_MODE", "scaled") or "scaled").strip().lower()
+        try:
+            self._input_scroll_scale = float(os.environ.get("METABONK_INPUT_SCROLL_SCALE", "3.0"))
+        except Exception:
+            self._input_scroll_scale = 3.0
+        self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "1") in ("1", "true", "True")
+        self._menu_bootstrap_step = 0
+        self._menu_bootstrap_next_ts = 0.0
+        self._init_input_backend()
         # Optional BonkLink bridge (BepInEx 6 IL2CPP).
         self._use_bonklink = os.environ.get("METABONK_USE_BONKLINK", "0") in ("1", "true", "True")
         self._bonklink = None
+        try:
+            self._bonklink_retry_s = float(os.environ.get("METABONK_BONKLINK_RETRY_S", "5.0"))
+        except Exception:
+            self._bonklink_retry_s = 5.0
+        self._bonklink_last_attempt = 0.0
         # Optional VLM-driven menu navigation (Lobby Agent).
         self._use_vlm_menu = os.environ.get("METABONK_USE_VLM_MENU", "0") in ("1", "true", "True")
         self._vlm_menu_goal = os.environ.get("METABONK_MENU_GOAL", "Start Run")
@@ -177,6 +219,27 @@ class WorkerService:
             except Exception:
                 self._vlm_menu = None
                 self._use_vlm_menu = False
+        # Optional switching controller (System-2 menu override).
+        self._use_switching_controller = os.environ.get("METABONK_USE_SWITCHING_CONTROLLER", "0") in (
+            "1",
+            "true",
+            "True",
+        )
+        self._switching_controller = None
+        if self._use_switching_controller:
+            try:
+                from src.control.switching_controller import SwitchingController
+
+                self._switching_controller = SwitchingController()
+                # Avoid double menu overrides.
+                self._use_vlm_menu = False
+                self._vlm_menu = None
+            except Exception:
+                self._use_switching_controller = False
+                self._switching_controller = None
+        if self._use_switching_controller or self._use_vlm_menu:
+            # Disable heuristic menu bootstrapping when a VLM controller is active.
+            self._input_menu_bootstrap = False
         # Optional causal Scientist for item/build discovery.
         self._use_causal_scientist = os.environ.get("METABONK_USE_CAUSAL", "0") in (
             "1",
@@ -642,6 +705,7 @@ class WorkerService:
 
     def start(self):
         self.launcher.launch()
+        self._bind_input_window()
         # If this worker is going to stream via GPU, we need to discover the node after launch.
         self._ensure_pipewire_node()
         if bool(getattr(self, "_pipewire_drain_enabled", False)) and not getattr(self, "_capture_disabled_env", False):
@@ -694,6 +758,37 @@ class WorkerService:
                 self._fifo_publisher.stop()
             except Exception:
                 pass
+        if self._input_backend is not None:
+            try:
+                for k in list(self._input_held_keys):
+                    try:
+                        self._input_backend.key_up(str(k))
+                    except Exception:
+                        pass
+                for b in list(self._input_held_mouse):
+                    try:
+                        self._input_backend.mouse_button(str(b), False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                self._input_backend.close()
+            except Exception:
+                pass
+            self._input_backend = None
+
+    def _bind_input_window(self) -> None:
+        if not self._input_backend:
+            return
+        pid = getattr(self.launcher.proc, "pid", None)
+        if not pid:
+            return
+        try:
+            if hasattr(self._input_backend, "set_window_pid"):
+                self._input_backend.set_window_pid(int(pid))
+        except Exception:
+            pass
 
     def _ensure_preview_jpeg(self) -> None:
         # Default-on: this runs at a low rate and keeps a cached JPEG for UI fallback/debug.
@@ -814,6 +909,238 @@ class WorkerService:
         except Exception:
             self.bridge = None
             self._use_bridge = False
+
+    def _parse_input_buttons(self) -> List[dict]:
+        """Parse input button list for uinput backend."""
+        raw = (
+            os.environ.get("METABONK_INPUT_BUTTONS")
+            or os.environ.get("METABONK_INPUT_KEYS")
+            or os.environ.get("METABONK_BUTTON_KEYS")
+            or ""
+        )
+        items = [s.strip() for s in str(raw).split(",") if s.strip()]
+        mouse_names = {
+            "LEFT",
+            "RIGHT",
+            "MIDDLE",
+            "MOUSE_LEFT",
+            "MOUSE_RIGHT",
+            "MOUSE_MIDDLE",
+            "BTN_LEFT",
+            "BTN_RIGHT",
+            "BTN_MIDDLE",
+        }
+        parsed: List[dict] = []
+        for item in items:
+            key = item.strip()
+            if key.upper() in mouse_names:
+                parsed.append({"kind": "mouse", "button": key})
+            else:
+                parsed.append({"kind": "key", "name": key})
+        return parsed
+
+    def _init_input_backend(self) -> None:
+        name = self._input_backend_name
+        if name not in ("uinput", "xdotool", "xdo"):
+            return
+        self._input_buttons = self._parse_input_buttons()
+        if not self._input_buttons:
+            print(f"[worker:{self.instance_id}] input backend enabled but no METABONK_INPUT_BUTTONS set")
+        if name == "uinput":
+            if UInputBackend is None:
+                print(f"[worker:{self.instance_id}] uinput backend unavailable (missing dependency)")
+                self._input_menu_bootstrap = False
+                return
+            try:
+                key_names = [b["name"] for b in self._input_buttons if b.get("kind") == "key"]
+                if self._input_menu_bootstrap:
+                    key_names.extend(["SPACE", "ENTER", "ESC"])
+                key_names = list({str(k) for k in key_names if str(k).strip()})
+                self._input_backend = UInputBackend(keys=key_names)
+                print(f"[worker:{self.instance_id}] uinput backend enabled (focused window receives input)")
+            except UInputError as e:
+                print(f"[worker:{self.instance_id}] uinput backend failed: {e}")
+                self._input_backend = None
+                self._input_menu_bootstrap = False
+            return
+        # xdotool backend (per-display input)
+        if XDoToolBackend is None:
+            print(f"[worker:{self.instance_id}] xdotool backend unavailable (missing dependency)")
+            self._input_menu_bootstrap = False
+            return
+        try:
+            display = os.environ.get("METABONK_INPUT_DISPLAY") or self.display
+            xauth = os.environ.get("METABONK_INPUT_XAUTHORITY") or os.environ.get("XAUTHORITY")
+            window_name = os.environ.get("METABONK_INPUT_XDO_WINDOW")
+            window_class = os.environ.get("METABONK_INPUT_XDO_CLASS")
+            self._input_backend = XDoToolBackend(
+                display=display,
+                xauth=xauth,
+                window_name=window_name,
+                window_class=window_class,
+            )
+            print(f"[worker:{self.instance_id}] xdotool backend enabled (DISPLAY={display})")
+        except XDoToolError as e:
+            print(f"[worker:{self.instance_id}] xdotool backend failed: {e}")
+            self._input_backend = None
+            self._input_menu_bootstrap = False
+
+    def _input_should_bootstrap(self, menu_hint: Optional[bool], game_state: dict) -> bool:
+        if not self._input_backend or not self._input_menu_bootstrap:
+            return False
+        try:
+            if bool(game_state.get("isPlaying")):
+                return False
+        except Exception:
+            pass
+        cm = str(game_state.get("currentMenu") or "").strip()
+        cm_l = cm.lower()
+        # Avoid bootstrapping during combat/play states.
+        if cm_l in ("combat", "none"):
+            return False
+        if menu_hint is True:
+            return True
+        if cm:
+            return True
+        # If we have no menu hint and no menu name, still attempt to advance prompts.
+        return True
+
+    def _run_menu_bootstrap(self) -> None:
+        if not self._input_backend:
+            return
+        now = time.time()
+        if now < self._menu_bootstrap_next_ts:
+            return
+        steps = [
+            ("key_tap", "SPACE"),
+            ("key_tap", "ENTER"),
+            ("key_tap", "ESC"),
+            ("mouse_move", (12, -8)),
+            ("mouse_click", "left"),
+            ("mouse_move", (-10, 6)),
+            ("mouse_click", "left"),
+        ]
+        kind, payload = steps[self._menu_bootstrap_step % len(steps)]
+        try:
+            if kind == "key_tap":
+                self._input_backend.key_down(str(payload))
+                self._input_backend.key_up(str(payload))
+            elif kind == "mouse_move":
+                dx, dy = payload
+                self._input_backend.mouse_move(int(dx), int(dy))
+            elif kind == "mouse_click":
+                self._input_backend.mouse_button(str(payload), True)
+                self._input_backend.mouse_button(str(payload), False)
+        except Exception:
+            pass
+        self._menu_bootstrap_step += 1
+        try:
+            interval = float(os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_INTERVAL", "0.35"))
+        except Exception:
+            interval = 0.35
+        self._menu_bootstrap_next_ts = now + max(0.1, interval)
+
+    def _input_send_menu_action(self, action: "MenuAction", frame_size: Optional[tuple[int, int]]) -> bool:
+        if not self._input_backend:
+            return False
+        try:
+            kind = str(getattr(action, "kind", "") or "").lower()
+        except Exception:
+            return False
+        if kind == "key":
+            try:
+                key = str(getattr(action, "key", "") or "").strip()
+                if key:
+                    self._input_backend.key_down(key)
+                    self._input_backend.key_up(key)
+                return True
+            except Exception:
+                return False
+        if kind == "click":
+            try:
+                tx = int(getattr(action, "x", 0))
+                ty = int(getattr(action, "y", 0))
+                if frame_size:
+                    w, h = frame_size
+                    if not self._input_cursor_pos:
+                        self._input_cursor_pos = (w // 2, h // 2)
+                    cx, cy = self._input_cursor_pos
+                    dx = int(tx - cx)
+                    dy = int(ty - cy)
+                    if dx or dy:
+                        self._input_backend.mouse_move(dx, dy)
+                    self._input_cursor_pos = (tx, ty)
+                self._input_backend.mouse_button("left", True)
+                self._input_backend.mouse_button("left", False)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _input_send_actions(self, a_cont: List[float], a_disc: List[int]) -> None:
+        if not self._input_backend:
+            return
+        # Mouse move (relative).
+        if a_cont:
+            if self._input_mouse_mode == "direct":
+                dx = int(round(float(a_cont[0]))) if len(a_cont) > 0 else 0
+                dy = int(round(float(a_cont[1]))) if len(a_cont) > 1 else 0
+            else:
+                dx = int(round(float(a_cont[0]) * self._input_mouse_scale)) if len(a_cont) > 0 else 0
+                dy = int(round(float(a_cont[1]) * self._input_mouse_scale)) if len(a_cont) > 1 else 0
+            if dx or dy:
+                try:
+                    self._input_backend.mouse_move(dx, dy)
+                except Exception:
+                    pass
+        # Mouse scroll (optional, uses third continuous dim).
+        if len(a_cont) >= 3:
+            try:
+                steps = int(round(float(a_cont[2]) * self._input_scroll_scale))
+                if steps:
+                    self._input_backend.mouse_scroll(steps)
+            except Exception:
+                pass
+        # Buttons as per discrete branches (binary per branch).
+        desired_keys: set[str] = set()
+        desired_mouse: set[str] = set()
+        for i, spec in enumerate(self._input_buttons):
+            if i >= len(a_disc):
+                break
+            try:
+                pressed = int(a_disc[i]) == 1
+            except Exception:
+                pressed = False
+            if not pressed:
+                continue
+            if spec.get("kind") == "mouse":
+                desired_mouse.add(str(spec.get("button")))
+            else:
+                desired_keys.add(str(spec.get("name")))
+        # Key transitions.
+        for k in sorted(desired_keys - self._input_held_keys):
+            try:
+                self._input_backend.key_down(k)
+            except Exception:
+                pass
+        for k in sorted(self._input_held_keys - desired_keys):
+            try:
+                self._input_backend.key_up(k)
+            except Exception:
+                pass
+        self._input_held_keys = desired_keys
+        # Mouse button transitions.
+        for b in sorted(desired_mouse - self._input_held_mouse):
+            try:
+                self._input_backend.mouse_button(b, True)
+            except Exception:
+                pass
+        for b in sorted(self._input_held_mouse - desired_mouse):
+            try:
+                self._input_backend.mouse_button(b, False)
+            except Exception:
+                pass
+        self._input_held_mouse = desired_mouse
 
     def _bridge_read_frame(self) -> Optional["GameFrame"]:
         if not self.bridge or not self._bridge_loop:
@@ -1060,10 +1387,10 @@ class WorkerService:
                 )
                 if not self._bonklink.connect(timeout_s=2.0):
                     self._bonklink = None
-                    self._use_bonklink = False
+                    self._bonklink_last_attempt = time.time()
             except Exception:
                 self._bonklink = None
-                self._use_bonklink = False
+                self._bonklink_last_attempt = time.time()
         if self._use_research_shm and self._research_shm is None:
             try:
                 from src.bridge.research_shm import ResearchSharedMemoryClient
@@ -1078,6 +1405,25 @@ class WorkerService:
 
         while not self._stop.is_set():
             now = time.time()
+            if self._use_bonklink and self._bonklink is None:
+                if (now - float(getattr(self, "_bonklink_last_attempt", 0.0))) >= float(
+                    getattr(self, "_bonklink_retry_s", 5.0)
+                ):
+                    try:
+                        from src.bridge.bonklink_client import BonkLinkClient
+
+                        self._bonklink_last_attempt = now
+                        self._bonklink = BonkLinkClient(
+                            host=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"),
+                            port=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")),
+                            use_named_pipe=os.environ.get("METABONK_BONKLINK_USE_PIPE", "0")
+                            in ("1", "true", "True"),
+                            pipe_name=os.environ.get("METABONK_BONKLINK_PIPE_NAME", "BonkLink"),
+                        )
+                        if not self._bonklink.connect(timeout_s=2.0):
+                            self._bonklink = None
+                    except Exception:
+                        self._bonklink = None
             if now - last_pull > float(getattr(self, "_config_poll_s", 30.0)):
                 # Refresh config/hparams from orchestrator.
                 if requests:
@@ -1170,6 +1516,7 @@ class WorkerService:
             forced_ui_click: Optional[tuple[int, int]] = None
             suppress_policy_clicks: bool = False
             sima2_action: Optional[List[float]] = None
+            menu_override_action: Optional["MenuAction"] = None
 
             # ResearchPlugin shared memory path (highest priority if enabled).
             if self._use_research_shm and self._research_shm is not None:
@@ -1182,7 +1529,13 @@ class WorkerService:
                     used_pixels = True
                     reward_from_game = float(header.reward)
                     done_from_game = bool(header.done) or header.flag == 4
-                    frame_size = (84, 84)
+                    client_w = int(getattr(self._research_shm, "obs_width", 84) or 84)
+                    client_h = int(getattr(self._research_shm, "obs_height", 84) or 84)
+                    frame_w = int(header.obs_width or client_w)
+                    frame_h = int(header.obs_height or client_h)
+                    if frame_w * frame_h * 3 != len(pixels):
+                        frame_w, frame_h = client_w, client_h
+                    frame_size = (frame_w, frame_h)
                     try:
                         from PIL import Image
 
@@ -1219,12 +1572,7 @@ class WorkerService:
                     continue
 
             # BonkLink (state + optional JPEG frame).
-            if (
-                (not used_pixels)
-                and (not detections)
-                and self._use_bonklink
-                and self._bonklink is not None
-            ):
+            if self._use_bonklink and self._bonklink is not None:
                 try:
                     pkt = self._bonklink.read_state_frame(timeout_ms=16)
                 except Exception:
@@ -1233,7 +1581,7 @@ class WorkerService:
                     state_obj, jpeg_bytes = pkt
                     if not self._visual_only:
                         game_state.update(state_obj.to_dict())
-                    if jpeg_bytes:
+                    if (not used_pixels) and (not detections) and jpeg_bytes:
                         try:
                             import base64
                             import io
@@ -1407,14 +1755,118 @@ class WorkerService:
                         self._latest_frame_ts = now
                 except Exception:
                     self._latest_frame_ts = now
+            elif (
+                str(os.environ.get("METABONK_MENU_SNAPSHOT_FALLBACK", "1")).lower() in ("1", "true", "yes")
+                and self.streamer is not None
+                and hasattr(self.streamer, "capture_jpeg")
+            ):
+                # Best-effort snapshot for menu reasoning when no live frames are available.
+                try:
+                    snap = self.streamer.capture_jpeg(
+                        timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5"))
+                    )
+                except Exception:
+                    snap = None
+                if snap:
+                    latest_image_bytes = snap
+                    self._latest_jpeg_bytes = snap
+                    self._latest_frame_ts = now
+
+            menu_hint: Optional[bool] = None
+            if isinstance(vision_metrics, dict):
+                try:
+                    if vision_metrics.get("menu_mode") is not None:
+                        menu_hint = bool(vision_metrics.get("menu_mode"))
+                except Exception:
+                    pass
+            if menu_hint is None:
+                try:
+                    cm = str(game_state.get("currentMenu") or "").strip().lower()
+                    if cm and cm not in ("none", "combat", ""):
+                        menu_hint = True
+                    elif game_state.get("levelUpOptions"):
+                        menu_hint = True
+                    elif game_state.get("isPlaying") is True:
+                        menu_hint = False
+                    elif cm in ("none", "combat", ""):
+                        menu_hint = False
+                except Exception:
+                    pass
+            if str(os.environ.get("METABONK_MENU_FORCE", "0")).lower() in ("1", "true", "yes"):
+                menu_hint = True
+
+            if menu_hint is not None and menu_hint != self._last_menu_mode_log:
+                try:
+                    cm_dbg = str(game_state.get("currentMenu") or "")
+                except Exception:
+                    cm_dbg = ""
+                print(f"[worker:{self.instance_id}] menu_mode={menu_hint} currentMenu='{cm_dbg}'")
+                self._last_menu_mode_log = menu_hint
+
+            menu_override_active = False
+            if (
+                self._switching_controller is not None
+                and menu_hint
+                and latest_image_bytes is not None
+            ):
+                try:
+                    import io
+                    from PIL import Image
+
+                    img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
+                    menu_override_action = self._switching_controller.step(
+                        img,
+                        bool(menu_hint),
+                        detections=detections,
+                        hint=str(game_state.get("currentMenu") or ""),
+                    )
+                except Exception:
+                    menu_override_action = None
+                if menu_override_action is not None:
+                    suppress_policy_clicks = True
+                    if self._input_backend is not None:
+                        menu_override_active = self._input_send_menu_action(
+                            menu_override_action,
+                            frame_size,
+                        )
+                    elif str(getattr(menu_override_action, "kind", "")) == "click":
+                        try:
+                            forced_ui_click = (
+                                int(menu_override_action.x),
+                                int(menu_override_action.y),
+                            )
+                        except Exception:
+                            forced_ui_click = None
+
+            ui_elements_cache = None
+            action_mask_cache = None
+            try:
+                from .perception import parse_detections, build_ui_candidates
+
+                dets_parsed = parse_detections(detections)
+                ui_elements_cache, action_mask_cache, _ = build_ui_candidates(
+                    dets_parsed,
+                    frame_size=frame_size,
+                    menu_hint=menu_hint,
+                )
+            except Exception:
+                ui_elements_cache = None
+                action_mask_cache = None
 
             obs, action_mask = construct_observation(
-                detections, obs_dim=self._obs_dim_raw, frame_size=frame_size
+                detections,
+                obs_dim=self._obs_dim_raw,
+                frame_size=frame_size,
+                menu_hint=menu_hint,
+                ui_override=ui_elements_cache,
+                action_mask_override=action_mask_cache,
             )
             obs = self._stack_observation(obs)
 
             # Default policy action (PPO).
-            a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask)
+            action_mask_for_policy = action_mask if self._input_backend is None else None
+            a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask_for_policy)
+            action_mask_for_rollout = action_mask_for_policy
 
             # Optional SIMA2 backend override (inference).
             if (
@@ -1447,12 +1899,27 @@ class WorkerService:
                 except Exception:
                     sima2_action = None
 
+            # Optional menu exploration: epsilon-greedy clicks when stuck in menus.
+            if menu_hint and action_mask and self._input_backend is None:
+                try:
+                    eps = float(os.environ.get("METABONK_MENU_EPS", "0") or 0.0)
+                except Exception:
+                    eps = 0.0
+                if eps > 0.0 and random.random() < eps:
+                    try:
+                        valid = [i for i, m in enumerate(action_mask[:-1]) if m == 1]
+                        if valid:
+                            a_disc[0] = int(random.choice(valid))
+                    except Exception:
+                        pass
+
             # Optional Lobby Agent override for menus/level-up screens.
             if (
                 self._use_vlm_menu
                 and self._vlm_menu is not None
                 and latest_image_bytes is not None
                 and frame_size is not None
+                and self._input_backend is None
             ):
                 menu_mode = False
                 if isinstance(vision_metrics, dict):
@@ -1538,6 +2005,13 @@ class WorkerService:
                                 forced_ui_click = None
                     except Exception:
                         forced_ui_click = None
+
+            input_bootstrap = False
+            if self._input_backend and (not menu_override_active) and self._input_should_bootstrap(menu_hint, game_state):
+                self._run_menu_bootstrap()
+                input_bootstrap = True
+            elif self._input_backend and (not menu_override_active):
+                self._input_send_actions(a_cont, a_disc)
 
             # Optional causal Scientist updates for item/build discovery.
             if self._use_causal_scientist and self._causal_graph is not None:
@@ -1674,7 +2148,7 @@ class WorkerService:
                     pass
 
             # If ResearchPlugin SHM, send 6-float action (movement + 4 button slots).
-            if self._use_research_shm and self._research_shm is not None:
+            if self._use_research_shm and self._research_shm is not None and not input_bootstrap:
                 try:
                     btns = [0.0, 0.0, 0.0, 0.0]
                     # Current action space doesn't align with ResearchPlugin buttons;
@@ -1691,7 +2165,7 @@ class WorkerService:
                     pass
 
             # If BonkLink, send continuous movement + optional UI click.
-            if self._use_bonklink and self._bonklink is not None:
+            if self._use_bonklink and self._bonklink is not None and self._input_backend is None and not input_bootstrap:
                 try:
                     from src.bridge.bonklink_client import BonkLinkAction
                     from .perception import parse_detections, build_ui_elements
@@ -1704,14 +2178,28 @@ class WorkerService:
                         action.ui_click = True
                         action.click_x = int(forced_ui_click[0])
                         action.click_y = int(forced_ui_click[1])
+                        if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
+                            print(
+                                f"[worker:{self.instance_id}] ui_click forced x={action.click_x} y={action.click_y}"
+                            )
                     elif (not suppress_policy_clicks) and a_disc and frame_size is not None:
-                        dets_parsed = parse_detections(detections)
-                        ui_elements, action_mask2, _ = build_ui_elements(
-                            dets_parsed, frame_size=frame_size
-                        )
+                        if ui_elements_cache is not None and action_mask_cache is not None:
+                            ui_elements = ui_elements_cache
+                            action_mask2 = action_mask_cache
+                        else:
+                            dets_parsed = parse_detections(detections)
+                            ui_elements, action_mask2, _ = build_ui_elements(
+                                dets_parsed, frame_size=frame_size
+                            )
                         idx = int(a_disc[0])
+                        allow_repeat = False
+                        try:
+                            if menu_hint and os.environ.get("METABONK_MENU_ALLOW_REPEAT_CLICK", "0") in ("1", "true", "True"):
+                                allow_repeat = True
+                        except Exception:
+                            allow_repeat = False
                         if (
-                            idx != self._last_disc_action
+                            (allow_repeat or idx != self._last_disc_action)
                             and 0 <= idx < len(ui_elements)
                             and action_mask2[idx] == 1
                         ):
@@ -1720,6 +2208,10 @@ class WorkerService:
                             action.ui_click = True
                             action.click_x = int(cx * w)
                             action.click_y = int(cy * h)
+                            if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
+                                print(
+                                    f"[worker:{self.instance_id}] ui_click idx={idx} x={action.click_x} y={action.click_y}"
+                                )
                         self._last_disc_action = idx
 
                     self._bonklink.send_action(action)
@@ -1727,15 +2219,28 @@ class WorkerService:
                     pass
 
             # If bridged, send actions into the game.
-            if self._use_bridge and self.bridge and self._bridge_loop and not self._use_bonklink:
+            if self._use_bridge and self.bridge and self._bridge_loop and not self._use_bonklink and self._input_backend is None and not input_bootstrap:
                 try:
-                    from .perception import parse_detections, build_ui_elements
+                    if ui_elements_cache is not None:
+                        ui_elements = ui_elements_cache
+                        action_mask_bridge = action_mask_cache
+                    else:
+                        from .perception import parse_detections, build_ui_elements
 
-                    dets_parsed = parse_detections(detections)
-                    ui_elements, _, _ = build_ui_elements(dets_parsed, frame_size=frame_size)
+                        dets_parsed = parse_detections(detections)
+                        ui_elements, action_mask_bridge, _ = build_ui_elements(
+                            dets_parsed, frame_size=frame_size
+                        )
                 except Exception:
                     ui_elements = None
-                self._bridge_send_actions(a_cont, a_disc, ui_elements, action_mask, frame_size)
+                    action_mask_bridge = None
+                self._bridge_send_actions(
+                    a_cont,
+                    a_disc,
+                    ui_elements,
+                    action_mask_bridge if action_mask_bridge is not None else action_mask,
+                    frame_size,
+                )
 
             # Reward: prefer learned reward-from-video (progress score delta). No placeholder shaping.
             if self._use_learned_reward:
@@ -1765,6 +2270,21 @@ class WorkerService:
                     "No reward available (game reward missing and learned reward disabled). "
                     "Enable learned reward (METABONK_USE_LEARNED_REWARD=1) or provide a reward-capable bridge."
                 )
+            # Optional menu shaping: discourage menu stalls, reward exiting menus.
+            if menu_hint is not None:
+                try:
+                    menu_penalty = float(os.environ.get("METABONK_MENU_PENALTY", "0") or 0.0)
+                except Exception:
+                    menu_penalty = 0.0
+                try:
+                    menu_exit_bonus = float(os.environ.get("METABONK_MENU_EXIT_BONUS", "0") or 0.0)
+                except Exception:
+                    menu_exit_bonus = 0.0
+                if menu_hint and menu_penalty:
+                    reward += menu_penalty
+                if (not menu_hint) and (self._last_menu_mode is True) and menu_exit_bonus:
+                    reward += menu_exit_bonus
+                self._last_menu_mode = bool(menu_hint)
             # Episode done: when METABONK_VISUAL_ONLY=1, never use SHM/memory flags.
             # If the vision model exports a boolean done signal, consume it here.
             if self._visual_only and isinstance(vision_metrics, dict):
@@ -2396,12 +2916,12 @@ class WorkerService:
                 meaningful = self._is_meaningful_action(
                     a_cont,
                     a_disc,
-                    action_mask,
+                    action_mask_for_rollout,
                     forced_ui_click,
                     suppress_policy_clicks,
                 )
                 self.trainer.update(reward, meaningful=meaningful)
-                self.rollout.add(obs, a_cont, a_disc, action_mask, reward, done, lp, val)
+                self.rollout.add(obs, a_cont, a_disc, action_mask_for_rollout, reward, done, lp, val)
 
             # Optional eval clip on episode end (best-effort).
             if (
@@ -2500,6 +3020,20 @@ class WorkerService:
             except Exception:
                 move_mag = 0.0
         move_ok = move_mag >= deadband
+
+        if self._input_backend is not None:
+            key_ok = False
+            try:
+                key_ok = any(int(x) == 1 for x in a_disc)
+            except Exception:
+                key_ok = False
+            scroll_ok = False
+            try:
+                if len(a_cont) >= 3 and abs(float(a_cont[2])) >= deadband:
+                    scroll_ok = True
+            except Exception:
+                scroll_ok = False
+            return bool(move_ok or key_ok or scroll_ok)
 
         click_ok = False
         if forced_ui_click is not None:

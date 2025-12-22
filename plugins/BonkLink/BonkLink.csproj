@@ -69,6 +69,15 @@
     <Reference Include="UnityEngine.InputModule" Condition="Exists('$(UnityManagedDir)/UnityEngine.InputModule.dll')">
       <HintPath>$(UnityManagedDir)/UnityEngine.InputModule.dll</HintPath>
     </Reference>
+    <Reference Include="UnityEngine.UI" Condition="Exists('$(UnityManagedDir)/UnityEngine.UI.dll')">
+      <HintPath>$(UnityManagedDir)/UnityEngine.UI.dll</HintPath>
+    </Reference>
+    <Reference Include="Rewired_Core" Condition="Exists('$(UnityManagedDir)/Rewired_Core.dll')">
+      <HintPath>$(UnityManagedDir)/Rewired_Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Rewired_Windows" Condition="Exists('$(UnityManagedDir)/Rewired_Windows.dll')">
+      <HintPath>$(UnityManagedDir)/Rewired_Windows.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
   <!-- If compiling against real UnityEngine modules, exclude stubs to avoid type conflicts. -->

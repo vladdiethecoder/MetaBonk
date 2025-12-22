@@ -335,6 +335,11 @@ def main() -> int:
             env.setdefault("METABONK_REQUIRE_CUDA", "0")
     else:
         env.setdefault("METABONK_REQUIRE_CUDA", "1")
+    # Prefer BonkLink for real inputs + frames (no memory access).
+    env.setdefault("METABONK_USE_BONKLINK", "1")
+    env.setdefault("METABONK_BONKLINK_USE_PIPE", "0")
+    env.setdefault("METABONK_USE_LEARNED_REWARD", "1")
+    env.setdefault("METABONK_VIDEO_REWARD_CKPT", str(repo_root / "checkpoints" / "video_reward_model.pt"))
     # Default to GPU-first streaming if PipeWire is available.
     env.setdefault("METABONK_STREAM", "1")
     env.setdefault("METABONK_STREAM_CONTAINER", "mp4")
@@ -342,14 +347,18 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_BACKEND", "auto")
     env.setdefault("METABONK_STREAM_BITRATE", "6M")
     env.setdefault("METABONK_STREAM_FPS", "60")
-    env.setdefault("METABONK_STREAM_GOP", "30")
+    env.setdefault("METABONK_STREAM_GOP", "60")
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
     # Give the UI some slack for reconnects (MSE) without permanently locking out a worker
     # due to a slow/half-closed client. The UI still enforces a per-worker lock to avoid
     # intentional multi-client contention.
-    env.setdefault("METABONK_STREAM_MAX_CLIENTS", "2")
-    env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
+    env.setdefault("METABONK_STREAM_MAX_CLIENTS", "3")
+    # If explicitly forcing x11grab, we cannot require PipeWire.
+    if str(env.get("METABONK_STREAM_BACKEND") or "").strip().lower() == "x11grab":
+        env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "0")
+    else:
+        env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
     env.setdefault("METABONK_CAPTURE_DISABLED", "0")
     env.setdefault("METABONK_CAPTURE_ALL", "0")
     env.setdefault("METABONK_GST_CAPTURE", "0")
@@ -366,8 +375,23 @@ def main() -> int:
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
     env.setdefault("METABONK_MENU_WEIGHTS", str(repo_root / "checkpoints" / "menu_classifier.pt"))
     env.setdefault("METABONK_MENU_THRESH", "0.5")
+    env.setdefault("METABONK_MENU_PENALTY", "-0.01")
+    env.setdefault("METABONK_MENU_EXIT_BONUS", "1.0")
+    env.setdefault("METABONK_UI_GRID_FALLBACK", "1")
+    env.setdefault("METABONK_MENU_EPS", "0.2")
+    env.setdefault("METABONK_MENU_ALLOW_REPEAT_CLICK", "1")
     env.setdefault("METABONK_REPO_ROOT", str(repo_root))
+    env.setdefault("METABONK_VISION_WEIGHTS", str(repo_root / "yolo11n.pt"))
+    env.setdefault("MEGABONK_WIDTH", str(int(args.gamescope_width)))
+    env.setdefault("MEGABONK_HEIGHT", str(int(args.gamescope_height)))
+    env.setdefault("METABONK_STREAM_WIDTH", env.get("MEGABONK_WIDTH"))
+    env.setdefault("METABONK_STREAM_HEIGHT", env.get("MEGABONK_HEIGHT"))
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
+    if (
+        str(env.get("METABONK_USE_RESEARCH_SHM") or "0").strip().lower() in ("1", "true", "yes", "on")
+        and Path("/dev/shm").exists()
+    ):
+        env.setdefault("MEGABONK_RESEARCH_SHM_DIR", "/dev/shm")
     # Prefer serial targeting (pipewiresrc target-object is documented as name/serial).
     env.setdefault("METABONK_PIPEWIRE_TARGET_MODE", "node-serial")
 
@@ -412,6 +436,35 @@ def main() -> int:
 
         def _write_bonklink_cfg(cfg_path: Path, port: int) -> None:
             cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                jpeg_w = int(env.get("METABONK_BONKLINK_WIDTH") or env.get("MEGABONK_OBS_WIDTH") or 320)
+            except Exception:
+                jpeg_w = 320
+            try:
+                jpeg_h = int(env.get("METABONK_BONKLINK_HEIGHT") or env.get("MEGABONK_OBS_HEIGHT") or 180)
+            except Exception:
+                jpeg_h = 180
+            try:
+                jpeg_hz = int(env.get("METABONK_BONKLINK_JPEG_HZ") or 10)
+            except Exception:
+                jpeg_hz = 10
+            try:
+                jpeg_q = int(env.get("METABONK_BONKLINK_JPEG_QUALITY") or 75)
+            except Exception:
+                jpeg_q = 75
+            enable_jpeg = str(env.get("METABONK_BONKLINK_ENABLE_JPEG", "1") or "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            enable_input = str(env.get("METABONK_BONKLINK_INPUT_SNAPSHOT", "1") or "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            frame_fmt = str(env.get("METABONK_BONKLINK_FRAME_FORMAT", "raw_rgb") or "raw_rgb").strip()
             txt = (
                 "[Network]\n"
                 f"Port = {int(port)}\n"
@@ -420,11 +473,13 @@ def main() -> int:
                 "[Performance]\n"
                 "UpdateHz = 60\n\n"
                 "[Capture]\n"
-                "EnableJpeg = true\n"
-                "JpegHz = 10\n"
-                "JpegWidth = 320\n"
-                "JpegHeight = 180\n"
-                "JpegQuality = 75\n"
+                f"EnableJpeg = {'true' if enable_jpeg else 'false'}\n"
+                f"JpegHz = {int(jpeg_hz)}\n"
+                f"JpegWidth = {int(max(64, jpeg_w))}\n"
+                f"JpegHeight = {int(max(64, jpeg_h))}\n"
+                f"JpegQuality = {int(max(1, min(100, jpeg_q)))}\n"
+                f"EnableInputSnapshot = {'true' if enable_input else 'false'}\n"
+                f"FrameFormat = {frame_fmt}\n"
             )
             try:
                 cfg_path.write_text(txt)
@@ -450,8 +505,14 @@ def main() -> int:
                 print(f"[start_omega] WARN: failed to prepare BepInEx for {iid}: {e}")
                 continue
             # Configure BonkLink per instance.
+            cfg_dir = inst / "BepInEx" / "config"
             _write_bonklink_cfg(
-                inst / "BepInEx" / "config" / "BonkLink.BonkLinkPlugin.cfg",
+                cfg_dir / "com.metabonk.bonklink.cfg",
+                args.bonklink_base_port + i,
+            )
+            # Legacy filename for older installs/scripts.
+            _write_bonklink_cfg(
+                cfg_dir / "BonkLink.BonkLinkPlugin.cfg",
                 args.bonklink_base_port + i,
             )
 
@@ -556,7 +617,7 @@ def main() -> int:
         env.pop("MEGABONK_CMD", None)
         env.pop("MEGABONK_COMMAND", None)
         env["MEGABONK_CMD_TEMPLATE"] = (
-            "bash -lc \"set -euo pipefail; "
+            "bash -lc \"set -eo pipefail; "
             f"APPID={int(args.appid)}; "
             f"REPO=\\\"{str(repo_root)}\\\"; "
             "IID=\\\"{instance_id}\\\"; "
@@ -568,6 +629,9 @@ def main() -> int:
             # Force SDL (gamescope --backend sdl) to use X11 when running under Xvfb on a Wayland desktop.
             # If WAYLAND_DISPLAY is set, SDL will often pick Wayland and the Xvfb display stays black.
             "unset WAYLAND_DISPLAY; export SDL_VIDEODRIVER=x11; "
+            "if [ -n \\\"$WINEDLLOVERRIDES\\\" ]; then "
+            "export WINEDLLOVERRIDES=\\\"winhttp=n,b;$WINEDLLOVERRIDES\\\"; "
+            "else export WINEDLLOVERRIDES=\\\"winhttp=n,b\\\"; fi; "
             f"export STEAM_COMPAT_CLIENT_INSTALL_PATH=\\\"{str(Path(args.steam_root).expanduser())}\\\"; "
             "export STEAM_COMPAT_DATA_PATH=\\\"$COMPAT\\\"; "
             "export SteamAppId=$APPID; export SteamGameId=$APPID; export WINEDEBUG=-all; "
@@ -596,6 +660,8 @@ def main() -> int:
                         "src.vision.service",
                         "--port",
                         str(args.vision_port),
+                        "--weights",
+                        str(env.get("METABONK_VISION_WEIGHTS", "yolo11n.pt") or "yolo11n.pt"),
                         "--device",
                         str(env.get("METABONK_VISION_DEVICE", "") or ""),
                     ],
@@ -626,6 +692,7 @@ def main() -> int:
             iid = f"{args.instance_prefix}-{i}"
             wenv = env.copy()
             wenv["INSTANCE_ID"] = iid
+            wenv["MEGABONK_INSTANCE_ID"] = iid
             wenv["POLICY_NAME"] = args.policy_name
             wenv["WORKER_PORT"] = str(args.worker_base_port + i)
             wenv["MEGABONK_SIDECAR_PORT"] = str(args.sidecar_base_port + i)
@@ -641,6 +708,8 @@ def main() -> int:
                 wenv.pop("WAYLAND_DISPLAY", None)
                 wenv["SDL_VIDEODRIVER"] = "x11"
                 wenv.setdefault("XDG_SESSION_TYPE", "x11")
+                wenv.setdefault("METABONK_INPUT_DISPLAY", wenv["DISPLAY"])
+                wenv.setdefault("METABONK_INPUT_BACKEND", "xdotool")
                 procs.append(
                     _spawn(
                         f"xvfb-{iid}",

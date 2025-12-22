@@ -25,6 +25,10 @@ using System.Text;
 using System.Threading;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using Rewired;
+using UnityEngine.SceneManagement;
 
 namespace BonkLink
 {
@@ -50,6 +54,11 @@ namespace BonkLink
         private ConfigEntry<int> _jpegQuality;
         private ConfigEntry<bool> _enableInputSnapshot;
         private ConfigEntry<string> _frameFormat;
+        private ConfigEntry<bool> _enableRewiredInput;
+        private ConfigEntry<string> _rewiredLayoutName;
+        private ConfigEntry<string> _rewiredTag;
+        private ConfigEntry<bool> _rewiredUseSystemPlayer;
+        private ConfigEntry<int> _rewiredPlayerId;
         
         // Networking
         private TcpListener _tcpListener;
@@ -67,6 +76,11 @@ namespace BonkLink
         private ActionBuffer _actionBuffer;
         private object _stateLock = new object();
         private object _actionLock = new object();
+        private string _lastMenu = "";
+        private bool _lastIsPlaying = false;
+        private bool _lastIsPaused = false;
+        private bool _loggedStateOnce = false;
+        private RewiredUiBridge _rewiredBridge;
 
         // Optional human input snapshot (disabled by default).
         private UnityInputSnapshot _hinp;
@@ -126,6 +140,11 @@ namespace BonkLink
                 defaultFmt,
                 "Frame payload encoding: 'jpeg' (Unity EncodeToJPG; may crash under Wine/Proton) or 'raw_rgb' (uncompressed RGB with MBRF header)."
             );
+            _enableRewiredInput = Config.Bind("Input", "EnableRewiredInput", true, "Inject UI input via Rewired CustomController.");
+            _rewiredLayoutName = Config.Bind("Input", "RewiredLayoutName", "", "Optional Rewired CustomController layout name. Leave empty to auto-pick.");
+            _rewiredTag = Config.Bind("Input", "RewiredTag", "BonkLink", "Tag assigned to the custom controller.");
+            _rewiredUseSystemPlayer = Config.Bind("Input", "RewiredUseSystemPlayer", true, "Attach the custom controller to the System Player (preferred for UI).");
+            _rewiredPlayerId = Config.Bind("Input", "RewiredPlayerId", 0, "Player id to attach when not using System Player.");
             
             // Initialize buffers
             _stateBuffer = new GameStateBuffer();
@@ -378,6 +397,18 @@ namespace BonkLink
                 _stateBuffer.currentMenu = GetCurrentMenu();
                 _stateBuffer.levelUpOptions = GetLevelUpOptions();
 
+                if (!_loggedStateOnce
+                    || _stateBuffer.currentMenu != _lastMenu
+                    || _stateBuffer.isPlaying != _lastIsPlaying
+                    || _stateBuffer.isPaused != _lastIsPaused)
+                {
+                    Log.LogInfo($"State: menu='{_stateBuffer.currentMenu}' playing={_stateBuffer.isPlaying} paused={_stateBuffer.isPaused}");
+                    _lastMenu = _stateBuffer.currentMenu;
+                    _lastIsPlaying = _stateBuffer.isPlaying;
+                    _lastIsPaused = _stateBuffer.isPaused;
+                    _loggedStateOnce = true;
+                }
+
                 // Optional input snapshot trailer (off by default; does not affect visual-only learning).
                 bool wantInput = _enableInputSnapshot != null && _enableInputSnapshot.Value;
                 _stateBuffer.includeInputTrailer = wantInput && _hinp != null;
@@ -424,35 +455,61 @@ namespace BonkLink
         /// </summary>
         public void ApplyAction()
         {
+            float moveX = 0f;
+            float moveY = 0f;
+            float aimX = 0f;
+            float aimY = 0f;
+            bool fire = false;
+            bool ability = false;
+            bool interact = false;
+            bool uiClick = false;
+            int clickX = 0;
+            int clickY = 0;
+            bool hadAction = false;
+
             lock (_actionLock)
             {
-                if (!_actionBuffer.hasAction) return;
-                
-                // Movement
-                SetPlayerInput(
-                    _actionBuffer.moveX,
-                    _actionBuffer.moveY
-                );
-                
-                // Aim/Look
-                SetPlayerAim(
-                    _actionBuffer.aimX,
-                    _actionBuffer.aimY
-                );
-                
-                // Actions
-                if (_actionBuffer.fire) TriggerFire();
-                if (_actionBuffer.ability) TriggerAbility();
-                if (_actionBuffer.interact) TriggerInteract();
-                
-                // UI
-                if (_actionBuffer.uiClick)
+                if (_actionBuffer.hasAction)
                 {
-                    ClickAtPosition(_actionBuffer.clickX, _actionBuffer.clickY);
+                    moveX = _actionBuffer.moveX;
+                    moveY = _actionBuffer.moveY;
+                    aimX = _actionBuffer.aimX;
+                    aimY = _actionBuffer.aimY;
+                    fire = _actionBuffer.fire;
+                    ability = _actionBuffer.ability;
+                    interact = _actionBuffer.interact;
+                    uiClick = _actionBuffer.uiClick;
+                    clickX = _actionBuffer.clickX;
+                    clickY = _actionBuffer.clickY;
+                    _actionBuffer.hasAction = false;
+                    hadAction = true;
                 }
-                
-                _actionBuffer.hasAction = false;
             }
+
+            if (!hadAction)
+            {
+                _rewiredBridge?.SetNeutral();
+                return;
+            }
+
+            // Movement
+            SetPlayerInput(moveX, moveY);
+
+            // Aim/Look
+            SetPlayerAim(aimX, aimY);
+
+            // Actions
+            if (fire) TriggerFire();
+            if (ability) TriggerAbility();
+            if (interact) TriggerInteract();
+
+            // UI
+            if (uiClick)
+            {
+                ClickAtPosition(clickX, clickY);
+            }
+
+            _rewiredBridge?.UpdateFromAction(moveX, moveY, fire, ability, interact, uiClick, IsInGameplay());
         }
 
         internal bool CaptureEnabled()
@@ -567,27 +624,76 @@ namespace BonkLink
         // Game Access Methods (implement via Harmony hooks or reflection)
         // =========================================================================
         
+        private GameObject FindPlayer()
+        {
+            try { return GameObject.FindWithTag("Player"); } catch { return null; }
+        }
+
         private Vector3 GetPlayerPosition()
         {
-            // TODO: Hook to actual player transform
-            // Example: return Player.Instance?.transform.position ?? Vector3.zero;
-            return Vector3.zero;
+            try
+            {
+                var p = FindPlayer();
+                return p != null ? p.transform.position : Vector3.zero;
+            }
+            catch { return Vector3.zero; }
         }
 
         private Vector3 GetPlayerVelocity()
         {
-            // TODO: Hook to player rigidbody
+            try
+            {
+                var p = FindPlayer();
+                if (p == null) return Vector3.zero;
+                var rb = p.GetComponent("Rigidbody");
+                if (rb != null)
+                {
+                    var prop = rb.GetType().GetProperty("velocity");
+                    if (prop != null)
+                    {
+                        var v = prop.GetValue(rb, null);
+                        if (v is Vector3 v3) return v3;
+                    }
+                }
+                var rb2 = p.GetComponent("Rigidbody2D");
+                if (rb2 != null)
+                {
+                    var prop = rb2.GetType().GetProperty("velocity");
+                    if (prop != null)
+                    {
+                        var v = prop.GetValue(rb2, null);
+                        if (v is Vector2 v2) return new Vector3(v2.x, v2.y, 0f);
+                    }
+                }
+            }
+            catch { }
             return Vector3.zero;
         }
 
         private float GetPlayerHealth() => 100f;
         private float GetPlayerMaxHealth() => 100f;
-        private bool IsInGameplay() => true;
-        private bool IsPaused() => false;
+        private bool IsInGameplay()
+        {
+            try { return FindPlayer() != null; } catch { return false; }
+        }
+        private bool IsPaused()
+        {
+            try { return Time.timeScale <= 0.0f; } catch { return false; }
+        }
         
         private List<EnemyState> GetNearbyEnemies(int max) => new List<EnemyState>();
         private List<PickupState> GetNearbyPickups(int max) => new List<PickupState>();
-        private string GetCurrentMenu() => "None";
+        private string GetCurrentMenu()
+        {
+            if (IsInGameplay()) return "Gameplay";
+            try
+            {
+                var scene = SceneManager.GetActiveScene();
+                var name = scene.name;
+                return string.IsNullOrEmpty(name) ? "Menu" : name;
+            }
+            catch { return "Menu"; }
+        }
         private List<string> GetLevelUpOptions() => new List<string>();
         
         private void SetPlayerInput(float x, float y) { }
@@ -595,7 +701,85 @@ namespace BonkLink
         private void TriggerFire() { }
         private void TriggerAbility() { }
         private void TriggerInteract() { }
-        private void ClickAtPosition(int x, int y) { }
+        private void ClickAtPosition(int x, int y)
+        {
+            try
+            {
+                var es = EventSystem.current;
+                if (es == null) return;
+                int capW = 0;
+                int capH = 0;
+                try { capW = _jpegWidth != null ? _jpegWidth.Value : 0; } catch { capW = 0; }
+                try { capH = _jpegHeight != null ? _jpegHeight.Value : 0; } catch { capH = 0; }
+                float sx = x;
+                float sy = y;
+                if (capW > 0 && capH > 0)
+                {
+                    sx = (float)x / capW * Screen.width;
+                    sy = (float)y / capH * Screen.height;
+                }
+                var ped = new PointerEventData(es) { position = new Vector2(sx, sy) };
+                var results = new Il2CppSystem.Collections.Generic.List<RaycastResult>();
+                es.RaycastAll(ped, results);
+                if (results.Count > 0)
+                {
+                    var target = results[0].gameObject;
+                    es.SetSelectedGameObject(target);
+                    ExecuteEvents.Execute(target, ped, ExecuteEvents.pointerDownHandler);
+                    ExecuteEvents.Execute(target, ped, ExecuteEvents.pointerUpHandler);
+                    ExecuteEvents.Execute(target, ped, ExecuteEvents.pointerClickHandler);
+                    ExecuteEvents.Execute(target, ped, ExecuteEvents.submitHandler);
+                }
+                else
+                {
+                    var fallback = es.currentSelectedGameObject ?? es.firstSelectedGameObject;
+                    if (fallback != null)
+                    {
+                        var bed = new BaseEventData(es);
+                        ExecuteEvents.Execute(fallback, bed, ExecuteEvents.submitHandler);
+                    }
+                    else
+                    {
+                        var selectable = UnityEngine.Object.FindObjectOfType<Selectable>();
+                        if (selectable != null)
+                        {
+                            es.SetSelectedGameObject(selectable.gameObject);
+                            var bed = new BaseEventData(es);
+                            ExecuteEvents.Execute(selectable.gameObject, bed, ExecuteEvents.submitHandler);
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                try { Log?.LogWarning($"ClickAtPosition error: {e.Message}"); } catch { }
+            }
+        }
+
+        internal void TryInitRewired()
+        {
+            if (_rewiredBridge != null) return;
+            try
+            {
+                if (_enableRewiredInput == null || !_enableRewiredInput.Value) return;
+            }
+            catch { return; }
+
+            try
+            {
+                _rewiredBridge = RewiredUiBridge.TryCreate(
+                    _rewiredLayoutName?.Value,
+                    _rewiredTag?.Value,
+                    _rewiredUseSystemPlayer != null && _rewiredUseSystemPlayer.Value,
+                    _rewiredPlayerId != null ? _rewiredPlayerId.Value : 0,
+                    Log
+                );
+            }
+            catch (Exception e)
+            {
+                try { Log?.LogWarning($"Rewired init error: {e.Message}"); } catch { }
+            }
+        }
     }
 
     public class BonkLinkUpdater : MonoBehaviour
@@ -609,6 +793,8 @@ namespace BonkLink
         {
             var inst = BonkLinkPlugin.Instance;
             if (inst == null) return;
+
+            inst.TryInitRewired();
 
             // Always refresh input snapshot on the main thread.
             inst.UpdateHumanInputSnapshot();
@@ -636,6 +822,302 @@ namespace BonkLink
             if (now < _nextCaptureTs) return;
             _nextCaptureTs = now + (1.0f / Mathf.Max(1, hz));
             inst.CaptureFrame();
+        }
+    }
+
+    internal class RewiredUiBridge
+    {
+        private readonly ManualLogSource _log;
+        private CustomController _controller;
+        private Player _player;
+        private int _axisH = 0;
+        private int _axisV = 1;
+        private int _btnSubmit = 0;
+        private int _btnCancel = 1;
+        private float _pendingH;
+        private float _pendingV;
+        private bool _pendingSubmit;
+        private bool _pendingCancel;
+
+        private RewiredUiBridge(ManualLogSource log)
+        {
+            _log = log;
+        }
+
+        public static RewiredUiBridge TryCreate(string layoutName, string tag, bool useSystemPlayer, int playerId, ManualLogSource log)
+        {
+            if (!ReInput.isReady)
+            {
+                return null;
+            }
+
+            var bridge = new RewiredUiBridge(log);
+            if (!bridge.Init(layoutName, tag, useSystemPlayer, playerId))
+            {
+                return null;
+            }
+            return bridge;
+        }
+
+        private bool Init(string layoutName, string tag, bool useSystemPlayer, int playerId)
+        {
+            try
+            {
+                var layouts = ReInput.mapping.CustomControllerLayouts;
+                if (layouts != null)
+                {
+                    int count = GetIl2CppListCount(layouts);
+                    if (count > 0)
+                    {
+                        var names = new List<string>();
+                        for (int i = 0; i < count; i++)
+                        {
+                            var layout = GetIl2CppListItem(layouts, i) as InputLayout;
+                            if (layout == null) continue;
+                            var name = layout.name ?? layout.descriptiveName ?? layout.nonLocalizedDescriptiveName;
+                            if (!string.IsNullOrEmpty(name)) names.Add($"{name} (id={layout.id})");
+                        }
+                        if (names.Count > 0)
+                        {
+                            _log?.LogInfo($"Rewired custom controller layouts: {string.Join(", ", names)}");
+                        }
+                    }
+                }
+                int layoutId = -1;
+                if (!string.IsNullOrWhiteSpace(layoutName))
+                {
+                    layoutId = ReInput.mapping.GetCustomControllerLayoutId(layoutName);
+                    if (layoutId < 0)
+                    {
+                        _log?.LogWarning($"Rewired layout '{layoutName}' not found; falling back to auto-pick.");
+                    }
+                }
+
+                CustomController controller = null;
+                if (layoutId >= 0)
+                {
+                    controller = ReInput.controllers.CreateCustomController(layoutId, tag ?? "BonkLink");
+                }
+                else if (layouts != null)
+                {
+                    int count = GetIl2CppListCount(layouts);
+                    for (int i = 0; i < count; i++)
+                    {
+                        var layout = GetIl2CppListItem(layouts, i) as InputLayout;
+                        int id = layout != null ? layout.id : -1;
+                        if (id < 0) continue;
+                        try
+                        {
+                            controller = ReInput.controllers.CreateCustomController(id, tag ?? "BonkLink");
+                            if (controller == null) continue;
+                            if (controller.axisCount >= 2 && controller.buttonCount >= 2)
+                            {
+                                break;
+                            }
+                            ReInput.controllers.DestroyCustomController(controller);
+                            controller = null;
+                        }
+                        catch
+                        {
+                            if (controller != null)
+                            {
+                                try { ReInput.controllers.DestroyCustomController(controller); } catch { }
+                                controller = null;
+                            }
+                        }
+                    }
+                }
+
+                if (controller == null)
+                {
+                    _log?.LogWarning("Failed to create Rewired CustomController (no suitable layout).");
+                    return false;
+                }
+
+                controller.enabled = true;
+                _controller = controller;
+                _player = useSystemPlayer ? ReInput.players.GetSystemPlayer() : ReInput.players.GetPlayer(playerId);
+                if (_player == null)
+                {
+                    _player = ReInput.players.GetSystemPlayer();
+                }
+
+                if (_player == null)
+                {
+                    _log?.LogWarning("Rewired player not found; custom controller not assigned.");
+                    return false;
+                }
+
+                _player.controllers.AddController(_controller, true);
+                ResolveElementIndices();
+                _log?.LogInfo($"Rewired CustomController active: layout sourceId={_controller.sourceControllerId}, axisCount={_controller.axisCount}, buttonCount={_controller.buttonCount}, player={_player.id}");
+                return true;
+            }
+            catch (Exception e)
+            {
+                _log?.LogWarning($"Rewired init failed: {e.Message}");
+                return false;
+            }
+        }
+
+        private void ResolveElementIndices()
+        {
+            try
+            {
+                var axisIds = _controller.AxisElementIdentifiers;
+                var buttonIds = _controller.ButtonElementIdentifiers;
+                _axisH = FindElementIndex(axisIds, new[] { "UIHorizontal", "Horizontal", "MoveX", "X" }, _axisH);
+                _axisV = FindElementIndex(axisIds, new[] { "UIVertical", "Vertical", "MoveY", "Y" }, _axisV);
+                _btnSubmit = FindElementIndex(buttonIds, new[] { "UISubmit", "Submit", "Accept", "A", "Confirm" }, _btnSubmit);
+                _btnCancel = FindElementIndex(buttonIds, new[] { "UICancel", "Cancel", "Back", "B" }, _btnCancel);
+                _log?.LogInfo($"Rewired element mapping: axisH={_axisH} axisV={_axisV} submit={_btnSubmit} cancel={_btnCancel}");
+            }
+            catch (Exception e)
+            {
+                _log?.LogWarning($"Rewired element mapping failed: {e.Message}");
+            }
+        }
+
+        private int FindElementIndex(Il2CppSystem.Collections.Generic.IList<ControllerElementIdentifier> ids, string[] preferredNames, int fallback)
+        {
+            if (ids == null) return fallback;
+            int count = GetIl2CppListCount(ids);
+            for (int i = 0; i < count; i++)
+            {
+                var id = GetIl2CppListItem(ids, i) as ControllerElementIdentifier;
+                if (id != null)
+                {
+                    var name = (id.name ?? id.nonLocalizedName ?? "").Trim();
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        for (int p = 0; p < preferredNames.Length; p++)
+                        {
+                            if (string.Equals(name, preferredNames[p], StringComparison.OrdinalIgnoreCase))
+                            {
+                                return i;
+                            }
+                        }
+                    }
+                }
+            }
+            return fallback;
+        }
+
+        private static int GetIl2CppListCount(object list)
+        {
+            if (list == null) return 0;
+            var t = list.GetType();
+            try
+            {
+                var prop = t.GetProperty("Count") ?? t.GetProperty("count");
+                if (prop != null) return (int)prop.GetValue(list, null);
+            }
+            catch { }
+            try
+            {
+                var method = t.GetMethod("get_Count");
+                if (method != null) return (int)method.Invoke(list, null);
+            }
+            catch { }
+            return 0;
+        }
+
+        private static object GetIl2CppListItem(object list, int index)
+        {
+            if (list == null) return null;
+            var t = list.GetType();
+            try
+            {
+                var prop = t.GetProperty("Item");
+                if (prop != null) return prop.GetValue(list, new object[] { index });
+            }
+            catch { }
+            try
+            {
+                var method = t.GetMethod("get_Item");
+                if (method != null) return method.Invoke(list, new object[] { index });
+            }
+            catch { }
+            return null;
+        }
+
+        public void SetNeutral()
+        {
+            _pendingH = 0f;
+            _pendingV = 0f;
+            _pendingSubmit = false;
+            _pendingCancel = false;
+            Apply();
+        }
+
+        public void UpdateFromAction(float moveX, float moveY, bool fire, bool ability, bool interact, bool uiClick, bool inGameplay)
+        {
+            if (_controller == null) return;
+            _pendingH = Mathf.Clamp(moveX, -1f, 1f);
+            _pendingV = Mathf.Clamp(-moveY, -1f, 1f);
+
+            bool menuMode = !inGameplay;
+            if (menuMode && (fire || interact))
+            {
+                _pendingSubmit = true;
+            }
+            if (menuMode && ability)
+            {
+                _pendingCancel = true;
+            }
+            if (uiClick)
+            {
+                _pendingSubmit = true;
+            }
+
+            if (menuMode && (_pendingSubmit || _pendingCancel))
+            {
+                EnsureEventSystemSelection();
+            }
+
+            Apply();
+        }
+
+        private void Apply()
+        {
+            if (_controller == null) return;
+            try
+            {
+                _controller.SetAxisValue(_axisH, _pendingH);
+                _controller.SetAxisValue(_axisV, _pendingV);
+                _controller.SetButtonValue(_btnSubmit, _pendingSubmit);
+                _controller.SetButtonValue(_btnCancel, _pendingCancel);
+            }
+            catch (Exception e)
+            {
+                _log?.LogWarning($"Rewired apply failed: {e.Message}");
+            }
+            finally
+            {
+                _pendingSubmit = false;
+                _pendingCancel = false;
+            }
+        }
+
+        private static void EnsureEventSystemSelection()
+        {
+            try
+            {
+                var es = EventSystem.current;
+                if (es == null) return;
+                if (es.currentSelectedGameObject != null) return;
+                if (es.firstSelectedGameObject != null)
+                {
+                    es.SetSelectedGameObject(es.firstSelectedGameObject);
+                    return;
+                }
+                var selectable = UnityEngine.Object.FindObjectOfType<Selectable>();
+                if (selectable != null)
+                {
+                    es.SetSelectedGameObject(selectable.gameObject);
+                }
+            }
+            catch { }
         }
     }
 

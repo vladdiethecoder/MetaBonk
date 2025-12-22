@@ -37,12 +37,10 @@ namespace MegabonkResearch
         // CONFIGURATION
         // ═══════════════════════════════════════════════════════════
         
-        private const int OBS_WIDTH = 84;
-        private const int OBS_HEIGHT = 84;
         private const int HEADER_SIZE = 0x20;
-        private const int OBS_SIZE = OBS_WIDTH * OBS_HEIGHT * 3;
         private const int ACTION_SIZE = 6 * 4; // 6 floats
-        private const int TOTAL_SIZE = HEADER_SIZE + OBS_SIZE + ACTION_SIZE;
+        private const int HEADER_OBS_WIDTH_OFFSET = 0x18;
+        private const int HEADER_OBS_HEIGHT_OFFSET = 0x1C;
         
         // Flag values
         private const int FLAG_WAIT = 0;
@@ -62,11 +60,18 @@ namespace MegabonkResearch
         private MemoryMappedFile shm;
         private MemoryMappedViewAccessor accessor;
         private string shmName;
+        private int obsWidth = 84;
+        private int obsHeight = 84;
+        private int obsSize;
+        private int totalSize;
+        private int? obsCullingMask;
         
         // Rendering
         private RenderTexture obsRT;
-        private Texture2D obsTex;
         private Camera obsCamera;
+        private byte[] obsPixelBuffer;
+        private bool readbackPending = false;
+        private bool warnedReadbackSize = false;
         
         // Stepping
         private bool deterministicMode = false;
@@ -89,8 +94,12 @@ namespace MegabonkResearch
             // Check if deterministic mode is enabled
             deterministicMode = Environment.GetEnvironmentVariable("MEGABONK_DETERMINISTIC") == "1";
             
+            // Configure observation shape before shared memory init.
+            ConfigureObservationFromEnv();
+
             // Initialize shared memory
             InitSharedMemory();
+            WriteObsShape();
             
             // Unlock all content
             UnlockAllContent();
@@ -122,6 +131,16 @@ namespace MegabonkResearch
         {
             try
             {
+                string shmDir = Environment.GetEnvironmentVariable("MEGABONK_RESEARCH_SHM_DIR") ?? "";
+                if (!string.IsNullOrWhiteSpace(shmDir))
+                {
+                    string path = Path.Combine(shmDir, shmName);
+                    shm = MemoryMappedFile.CreateFromFile(path, FileMode.OpenOrCreate, null, totalSize);
+                    accessor = shm.CreateViewAccessor();
+                    Log.LogInfo($"Created shared memory file: {path}");
+                    return;
+                }
+
                 // Try to open existing (Python creates it)
                 shm = MemoryMappedFile.OpenExisting(shmName);
                 accessor = shm.CreateViewAccessor();
@@ -130,9 +149,14 @@ namespace MegabonkResearch
             catch (FileNotFoundException)
             {
                 // Create new if Python hasn't created it yet
-                shm = MemoryMappedFile.CreateOrOpen(shmName, TOTAL_SIZE);
+                shm = MemoryMappedFile.CreateOrOpen(shmName, totalSize);
                 accessor = shm.CreateViewAccessor();
                 Log.LogInfo($"Created shared memory: {shmName}");
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"Failed to open shared memory: {ex.Message}");
+                throw;
             }
         }
         
@@ -149,7 +173,7 @@ namespace MegabonkResearch
         private float[] ReadAction()
         {
             float[] action = new float[6];
-            int offset = HEADER_SIZE + OBS_SIZE;
+            int offset = HEADER_SIZE + obsSize;
             
             for (int i = 0; i < 6; i++)
             {
@@ -183,6 +207,13 @@ namespace MegabonkResearch
         {
             accessor.WriteArray(HEADER_SIZE, pixels, 0, pixels.Length);
         }
+
+        private void WriteObsShape()
+        {
+            if (accessor == null) return;
+            accessor.Write(HEADER_OBS_WIDTH_OFFSET, obsWidth);
+            accessor.Write(HEADER_OBS_HEIGHT_OFFSET, obsHeight);
+        }
         
         // ═══════════════════════════════════════════════════════════
         // OBSERVATION CAPTURE
@@ -190,11 +221,11 @@ namespace MegabonkResearch
         
         void Start()
         {
+            DontDestroyOnLoad(gameObject);
             // Create observation render texture
-            obsRT = new RenderTexture(OBS_WIDTH, OBS_HEIGHT, 24, RenderTextureFormat.ARGB32);
+            obsRT = new RenderTexture(obsWidth, obsHeight, 24, RenderTextureFormat.ARGB32);
             obsRT.Create();
-            
-            obsTex = new Texture2D(OBS_WIDTH, OBS_HEIGHT, TextureFormat.RGB24, false);
+            obsPixelBuffer = new byte[obsSize];
             
             // Find or create observation camera
             SetupObservationCamera();
@@ -204,45 +235,75 @@ namespace MegabonkResearch
         {
             // Try to find existing camera
             Camera mainCam = Camera.main;
-            
-            if (mainCam != null)
+            if (mainCam == null && Camera.allCamerasCount > 0)
             {
-                // Create a child camera for observations
-                GameObject obsCamObj = new GameObject("ObservationCamera");
-                obsCamera = obsCamObj.AddComponent<Camera>();
-                obsCamera.CopyFrom(mainCam);
-                obsCamera.targetTexture = obsRT;
-                obsCamera.enabled = true;
-                
-                // Follow main camera
-                obsCamObj.transform.SetParent(mainCam.transform);
-                obsCamObj.transform.localPosition = Vector3.zero;
-                obsCamObj.transform.localRotation = Quaternion.identity;
+                Camera[] cams = new Camera[Camera.allCamerasCount];
+                Camera.GetAllCameras(cams);
+                if (cams.Length > 0)
+                {
+                    mainCam = cams[0];
+                }
             }
+
+            if (mainCam == null)
+            {
+                Log.LogWarning("No camera found for observation capture.");
+                return;
+            }
+
+            // Create a child camera for observations
+            GameObject obsCamObj = new GameObject("ObservationCamera");
+            obsCamera = obsCamObj.AddComponent<Camera>();
+            obsCamera.CopyFrom(mainCam);
+            obsCamera.targetTexture = obsRT;
+            obsCamera.enabled = true;
+            if (obsCullingMask.HasValue)
+            {
+                obsCamera.cullingMask = obsCullingMask.Value;
+            }
+
+            // Follow main camera
+            obsCamObj.transform.SetParent(mainCam.transform);
+            obsCamObj.transform.localPosition = Vector3.zero;
+            obsCamObj.transform.localRotation = Quaternion.identity;
         }
         
         private void CaptureObservation()
         {
-            if (obsCamera == null || obsRT == null) return;
-            
+            if (obsCamera == null)
+            {
+                SetupObservationCamera();
+            }
+            if (obsCamera == null || obsRT == null || readbackPending) return;
+
             // Use AsyncGPUReadback for non-blocking capture
+            readbackPending = true;
             AsyncGPUReadback.Request(obsRT, 0, TextureFormat.RGB24, OnReadbackComplete);
         }
         
         private void OnReadbackComplete(AsyncGPUReadbackRequest request)
         {
+            readbackPending = false;
             if (request.hasError)
             {
                 Log.LogWarning("GPU readback failed");
                 return;
             }
-            
-            // Get pixel data
+
             var data = request.GetData<byte>();
-            byte[] pixels = data.ToArray();
+            if (obsPixelBuffer == null || data.Length != obsPixelBuffer.Length)
+            {
+                if (!warnedReadbackSize)
+                {
+                    Log.LogWarning($"Readback size mismatch: expected {obsPixelBuffer?.Length ?? 0} bytes, got {data.Length}");
+                    warnedReadbackSize = true;
+                }
+                return;
+            }
+            data.CopyTo(obsPixelBuffer);
             
             // Write to shared memory
-            WriteObservation(pixels);
+            WriteObservation(obsPixelBuffer);
             WriteStep(currentStep);
             WriteGameTime((int)(Time.timeSinceLevelLoad * 1000));
             
@@ -256,10 +317,9 @@ namespace MegabonkResearch
         
         void LateUpdate()
         {
-            if (!deterministicMode) return;
-            
             // Capture observation
             CaptureObservation();
+            if (!deterministicMode) return;
             
             // Wait for action
             waitingForAction = true;
@@ -295,6 +355,35 @@ namespace MegabonkResearch
                 // Would inject into player controller here
                 // This depends on Megabonk's specific implementation
             }
+        }
+
+        private void ConfigureObservationFromEnv()
+        {
+            obsWidth = ReadEnvInt("MEGABONK_OBS_WIDTH", obsWidth);
+            obsHeight = ReadEnvInt("MEGABONK_OBS_HEIGHT", obsHeight);
+            obsCullingMask = ReadEnvIntNullable("MEGABONK_OBS_CULLING_MASK");
+            obsSize = obsWidth * obsHeight * 3;
+            totalSize = HEADER_SIZE + obsSize + ACTION_SIZE;
+        }
+
+        private static int ReadEnvInt(string name, int fallback)
+        {
+            string val = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(val) && int.TryParse(val, out int parsed) && parsed > 0)
+            {
+                return parsed;
+            }
+            return fallback;
+        }
+
+        private static int? ReadEnvIntNullable(string name)
+        {
+            string val = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(val) && int.TryParse(val, out int parsed))
+            {
+                return parsed;
+            }
+            return null;
         }
         
         private void HandleReset()

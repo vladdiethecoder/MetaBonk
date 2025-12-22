@@ -394,6 +394,12 @@ def _get_or_create(policy_name: str, obs_dim: int) -> PolicyLearner:
     cfg = PPOConfig(
         entropy_coef=bias.entropy_coef if bias else PPOConfig.entropy_coef,
     )
+    try:
+        from .ppo import apply_env_overrides
+
+        cfg = apply_env_overrides(cfg)
+    except Exception:
+        pass
     if os.environ.get("METABONK_PPO_USE_LSTM", "0") in ("1", "true", "True"):
         cfg.use_lstm = True
     try:
@@ -762,6 +768,56 @@ async def push_rollout(batch: RolloutBatch):
                 else:
                     cpqe_losses = cpqe.update_policy(act_batch, obs_batch)
                     cpqe_losses["cpqe_distill_source"] = "on_policy"
+
+                # Optional Q-ensemble TD updates from on-policy windows.
+                try:
+                    q_updates = int(os.environ.get("METABONK_CPQE_Q_UPDATES", "1"))
+                    q_gamma = float(os.environ.get("METABONK_CPQE_Q_GAMMA", "0.99"))
+                    if q_updates > 0:
+                        q_losses = []
+                        for _ in range(q_updates):
+                            q_obs = []
+                            q_next = []
+                            q_rewards = []
+                            q_dones = []
+                            N = obs_t.shape[0]
+                            for i in range(0, max(1, N - 2)):
+                                o_win = obs_t[i : i + 2]
+                                if o_win.shape[0] < 2:
+                                    o_win = torch.cat([o_win, o_win[-1:]], dim=0)
+                                o_win = o_win.unsqueeze(0)
+                                o_next = obs_t[i + 1 : i + 3]
+                                if o_next.shape[0] < 2:
+                                    o_next = torch.cat([o_next, o_next[-1:]], dim=0)
+                                o_next = o_next.unsqueeze(0)
+                                r = rewards_t[i : i + 1]
+                                d = dones_t[i : i + 1]
+                                q_obs.append(o_win)
+                                q_next.append(o_next)
+                                q_rewards.append(r)
+                                q_dones.append(d)
+                                if len(q_obs) >= 64:
+                                    break
+                            if q_obs:
+                                q_obs_b = torch.cat(q_obs, dim=0)
+                                q_next_b = torch.cat(q_next, dim=0)
+                                q_rewards_b = torch.cat(q_rewards, dim=0).view(-1)
+                                q_dones_b = torch.cat(q_dones, dim=0).view(-1)
+                                q_actions_b = act_batch[: q_obs_b.shape[0]].detach()
+                                q_loss_out = cpqe.update_q(
+                                    q_obs_b,
+                                    q_actions_b,
+                                    q_rewards_b,
+                                    q_next_b,
+                                    q_dones_b,
+                                    gamma=q_gamma,
+                                )
+                                q_losses.append(q_loss_out.get("q_loss", 0.0))
+                        if q_losses:
+                            cpqe_losses["cpqe_q_loss"] = float(sum(q_losses) / max(1, len(q_losses)))
+                            cpqe_losses["cpqe_q_updates"] = int(q_updates)
+                except Exception:
+                    pass
             else:
                 cpqe_losses = {}
         else:
@@ -1135,6 +1191,8 @@ async def merge_policies(payload: Dict[str, Any]):
     method = str(payload.get("method") or "ties").lower()
     topk = float(payload.get("topk") or 0.2)
     role_weights = payload.get("role_weights") if isinstance(payload.get("role_weights"), dict) else None
+    dry_run = bool(payload.get("dry_run") or False)
+    force = bool(payload.get("force") or False) or os.environ.get("METABONK_MERGE_FORCE", "0") in ("1", "true", "True")
     auto_llm = bool(payload.get("auto_llm") or False) or os.environ.get(
         "METABONK_LLM_AUTO_MERGE", "1"
     ) in ("1", "true", "True")
@@ -1193,6 +1251,62 @@ async def merge_policies(payload: Dict[str, Any]):
             meta = TaskVectorMetadata(name=str(sp), tags=["hive_mind"])
             vectors.append(TaskVector.from_state_dicts(base_state, st, meta))
 
+        # Merge report / gating stats.
+        report: Dict[str, Any] = {
+            "sources": [],
+            "pairwise": [],
+            "method": method,
+            "topk": float(topk),
+        }
+        for vec in vectors:
+            report["sources"].append(
+                {
+                    "name": vec.metadata.name,
+                    "magnitude": vec.magnitude(),
+                    "param_count": vec.param_count(),
+                }
+            )
+        for i in range(len(vectors)):
+            for j in range(i + 1, len(vectors)):
+                v1 = vectors[i]
+                v2 = vectors[j]
+                report["pairwise"].append(
+                    {
+                        "a": v1.metadata.name,
+                        "b": v2.metadata.name,
+                        "cosine": v1.cosine_similarity(v2),
+                        "sign_agreement": v1.sign_agreement(v2),
+                    }
+                )
+
+        min_cos = float(payload.get("min_cosine") or os.environ.get("METABONK_MERGE_MIN_COSINE", "0.0"))
+        min_sign = float(payload.get("min_sign_agreement") or os.environ.get("METABONK_MERGE_MIN_SIGN_AGREEMENT", "0.0"))
+        if report["pairwise"]:
+            cos_vals = [p["cosine"] for p in report["pairwise"]]
+            sign_vals = [p["sign_agreement"] for p in report["pairwise"]]
+            report["cosine_min"] = float(min(cos_vals))
+            report["cosine_avg"] = float(sum(cos_vals) / max(1, len(cos_vals)))
+            report["sign_min"] = float(min(sign_vals))
+            report["sign_avg"] = float(sum(sign_vals) / max(1, len(sign_vals)))
+        else:
+            report["cosine_min"] = 0.0
+            report["cosine_avg"] = 0.0
+            report["sign_min"] = 0.0
+            report["sign_avg"] = 0.0
+
+        if dry_run:
+            return {"ok": True, "dry_run": True, "report": report}
+        if not force and (report["cosine_min"] < min_cos or report["sign_min"] < min_sign):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "merge_gated",
+                    "min_cosine": min_cos,
+                    "min_sign_agreement": min_sign,
+                    "report": report,
+                },
+            )
+
         if not vectors:
             # Nothing to merge; copy base.
             merged_vector = TaskVector({})
@@ -1215,6 +1329,25 @@ async def merge_policies(payload: Dict[str, Any]):
 
         new_state = merged_vector.apply_to_state_dict(base_state)
 
+        # Optional: persist merged vector to skill DB.
+        if os.environ.get("METABONK_MERGE_SAVE_VECTOR", "0") in ("1", "true", "True"):
+            try:
+                from src.learner.task_vectors import SkillVectorDatabase
+
+                db_path = os.environ.get("METABONK_SKILL_DB_PATH", "./skill_vectors")
+                skill_db = SkillVectorDatabase(db_path)
+                merged_name = f"merge_{target_policy}_{int(time.time())}"
+                skill_db.store_from_state_dicts(
+                    merged_name,
+                    base_state,
+                    new_state,
+                    tags=["merged", method],
+                    description=f"merge:{method} base={base_name} sources={list(source_policies)}",
+                    performance={},
+                )
+            except Exception:
+                pass
+
         # Create / update target learner.
         obs_dim = getattr(base_learner.net, "obs_dim", None) or len(next(iter(base_state.values())))
         target_learner = _get_or_create(target_policy, obs_dim=int(obs_dim))
@@ -1232,9 +1365,17 @@ async def merge_policies(payload: Dict[str, Any]):
             "merge_topk": float(topk),
             "merge_auto_llm": bool(auto_llm),
             "version": target_learner.version,
+            "merge_cosine_min": report.get("cosine_min", 0.0),
+            "merge_sign_min": report.get("sign_min", 0.0),
         }
 
-    return {"ok": True, "target_policy": target_policy, "base_policy": base_name, "version": target_learner.version}
+    return {
+        "ok": True,
+        "target_policy": target_policy,
+        "base_policy": base_name,
+        "version": target_learner.version,
+        "report": report,
+    }
 
 
 def main() -> None:

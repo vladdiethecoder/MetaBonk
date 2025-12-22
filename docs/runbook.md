@@ -64,7 +64,7 @@ Expected:
 - Streaming:
   - `METABONK_STREAM_CODEC` (default: `h264`)
   - `METABONK_STREAM_CONTAINER` (default: `mp4`)
-  - `METABONK_STREAM_MAX_CLIENTS` (default: `2`)
+  - `METABONK_STREAM_MAX_CLIENTS` (default: `3`)
   - `METABONK_REQUIRE_PIPEWIRE_STREAM` (default: `1`)
 - Game launcher:
   - `MEGABONK_GAME_DIR`, `MEGABONK_APPID`, `MEGABONK_PROTON`
@@ -95,6 +95,23 @@ MediaSource.isTypeSupported('video/mp4; codecs="avc1.4d401f"')
 If `false`:
 - Install full codecs (Fedora: RPM Fusion multimedia)
 - Try a browser with H.264 support
+
+## Recommended GPU Streaming Settings (PipeWire + NVENC)
+
+| Environment Variable | Recommended Value | Purpose / Note |
+| --- | --- | --- |
+| `METABONK_STREAM_CODEC` | `h264` | Required for browser MSE compatibility. |
+| `METABONK_STREAM_CONTAINER` | `mp4` | Fragmented MP4 for `/stream.mp4`. |
+| `METABONK_STREAM_BACKEND` | `auto` (or `ffmpeg`) | `auto` prefers GStreamer NVENC; use `ffmpeg` if GStreamer fails. |
+| `METABONK_STREAM_FPS` | `60` | Keep at or below game FPS for smoothness. |
+| `METABONK_STREAM_GOP` | `60` | ~1s keyframes; lower for reduced latency if needed. |
+| `METABONK_STREAM_BITRATE` | `6M` | Adjust for quality / bandwidth. |
+| `METABONK_STREAM_MAX_CLIENTS` | `3` | UI MP4 + go2rtc + probe without lock contention. |
+| `METABONK_REQUIRE_PIPEWIRE_STREAM` | `1` | Enforce PipeWire capture (avoid CPU fallbacks). |
+| `METABONK_PIPEWIRE_DRAIN` | `1` (optional) | Keep PipeWire pumping when no viewer is attached. |
+| `METABONK_STREAM_WIDTH` / `METABONK_STREAM_HEIGHT` | target resolution | Fixes capture size to avoid renegotiation churn. |
+| `METABONK_GST_CAPTURE` | `0` | Keep CPU snapshot fallback disabled. |
+| `METABONK_PREVIEW_JPEG` | `0` (or `1` for debug) | Optional 2 FPS JPEG preview thread. |
 
 ## go2rtc FIFO Streaming (On-Demand, Raw H.264)
 

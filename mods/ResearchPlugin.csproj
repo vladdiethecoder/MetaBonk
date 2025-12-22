@@ -9,11 +9,14 @@
     <RootNamespace>MegabonkResearch</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
   <!-- Pass -p:MEGABONK_DIR=/path/to/MegaBonk at build time -->
   <PropertyGroup>
     <MEGABONK_DIR Condition="'$(MEGABONK_DIR)'==''">$(MSBuildThisFileDirectory)..</MEGABONK_DIR>
+    <UnityManagedDir Condition="Exists('$(MEGABONK_DIR)/BepInEx/interop')">$(MEGABONK_DIR)/BepInEx/interop</UnityManagedDir>
+    <UnityManagedDir Condition="'$(UnityManagedDir)'==''">$(MEGABONK_DIR)/MegaBonk_Data/Managed</UnityManagedDir>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,6 +34,10 @@
       <HintPath>$(MEGABONK_DIR)/BepInEx/core/BepInEx.Unity.IL2CPP.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="Il2CppInterop.Runtime">
+      <HintPath>$(MEGABONK_DIR)/BepInEx/core/Il2CppInterop.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="0Harmony">
       <HintPath>$(MEGABONK_DIR)/BepInEx/core/0Harmony.dll</HintPath>
       <Private>false</Private>
@@ -38,17 +45,20 @@
 
     <!-- UnityEngine managed assemblies (for compile-time API) -->
     <Reference Include="UnityEngine">
-      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.dll</HintPath>
+      <HintPath>$(UnityManagedDir)/UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Il2Cppmscorlib" Condition="Exists('$(UnityManagedDir)/Il2Cppmscorlib.dll')">
+      <HintPath>$(UnityManagedDir)/Il2Cppmscorlib.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(UnityManagedDir)/UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.RenderingModule">
-      <HintPath>$(MEGABONK_DIR)/MegaBonk_Data/Managed/UnityEngine.RenderingModule.dll</HintPath>
+      <HintPath>$(UnityManagedDir)/UnityEngine.RenderingModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
 </Project>
-

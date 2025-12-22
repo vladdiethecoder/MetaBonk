@@ -185,6 +185,13 @@ class TaskVector:
         for v in self.vector.values():
             total += v.float().pow(2).sum().item()
         return total ** 0.5
+
+    def param_count(self) -> int:
+        """Total number of elements in this task vector."""
+        total = 0
+        for v in self.vector.values():
+            total += int(v.numel())
+        return total
     
     def cosine_similarity(self, other: "TaskVector") -> float:
         """Cosine similarity with another task vector."""
@@ -193,6 +200,26 @@ class TaskVector:
             if key in other.vector:
                 dot += (self.vector[key] * other.vector[key]).sum().item()
         return dot / (self.magnitude() * other.magnitude() + 1e-8)
+
+    def sign_agreement(self, other: "TaskVector") -> float:
+        """Fraction of overlapping parameters with matching sign (excluding zeros)."""
+        agree = 0.0
+        total = 0.0
+        for key, v in self.vector.items():
+            if key not in other.vector:
+                continue
+            v2 = other.vector[key]
+            if v.shape != v2.shape:
+                continue
+            s1 = torch.sign(v)
+            s2 = torch.sign(v2)
+            mask = (s1 != 0) & (s2 != 0)
+            if mask.any():
+                agree += float((s1[mask] == s2[mask]).float().sum().item())
+                total += float(mask.float().sum().item())
+        if total <= 0:
+            return 0.0
+        return float(agree / total)
     
     def sparsify(self, topk: float = 0.2) -> "TaskVector":
         """Keep only top-k% parameters by magnitude (for TIES)."""
@@ -346,6 +373,28 @@ class SkillVectorDatabase:
         # Save to disk
         vector.save(self.db_path / f"{name}.pt")
         self._save_index()
+
+    def store_from_state_dicts(
+        self,
+        name: str,
+        base_state: Dict[str, torch.Tensor],
+        finetuned_state: Dict[str, torch.Tensor],
+        tags: Optional[List[str]] = None,
+        description: str = "",
+        performance: Optional[Dict[str, float]] = None,
+    ) -> TaskVector:
+        """Store a task vector computed from state dicts."""
+        metadata = TaskVectorMetadata(
+            name=name,
+            description=description,
+            tags=tags or [],
+            performance=performance or {},
+        )
+        vector = TaskVector.from_state_dicts(base_state, finetuned_state, metadata)
+        self.vectors[name] = vector
+        vector.save(self.db_path / f"{name}.pt")
+        self._save_index()
+        return vector
     
     def get(self, name: str) -> Optional[TaskVector]:
         """Get a skill vector by name."""

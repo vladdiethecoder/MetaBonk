@@ -31,6 +31,11 @@ def main() -> int:
         help="Video codec: h264|hevc|av1 (default: env or h264).",
     )
     parser.add_argument(
+        "--container",
+        default=os.environ.get("METABONK_STREAM_CONTAINER", "mp4"),
+        help="Container: mp4|mpegts|h264 (default: env or mp4).",
+    )
+    parser.add_argument(
         "--pipewire-node",
         default=os.environ.get("PIPEWIRE_NODE", ""),
         help="PipeWire node id/path (default: env PIPEWIRE_NODE).",
@@ -68,6 +73,9 @@ def main() -> int:
     codec = str(args.codec or "h264").strip().lower()
     if codec in ("avc",):
         codec = "h264"
+    container = str(args.container or "mp4").strip().lower()
+    if container not in ("mp4", "mpegts", "h264"):
+        container = "mp4"
     require_pipewire = str(args.require_pipewire or "1").strip().lower() in (
         "1",
         "true",
@@ -78,6 +86,7 @@ def main() -> int:
     print("[stream_diagnostics] MetaBonk streaming preflight")
     print(f"[stream_diagnostics] backend requested: {backend_raw} (normalized: {backend_norm or 'auto'})")
     print(f"[stream_diagnostics] codec: {codec}")
+    print(f"[stream_diagnostics] container: {container}")
 
     gst_ok = False
     gst_err = None
@@ -134,6 +143,12 @@ def main() -> int:
         print(
             f"[stream_diagnostics] go2rtc: url={go2rtc or 'unset'} "
             f"fifo_stream={'on' if fifo.lower() in ('1','true','yes','on') else 'off'}"
+        )
+
+    if container != "mp4" or codec != "h264":
+        print(
+            "[stream_diagnostics] WARN: /stream.mp4 + browser MSE expects H.264 in MP4 "
+            f"(current: codec={codec}, container={container})"
         )
 
     if gst_ok:

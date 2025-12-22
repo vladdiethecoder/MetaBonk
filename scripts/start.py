@@ -280,11 +280,11 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_BACKEND", "auto")
     env.setdefault("METABONK_STREAM_BITRATE", "6M")
     env.setdefault("METABONK_STREAM_FPS", "60")
-    env.setdefault("METABONK_STREAM_GOP", "30")
+    env.setdefault("METABONK_STREAM_GOP", "60")
     # Give the UI some slack for reconnects (MSE) without permanently locking out a worker
     # due to a slow/half-closed client. The UI still enforces a per-worker lock to avoid
     # intentional multi-client contention.
-    env.setdefault("METABONK_STREAM_MAX_CLIENTS", "2")
+    env.setdefault("METABONK_STREAM_MAX_CLIENTS", "3")
     env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
     env.setdefault("METABONK_CAPTURE_DISABLED", "0")
     # Only capture/stream featured slots by default to avoid saturating GPU encoders.
@@ -292,6 +292,10 @@ def main() -> int:
     env.setdefault("METABONK_GST_CAPTURE", "0")
     env.setdefault("METABONK_CAPTURE_CPU", "0")
     env.setdefault("METABONK_WORKER_TTL_S", "20")
+    if "METABONK_STREAM_WIDTH" not in env and env.get("MEGABONK_WIDTH"):
+        env["METABONK_STREAM_WIDTH"] = str(env.get("MEGABONK_WIDTH"))
+    if "METABONK_STREAM_HEIGHT" not in env and env.get("MEGABONK_HEIGHT"):
+        env["METABONK_STREAM_HEIGHT"] = str(env.get("MEGABONK_HEIGHT"))
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
     # Default to LSTM PPO + frame stacking for stability in partial observability.

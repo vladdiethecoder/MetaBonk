@@ -14,6 +14,7 @@ All components are intentionally *game-agnostic*:
 
 from __future__ import annotations
 
+import json
 import time
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -235,6 +236,11 @@ class ExportRolloutsConfig:
     cache_on_device: bool = False
     cache_fp16: bool = True
     cache_max_bytes: int = 0
+    min_steps: int = 2
+    validate_finite: bool = True
+    include_metadata: bool = True
+    write_manifest: bool = True
+    manifest_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -985,6 +991,26 @@ def label_actions(cfg: IDMLabelConfig) -> Path:
         return data, frames
 
     executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1) if bool(getattr(cfg, "prefetch", True)) else None
+    min_steps = max(1, int(getattr(cfg, "min_steps", 2)))
+    validate_finite = bool(getattr(cfg, "validate_finite", True))
+    include_metadata = bool(getattr(cfg, "include_metadata", True))
+    write_manifest = bool(getattr(cfg, "write_manifest", True))
+    manifest_path = str(getattr(cfg, "manifest_path", "") or "")
+    manifest: Dict[str, Any] = {
+        "in_npz_dir": str(in_dir),
+        "out_pt_dir": str(out_dir),
+        "reward_ckpt": str(cfg.reward_ckpt),
+        "audio_ckpt": str(audio_ckpt_path),
+        "frame_size": list(frame_size),
+        "embed_dim": int(embed_dim),
+        "audio_code_dim": int(audio_code_dim),
+        "min_steps": int(min_steps),
+        "episodes": [],
+        "skipped": [],
+    }
+
+    def _finite_ok(arr: np.ndarray) -> bool:
+        return np.isfinite(arr).all()
     peek_every = max(0, int(getattr(cfg, "peek_every", 0) or 0))
     peek_samples = max(0, int(getattr(cfg, "peek_samples", 5) or 0))
     peek_every = max(0, int(getattr(cfg, "peek_every", 0) or 0))
@@ -1100,6 +1126,15 @@ def label_actions(cfg: IDMLabelConfig) -> Path:
     finally:
         if executor is not None:
             executor.shutdown(wait=False)
+
+    if write_manifest:
+        out_manifest = Path(manifest_path) if manifest_path else (out_dir / "manifest.json")
+        try:
+            out_manifest.parent.mkdir(parents=True, exist_ok=True)
+            out_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+            print(f"[video_pretraining] Wrote manifest -> {out_manifest}")
+        except Exception as e:
+            print(f"[video_pretraining] Failed to write manifest: {e}")
 
     return out_dir
 
@@ -1518,6 +1553,29 @@ def export_pt_rollouts(cfg: ExportRolloutsConfig) -> Path:
             dones = np.asarray(data.get("dones")) if "dones" in data else np.zeros((len(frames),), dtype=bool)
 
             T = int(frames.shape[0])
+            if T < min_steps:
+                manifest["skipped"].append({"file": path.name, "reason": f"too_short(T={T})"})
+                print(f"[video_pretraining] Skipping {path.name}: too short (T={T})")
+                continue
+            if actions.ndim != 2 or actions.shape[0] != T:
+                manifest["skipped"].append(
+                    {"file": path.name, "reason": f"action_shape_mismatch(actions={actions.shape}, T={T})"}
+                )
+                print(f"[video_pretraining] Skipping {path.name}: action shape mismatch {actions.shape} vs T={T}")
+                continue
+            if rewards.ndim != 1 or rewards.shape[0] != T:
+                manifest["skipped"].append(
+                    {"file": path.name, "reason": f"reward_shape_mismatch(rewards={rewards.shape}, T={T})"}
+                )
+                print(f"[video_pretraining] Skipping {path.name}: reward shape mismatch {rewards.shape} vs T={T}")
+                continue
+            if validate_finite:
+                if not _finite_ok(actions) or not _finite_ok(rewards):
+                    manifest["skipped"].append(
+                        {"file": path.name, "reason": "non_finite_actions_or_rewards"}
+                    )
+                    print(f"[video_pretraining] Skipping {path.name}: non-finite actions/rewards")
+                    continue
             obs_emb = np.zeros((T, embed_dim), dtype=np.float32)
 
             frames_cache, _ = _cache_episode_on_device(
@@ -1566,6 +1624,11 @@ def export_pt_rollouts(cfg: ExportRolloutsConfig) -> Path:
                         emb *= scale
                     obs_emb = np.concatenate([obs_emb, emb], axis=-1)
 
+            if validate_finite and not _finite_ok(obs_emb):
+                manifest["skipped"].append({"file": path.name, "reason": "non_finite_obs_embeddings"})
+                print(f"[video_pretraining] Skipping {path.name}: non-finite obs embeddings")
+                continue
+
             ep = {
                 "observations": torch.from_numpy(obs_emb).float(),
                 "actions": torch.from_numpy(actions).float(),
@@ -1574,9 +1637,28 @@ def export_pt_rollouts(cfg: ExportRolloutsConfig) -> Path:
             }
             if audio_tokens is not None:
                 ep["audio_tokens"] = torch.from_numpy(np.asarray(audio_tokens).astype(np.int32))
+            if include_metadata:
+                ep["meta"] = {
+                    "source_npz": path.name,
+                    "frame_size": list(frame_size),
+                    "embed_dim": int(embed_dim),
+                    "audio_code_dim": int(audio_code_dim),
+                    "reward_ckpt": str(cfg.reward_ckpt),
+                    "audio_ckpt": str(audio_ckpt_path),
+                    "obs_dim": int(obs_emb.shape[-1]),
+                    "action_dim": int(actions.shape[-1]),
+                }
             out_path = out_dir / f"{path.stem}.pt"
             torch.save(ep, out_path)
             print(f"[video_pretraining] Exported rollout -> {out_path}")
+            manifest["episodes"].append(
+                {
+                    "file": out_path.name,
+                    "steps": int(T),
+                    "obs_dim": int(obs_emb.shape[-1]),
+                    "action_dim": int(actions.shape[-1]),
+                }
+            )
     finally:
         if executor is not None:
             executor.shutdown(wait=False)

@@ -44,7 +44,7 @@ except Exception:  # pragma: no cover
 
 from src.common.device import resolve_device
 from src.common.schemas import PredictRequest, PredictResponse
-from .menu_classifier import load_menu_classifier, MenuClassifier
+from .menu_classifier import load_menu_classifier, MenuClassifier, heuristic_menu_metrics
 
 
 app = FastAPI(title="MetaBonk Vision Service")
@@ -147,6 +147,11 @@ async def predict(req: PredictRequest):
         metrics.update(_run_menu_classifier(frame))
     except Exception:
         metrics = metrics or {}
+    if not metrics:
+        try:
+            metrics.update(heuristic_menu_metrics(frame))
+        except Exception:
+            metrics = metrics or {}
     # Recovery vision service returns detections only. Downstream code may also
     # consume a `metrics` dict when a richer visual model is used.
     return PredictResponse(detections=dets, latency_ms=latency_ms, metrics=metrics)

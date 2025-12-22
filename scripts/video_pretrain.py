@@ -352,6 +352,7 @@ def main() -> None:
             "skills_label",
             "world_model",
             "dream",
+            "eval",
             "all",
         ],
     )
@@ -438,6 +439,13 @@ def main() -> None:
     parser.add_argument("--skill-num-codes", type=int, default=256)
     parser.add_argument("--skill-epochs", type=int, default=20)
 
+    # Eval
+    parser.add_argument("--eval-max-files", type=int, default=25)
+    parser.add_argument("--eval-idm-batches", type=int, default=10)
+    parser.add_argument("--eval-reward-pairs", type=int, default=2000)
+    parser.add_argument("--eval-reward-frame-stride", type=int, default=1)
+    parser.add_argument("--eval-skill-topk", type=int, default=10)
+
     # Audio tokens
     parser.add_argument("--audio-steps", type=int, default=4000)
     parser.add_argument("--audio-batch", type=int, default=128)
@@ -511,6 +519,7 @@ def main() -> None:
         "skills_label",
         "world_model",
         "dream",
+        "eval",
     ]
 
     work_npz_dir = args.npz_dir
@@ -952,6 +961,78 @@ def main() -> None:
             starts=int(args.dream_starts),
             max_episodes=int(args.dream_max_episodes),
         )
+
+    # Eval
+    if "eval" in phases:
+        from src.imitation.offline_eval import (
+            IDMEvalConfig,
+            RewardEvalConfig,
+            RolloutEvalConfig,
+            SkillEvalConfig,
+            evaluate_idm,
+            evaluate_reward_model,
+            evaluate_skill_tokens,
+            validate_pt_rollouts,
+        )
+
+        print("\n" + "="*60)
+        print("🧪 PHASE: OFFLINE PRETRAINING EVAL")
+        print("="*60)
+
+        try:
+            metrics = evaluate_idm(
+                IDMEvalConfig(
+                    npz_dir=args.labeled_npz_dir,
+                    idm_ckpt=args.idm_ckpt,
+                    device=args.device,
+                    context=int(args.idm_context),
+                    batch_size=int(args.idm_label_batch),
+                    batches_per_file=int(args.eval_idm_batches),
+                    max_files=int(args.eval_max_files),
+                )
+            )
+            print("[eval] IDM:", metrics)
+        except Exception as e:
+            print(f"[eval] IDM failed: {e}")
+
+        try:
+            metrics = evaluate_reward_model(
+                RewardEvalConfig(
+                    npz_dir=args.labeled_npz_dir,
+                    reward_ckpt=args.reward_ckpt,
+                    device=args.device,
+                    batch_size=int(args.reward_label_batch),
+                    max_files=int(args.eval_max_files),
+                    pair_samples=int(args.eval_reward_pairs),
+                    frame_stride=int(args.eval_reward_frame_stride),
+                )
+            )
+            print("[eval] Reward model:", metrics)
+        except Exception as e:
+            print(f"[eval] Reward model failed: {e}")
+
+        try:
+            metrics = evaluate_skill_tokens(
+                SkillEvalConfig(
+                    npz_dir=args.labeled_npz_dir,
+                    max_files=int(args.eval_max_files),
+                    topk=int(args.eval_skill_topk),
+                )
+            )
+            print("[eval] Skill tokens:", metrics)
+        except Exception as e:
+            print(f"[eval] Skill tokens failed: {e}")
+
+        try:
+            metrics = validate_pt_rollouts(
+                RolloutEvalConfig(
+                    pt_dir=args.pt_dir,
+                    max_files=int(args.eval_max_files),
+                )
+            )
+            print("[eval] Rollouts:", metrics)
+        except Exception as e:
+            print(f"[eval] Rollouts failed: {e}")
 
     print("\n" + "="*60)
     print("✅ VIDEO PRETRAINING PIPELINE COMPLETE")

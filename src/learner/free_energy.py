@@ -18,6 +18,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import List, Optional, Tuple, Dict, Any
 
 import torch
@@ -39,6 +40,8 @@ class FreeEnergyConfig:
     num_samples: int = 8            # Monte Carlo samples for EFE
     preference_temperature: float = 1.0  # Sharpness of preferences
     policy_lr: float = 3e-4         # Learning rate for EFE policy/preferences
+    preference_weight: float = 0.1  # Weight for preference fitting (reward-aligned)
+    preference_tau: float = 1.0     # Softmax temperature over rewards for preference targets
 
 
 class PreferenceModel(nn.Module):
@@ -130,6 +133,7 @@ class FreeEnergyObjective:
         self,
         start_state: LatentState,
         policy: nn.Module,
+        return_components: bool = False,
     ) -> torch.Tensor:
         """Compute Expected Free Energy for a policy (planning).
         
@@ -146,6 +150,8 @@ class FreeEnergyObjective:
         device = start_state.deter.device
         
         total_efe = torch.zeros(B, device=device)
+        total_risk = torch.zeros(B, device=device)
+        total_amb = torch.zeros(B, device=device)
         state = start_state
         
         for t in range(self.cfg.horizon):
@@ -177,9 +183,13 @@ class FreeEnergyObjective:
                 self.cfg.pragmatic_weight * risk +
                 self.cfg.epistemic_weight * ambiguity
             )
+            total_risk += risk
+            total_amb += ambiguity
             
             state = next_state
         
+        if return_components:
+            return total_efe, total_risk, total_amb
         return total_efe
     
     def evaluate_policies(
@@ -356,6 +366,7 @@ class ActiveInferenceAgent(nn.Module):
         with torch.no_grad():
             states, _ = self.world_model.observe_sequence(observations, actions, dones=dones)
 
+        pref_loss = torch.tensor(0.0, device=observations.device)
         if len(states) < 2:
             policy_loss = torch.tensor(0.0, device=observations.device)
         else:
@@ -368,13 +379,39 @@ class ActiveInferenceAgent(nn.Module):
                 start_states.append(LatentState(s.deter.detach(), s.stoch.detach()))
 
             policy_loss = torch.tensor(0.0, device=observations.device)
+            risk_acc = torch.tensor(0.0, device=observations.device)
+            amb_acc = torch.tensor(0.0, device=observations.device)
             for start_state in start_states:
-                efe = self.efe.expected_free_energy(start_state, self.policy)
+                efe_out = self.efe.expected_free_energy(start_state, self.policy, return_components=True)
+                efe, risk, amb = efe_out  # type: ignore[misc]
                 policy_loss = policy_loss + efe.mean()
+                risk_acc = risk_acc + risk.mean()
+                amb_acc = amb_acc + amb.mean()
             policy_loss = policy_loss / max(1, len(start_states))
+            risk_acc = risk_acc / max(1, len(start_states))
+            amb_acc = amb_acc / max(1, len(start_states))
 
+            # Preference fitting: push preferences toward high-reward latent states.
+            if rewards is not None and rewards.numel() > 0:
+                # Build per-timestep latent combined state.
+                latents = torch.stack([s.combined for s in states], dim=0)  # [T, B, D]
+                rew = rewards.detach()
+                if rew.dim() == 2:
+                    rew = rew.mean(dim=-1)
+                if rew.dim() == 1 and latents.dim() == 3:
+                    rew = rew[: latents.shape[0]]
+
+                pref_tau = float(os.environ.get("METABONK_EFE_PREF_TAU", str(self.cfg.preference_tau)))
+                temp = pref_tau
+                weights = torch.softmax(rew / max(1e-6, temp), dim=0)  # [T]
+                pref_target = torch.einsum("t,tbd->bd", weights, latents)
+                pref_mean, _pref_log_std = self.preferences(pref_target)
+                pref_loss = F.mse_loss(pref_mean, pref_target.detach())
+
+        pref_weight = float(os.environ.get("METABONK_EFE_PREF_WEIGHT", str(self.cfg.preference_weight)))
+        total_loss = policy_loss + pref_weight * pref_loss
         self.policy_opt.zero_grad(set_to_none=True)
-        policy_loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
             list(self.policy.parameters()) + list(self.preferences.parameters()),
             1.0,
@@ -388,6 +425,13 @@ class ActiveInferenceAgent(nn.Module):
         self.policy.eval()
         self.preferences.eval()
 
-        return {
+        out: Dict[str, Any] = {
             "efe_policy_loss": float(policy_loss.detach().mean().item()),
+            "efe_pref_loss": float(pref_loss.detach().mean().item()),
         }
+        try:
+            out["efe_risk"] = float(risk_acc.detach().mean().item())
+            out["efe_ambiguity"] = float(amb_acc.detach().mean().item())
+        except Exception:
+            pass
+        return out

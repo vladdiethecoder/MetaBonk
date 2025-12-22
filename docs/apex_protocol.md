@@ -150,6 +150,9 @@ Learner flag: `METABONK_TRAIN_CPQE=1`
 - For policies containing `pilot`, the learner will distill a small CPQE motor from on‑policy
   movement rollouts and expose weights at `/get_cpqe_weights`.
 - This is a lightweight bootstrap toward full diffusion→consistency distillation.
+ - Q-ensemble TD updates (optional):
+   - `METABONK_CPQE_Q_UPDATES=1` (how many TD updates per rollout)
+   - `METABONK_CPQE_Q_GAMMA=0.99` (discount for Q targets)
 
 ### 8) World‑model “dream” training (default on)
 
@@ -172,6 +175,11 @@ Tuning:
 - `METABONK_DREAM_ACTOR_LR=3e-4` (latent actor LR)
 - `METABONK_DREAM_ACTION_NOISE=0.0` (Gaussian exploration in dreams)
 - `METABONK_DREAM_DISTILL_COEF=0.0` (MSE distill into PPO net)
+ - `METABONK_DREAM_REWARD_CLIP=0.0` (if >0, clamp predicted rewards)
+ - `METABONK_DREAM_SYMLOG=0|1` (apply symlog transform to predicted rewards)
+ - `METABONK_DREAM_RET_NORM=0|1` (normalize predicted rewards using running mean/std)
+ - `METABONK_DREAM_DETERMINISTIC=0|1` (deterministic RSSM imagine)
+ - `METABONK_DREAM_STOP_ON_NAN=0|1` (abort dream update on non-finite predictions)
 
 ### 8b) Active‑Inference EFE policy path (default on)
 
@@ -184,6 +192,9 @@ Learner flag: `METABONK_USE_ACTIVE_INFERENCE=1` (default). Disable with `METABON
 - After each rollout, an Active‑Inference policy head minimizes Expected Free Energy
   (Risk + Ambiguity) on imagined rollouts while freezing the world model.
 - Reports `efe_policy_loss` to RCC metrics.
+ - Optional preference fitting (reward‑aligned latent goals):
+   - `METABONK_EFE_PREF_WEIGHT=0.1` (scale for preference loss)
+   - `METABONK_EFE_PREF_TAU=1.0` (softmax temperature over rewards)
 
 ### 9) LLM‑derived weights (default on, generalist‑oriented)
 

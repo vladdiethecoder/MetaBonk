@@ -81,6 +81,7 @@ Documentation
 - **go2rtc FIFO Streaming**: `docs/go2rtc_fifo_streaming.md`
 - **EGL Zero-Copy Demo**: `docs/egl_zero_copy_demo.md`
 - **Robust Headless Streaming**: `docs/robust_headless_streaming.md`
+- **Agentic Direct Render Streaming**: `docs/agentic_direct_render_streaming.md`
 - **Bridges**: `docs/bonklink_bridge.md` & `docs/research_plugin_build.md`
 
 Design Philosophy
@@ -97,3 +98,11 @@ Environment Variables
 - METABONK_LLM_MODEL: Model name (gpt-4, claude-3)
 - METABONK_VIDEO_ROLLOUTS_PT_DIR: Path to .pt rollouts
 - MEGABONK_USE_GAMESCOPE: Enable Gamescope containment
+- METABONK_INPUT_BACKEND: OS input backend (set to "uinput" for real KB/mouse)
+- METABONK_INPUT_BUTTONS: Comma list of key/button names (e.g., "W,A,S,D,SPACE,MOUSE_LEFT")
+- METABONK_INPUT_MOUSE_SCALE: Mouse delta scale for continuous actions (default 100.0)
+- METABONK_INPUT_MOUSE_MODE: "scaled" (default) or "direct" for mouse deltas
+- METABONK_INPUT_SCROLL_SCALE: Scroll scale for a_cont[2] (default 3.0)
+- METABONK_INPUT_MENU_BOOTSTRAP: Enable menu bootstrap macro (default 1)
+- METABONK_PPO_CONTINUOUS_DIM: Override PPO continuous action dim (e.g., 3 for scroll)
+- METABONK_PPO_DISCRETE_BRANCHES: Override PPO discrete branches (e.g., "2,2,2,2,2")

@@ -655,7 +655,7 @@ class NVENCStreamer:
         if not selector:
             raise RuntimeError("invalid PIPEWIRE_NODE target for pipewiresrc")
 
-        # Capture pipeline (raw frames): PipeWire -> NV12 -> appsink.
+        # Capture pipeline (raw frames): PipeWire -> I420 -> appsink.
         # We keep it permissive and let pipewiresrc negotiate size.
         #
         # Note: We intentionally keep this separate from the GStreamer-encoder pipeline so we
@@ -663,11 +663,19 @@ class NVENCStreamer:
         vc = "videoconvert"
         if force_videoconvert:
             vc = "videoconvert"
+        try:
+            pw_use_pool = str(os.environ.get("METABONK_PIPEWIRE_USE_BUFFERPOOL", "1")).strip().lower()
+        except Exception:
+            pw_use_pool = "1"
+        pool_prop = ""
+        if pw_use_pool in ("0", "false", "no", "off"):
+            pool_prop = "use-bufferpool=false "
+
         pipeline = (
-            f"pipewiresrc {selector} do-timestamp=true ! "
+            f"pipewiresrc {selector} {pool_prop}do-timestamp=true ! "
             "queue max-size-buffers=4 leaky=downstream ! "
             f"{vc} ! "
-            "video/x-raw,format=NV12 ! "
+            "video/x-raw,format=I420 ! "
             "appsink name=raw_sink emit-signals=true sync=false max-buffers=8 drop=true"
         )
 
@@ -778,7 +786,13 @@ class NVENCStreamer:
             return "ffmpeg"
         return backend
 
-    def iter_chunks(self, chunk_size: int = 64 * 1024, *, container: Optional[str] = None) -> Iterator[bytes]:
+    def iter_chunks(
+        self,
+        chunk_size: int = 64 * 1024,
+        *,
+        container: Optional[str] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Iterator[bytes]:
         """Yield MP4/TS chunks for a single client connection.
 
         Important: we spawn a dedicated encoder process per client. Sharing a single
@@ -828,10 +842,10 @@ class NVENCStreamer:
         if container_name == "mp4" and not allow_gst_mp4 and backend not in ("ffmpeg", "x11grab"):
             backend = "ffmpeg"
         if backend == "x11grab":
-            yield from self._iter_chunks_x11grab(chunk_size=chunk_size, container=container_name)
+            yield from self._iter_chunks_x11grab(chunk_size=chunk_size, container=container_name, stop_event=stop_event)
             return
         if backend in ("ffmpeg",):
-            yield from self._iter_chunks_ffmpeg(chunk_size=chunk_size, container=container_name)
+            yield from self._iter_chunks_ffmpeg(chunk_size=chunk_size, container=container_name, stop_event=stop_event)
             return
 
         # Drain appsink via callback so we don't drop critical codec headers (SPS/PPS / MP4 init)
@@ -1013,6 +1027,8 @@ class NVENCStreamer:
 
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 err = _pop_bus_error()
                 if err:
                     self._record_error(err)
@@ -1048,7 +1064,7 @@ class NVENCStreamer:
             with self._lock:
                 self._active_clients = max(0, int(self._active_clients) - 1)
 
-    def _iter_chunks_ffmpeg(self, *, chunk_size: int, container: str) -> Iterator[bytes]:
+    def _iter_chunks_ffmpeg(self, *, chunk_size: int, container: str, stop_event: Optional[threading.Event]) -> Iterator[bytes]:
         if False:  # ensure this is always a generator function
             yield b""
         if Gst is None or GstApp is None:
@@ -1089,6 +1105,9 @@ class NVENCStreamer:
                 if not p.stderr:
                     return
                 while not stop_ev.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        stop_ev.set()
+                        break
                     line = p.stderr.readline()
                     if not line:
                         break
@@ -1120,6 +1139,9 @@ class NVENCStreamer:
 
             # Pull frames from appsink and stream into ffmpeg stdin.
             while not stop_ev.is_set():
+                if stop_event is not None and stop_event.is_set():
+                    stop_ev.set()
+                    break
                 sample = None
                 try:
                     if hasattr(appsink, "try_pull_sample"):
@@ -1245,6 +1267,9 @@ class NVENCStreamer:
 
             last_out_ts = 0.0
             while not stop_ev.is_set():
+                if stop_event is not None and stop_event.is_set():
+                    stop_ev.set()
+                    break
                 if ffmpeg_proc.poll() is not None:
                     with ffmpeg_err_lock:
                         extra = "\n".join(ffmpeg_err_lines[-10:])
@@ -1307,7 +1332,13 @@ class NVENCStreamer:
             with self._lock:
                 self._active_clients = max(0, int(self._active_clients) - 1)
 
-    def _iter_chunks_x11grab(self, *, chunk_size: int, container: str) -> Iterator[bytes]:
+    def _iter_chunks_x11grab(
+        self,
+        *,
+        chunk_size: int,
+        container: str,
+        stop_event: Optional[threading.Event],
+    ) -> Iterator[bytes]:
         if False:  # ensure generator
             yield b""
         ffmpeg = shutil.which("ffmpeg")
@@ -1414,6 +1445,9 @@ class NVENCStreamer:
                 if not p.stderr:
                     return
                 while not stop_ev.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        stop_ev.set()
+                        break
                     line = p.stderr.readline()
                     if not line:
                         break
@@ -1451,6 +1485,8 @@ class NVENCStreamer:
                 return
             last_out_ts = 0.0
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if p.poll() is not None:
                     with err_lock:
                         extra = "\n".join(err_lines[-10:])
