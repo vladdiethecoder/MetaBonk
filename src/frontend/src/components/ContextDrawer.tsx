@@ -51,6 +51,24 @@ export default function ContextDrawer() {
   }, [events, payload?.instanceId]);
 
   const detailEntries = useMemo(() => Object.entries(payload?.details ?? {}).slice(0, 12), [payload?.details]);
+  const frameUrls = useMemo(() => {
+    const d = payload?.details as any;
+    if (!d) return [];
+    const urls = (d.frame_urls ?? d.frames ?? []) as any[];
+    return urls
+      .map((u) => {
+        if (typeof u === "string") return u;
+        if (u?.url) return String(u.url);
+        if (u?.b64) return `data:${u.mime ?? "image/jpeg"};base64,${u.b64}`;
+        return null;
+      })
+      .filter(Boolean)
+      .slice(0, 6) as string[];
+  }, [payload?.details]);
+  const traceUrl = (payload?.details as any)?.trace_url ?? null;
+  const logUrl = (payload?.details as any)?.log_url ?? null;
+  const snapshotId = (payload?.details as any)?.snapshot_id ?? null;
+  const snapshotUrl = (payload?.details as any)?.snapshot_url ?? null;
 
   return (
     <>
@@ -103,6 +121,46 @@ export default function ContextDrawer() {
                 <div className="k">stream</div>
                 <div className="v">{instance.heartbeat?.stream_ok ? "ok" : "stale"}</div>
               </div>
+            </div>
+          ) : null}
+
+          {frameUrls.length ? (
+            <div className="panel">
+              <div className="muted">Frame thumbnails</div>
+              <div className="thumb-grid" style={{ marginTop: 6 }}>
+                {frameUrls.map((u) => (
+                  <img key={u} src={u} alt="frame thumbnail" className="thumb" />
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {traceUrl || logUrl || snapshotId || snapshotUrl ? (
+            <div className="panel">
+              <div className="muted">Links</div>
+              <div className="statline">
+                {traceUrl ? (
+                  <a className="btn btn-ghost btn-compact" href={traceUrl} target="_blank" rel="noreferrer">
+                    trace
+                  </a>
+                ) : null}
+                {logUrl ? (
+                  <a className="btn btn-ghost btn-compact" href={logUrl} target="_blank" rel="noreferrer">
+                    logs
+                  </a>
+                ) : null}
+                {snapshotUrl ? (
+                  <a className="btn btn-ghost btn-compact" href={snapshotUrl} target="_blank" rel="noreferrer">
+                    snapshot
+                  </a>
+                ) : null}
+                {payload?.instanceId ? (
+                  <a className="btn btn-ghost btn-compact" href={`/instances?instance=${payload.instanceId}`}>
+                    open instance
+                  </a>
+                ) : null}
+              </div>
+              {snapshotId ? <div className="muted">snapshot bundle {snapshotId}</div> : null}
             </div>
           ) : null}
 

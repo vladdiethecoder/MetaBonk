@@ -131,6 +131,8 @@ export default function Spy() {
   const labeledCount = Number(pretrain?.datasets?.video_labeled_npz ?? 0);
   const rolloutCount = Number(pretrain?.datasets?.video_rollouts_pt ?? 0);
   const labelCoverage = demoCount > 0 ? Math.round((labeledCount / demoCount) * 100) : 0;
+  const auditDemos = pretrain?.audit?.video_demos;
+  const auditLabeled = pretrain?.audit?.video_labeled;
 
   const topTokens = skills?.dataset?.token_top ?? [];
 
@@ -390,15 +392,17 @@ export default function Spy() {
                 <div className="value">{labelCoverage}%</div>
               </div>
               <div className="kpi">
-                <div className="label">Corrupt Videos</div>
-                <div className="value">0</div>
+                <div className="label">Corrupt Samples</div>
+                <div className="value">{auditDemos?.corrupt ?? 0}</div>
               </div>
               <div className="kpi">
                 <div className="label">Avg Clip Len</div>
-                <div className="value">—</div>
+                <div className="value">{auditDemos?.avg_len != null ? auditDemos.avg_len.toFixed(0) : "—"}</div>
               </div>
             </div>
-            <div className="muted">Quality metrics expand once dataset audits are enabled.</div>
+            <div className="muted">
+              sampled {auditDemos?.samples ?? 0} demos, {auditLabeled?.samples ?? 0} labeled · labeled avg len {auditLabeled?.avg_len != null ? auditLabeled.avg_len.toFixed(0) : "—"}
+            </div>
           </>
         )}
       </section>

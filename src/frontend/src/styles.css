@@ -762,6 +762,9 @@ body::before{
   letter-spacing: .3px;
 }
 
+.thumb-grid{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.thumb{ width: 100%; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); }
+
 /* Stream-facing HUD (OBS browser source) */
 .hud{
   width: 100vw;
