@@ -46,6 +46,7 @@ from .rollout import LearnerClient, RolloutBuffer
 from .nvenc_streamer import NVENCConfig, NVENCStreamer
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
+from .stream_health import jpeg_luma_variance
 
 if TYPE_CHECKING:
     from src.control.menu_reasoner import MenuAction
@@ -161,6 +162,9 @@ class WorkerService:
         self._last_policy_warn_ts: float = 0.0
         self._last_stream_ok_ts: float = 0.0
         self._last_stream_heal_ts: float = 0.0
+        self._last_frame_var_ts: float = 0.0
+        self._last_frame_var: Optional[float] = None
+        self._black_frame_since: float = 0.0
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
 
@@ -1330,6 +1334,28 @@ class WorkerService:
             ok_ttl = float(os.environ.get("METABONK_STREAM_OK_TTL_S", "10.0"))
             stream_ok = bool((last > 0 and (now - last) <= ok_ttl) or (enc_last > 0 and (now - enc_last) <= ok_ttl))
             last_any = max(last, enc_last)
+            # Optional black-frame watchdog (uses cached JPEG, so no extra capture cost).
+            try:
+                black_var = float(os.environ.get("METABONK_STREAM_BLACK_VAR", "1.0"))
+            except Exception:
+                black_var = 1.0
+            try:
+                black_s = float(os.environ.get("METABONK_STREAM_BLACK_S", "8.0"))
+            except Exception:
+                black_s = 8.0
+            try:
+                black_check_s = float(os.environ.get("METABONK_STREAM_BLACKCHECK_S", "5.0"))
+            except Exception:
+                black_check_s = 5.0
+            if black_var > 0 and black_s > 0 and black_check_s > 0 and (now - self._last_frame_var_ts) >= black_check_s:
+                self._last_frame_var_ts = now
+                var = jpeg_luma_variance(self._latest_jpeg_bytes or b"")
+                self._last_frame_var = var
+                if var is not None and var <= black_var:
+                    if self._black_frame_since <= 0:
+                        self._black_frame_since = now
+                else:
+                    self._black_frame_since = 0.0
             if stream_ok:
                 self._last_stream_ok_ts = now
             heal_s = float(os.environ.get("METABONK_STREAM_SELF_HEAL_S", "20.0"))
@@ -1347,6 +1373,13 @@ class WorkerService:
                     should_heal = True
                 elif last_any > 0 and (now - last_any) >= heal_s and (now - self._last_stream_ok_ts) >= heal_s:
                     reason = "stream stale (no frames)"
+                    should_heal = True
+                elif (
+                    self._black_frame_since > 0
+                    and (now - self._black_frame_since) >= black_s
+                    and (now - self._last_stream_ok_ts) >= black_s
+                ):
+                    reason = f"stream black frames (var={self._last_frame_var})"
                     should_heal = True
                 # Never tear down/recreate the streamer while a client is actively consuming it.
                 # Doing so causes visible "cut out" flapping for the UI and can fight go2rtc/FIFO readers.
@@ -1391,6 +1424,8 @@ class WorkerService:
                 stream_backend=getattr(self.streamer, "backend", None) if self.streamer else None,
                 stream_active_clients=active_clients,
                 stream_max_clients=max_clients,
+                stream_frame_var=self._last_frame_var,
+                stream_black_since_s=(now - self._black_frame_since) if self._black_frame_since > 0 else None,
                 fifo_stream_enabled=bool(getattr(self, "_fifo_stream_enabled", False)),
                 fifo_stream_path=getattr(self, "_fifo_stream_path", None),
                 fifo_stream_last_error=(self._fifo_publisher.last_error() if self._fifo_publisher is not None else None),

@@ -42,6 +42,37 @@ _GST_ELEMENT_CACHE: dict[str, bool] = {}
 _GST_PROPS_CACHE: dict[str, set[str]] = {}
 _FFMPEG_ENCODER_CACHE: dict[str, bool] = {}
 _FFMPEG_ENCODERS_TXT: Optional[str] = None
+_STREAM_LOG_LAST: dict[str, float] = {}
+
+
+def _log_stream_event(event: str, **fields: object) -> None:
+    if str(os.environ.get("METABONK_STREAM_LOG", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        throttle = float(os.environ.get("METABONK_STREAM_LOG_THROTTLE_S", "5.0"))
+    except Exception:
+        throttle = 5.0
+    instance = (
+        os.environ.get("METABONK_INSTANCE_ID")
+        or os.environ.get("MEGABONK_INSTANCE_ID")
+        or os.environ.get("INSTANCE_ID")
+        or ""
+    )
+    key = f"{event}:{instance}"
+    now = time.time()
+    if event in ("fifo_backpressure", "stream_error") and throttle > 0:
+        last = _STREAM_LOG_LAST.get(key, 0.0)
+        if (now - last) < throttle:
+            return
+        _STREAM_LOG_LAST[key] = now
+    parts = [f"event={event}"]
+    if instance:
+        parts.append(f"instance={instance}")
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={v}")
+    print("[stream] " + " ".join(parts))
 
 
 def _env_truthy(name: str) -> bool:
@@ -328,6 +359,7 @@ class NVENCStreamer:
         with self._lock:
             self.last_error = str(msg)
             self.last_error_ts = time.time()
+        _log_stream_event("stream_error", message=str(msg))
 
     def is_busy(self) -> bool:
         try:
@@ -636,6 +668,18 @@ class NVENCStreamer:
         appsink = pipeline_obj.get_by_name("stream_sink")
         if appsink is None:
             raise RuntimeError("appsink not found in GStreamer pipeline")
+        _log_stream_event(
+            "gst_pipeline",
+            encoder=encoder,
+            container=container,
+            codec=codec,
+            bitrate_kbps=bitrate_kbps,
+            fps=fps,
+            gop=gop,
+            pipewire_node=target,
+            videoconvert=use_videoconvert,
+            cuda_upload=use_cuda_upload,
+        )
         self.backend = f"gst:{encoder}"
         return pipeline_obj, appsink
 
@@ -775,6 +819,17 @@ class NVENCStreamer:
             stderr=subprocess.PIPE,
             bufsize=0,
         )
+        _log_stream_event(
+            "ffmpeg_spawn",
+            encoder=enc,
+            container=container,
+            codec=codec,
+            bitrate=bitrate,
+            fps=fps,
+            gop=gop,
+            width=width,
+            height=height,
+        )
         self.backend = f"ffmpeg:{enc}"
         return p
 
@@ -841,6 +896,18 @@ class NVENCStreamer:
         allow_gst_mp4 = _env_truthy("METABONK_STREAM_ALLOW_GST_MP4")
         if container_name == "mp4" and not allow_gst_mp4 and backend not in ("ffmpeg", "x11grab"):
             backend = "ffmpeg"
+        try:
+            with self._lock:
+                active = int(self._active_clients)
+        except Exception:
+            active = 0
+        _log_stream_event(
+            "client_connected",
+            active_clients=active,
+            max_clients=max_clients,
+            container=container_name,
+            backend=backend,
+        )
         if backend == "x11grab":
             yield from self._iter_chunks_x11grab(chunk_size=chunk_size, container=container_name, stop_event=stop_event)
             return
@@ -921,6 +988,7 @@ class NVENCStreamer:
                         pass
                     continue
                 if ret != Gst.StateChangeReturn.FAILURE:
+                    _log_stream_event("gst_playing", backend=self.backend, container=container_name)
                     return pipeline, appsink, sample_hid
                 last_exc = RuntimeError("pipeline failed to enter PLAYING state")
                 try:
@@ -1063,6 +1131,8 @@ class NVENCStreamer:
                 pass
             with self._lock:
                 self._active_clients = max(0, int(self._active_clients) - 1)
+                active = int(self._active_clients)
+            _log_stream_event("client_disconnected", active_clients=active, container=container_name)
 
     def _iter_chunks_ffmpeg(self, *, chunk_size: int, container: str, stop_event: Optional[threading.Event]) -> Iterator[bytes]:
         if False:  # ensure this is always a generator function
@@ -1435,6 +1505,14 @@ class NVENCStreamer:
             bufsize=0,
         )
         self.backend = f"ffmpeg:x11grab:{enc}"
+        _log_stream_event(
+            "x11grab_start",
+            encoder=enc,
+            container=container,
+            fps=fps,
+            size=size,
+            display=display,
+        )
 
         stop_ev = threading.Event()
         err_lines: list[str] = []

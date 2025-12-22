@@ -94,6 +94,8 @@ class Heartbeat(MBBaseModel):
     stream_active_clients: Optional[int] = None
     stream_max_clients: Optional[int] = None
     stream_fps: Optional[float] = None
+    stream_frame_var: Optional[float] = None
+    stream_black_since_s: Optional[float] = None
     # Optional FIFO/go2rtc distribution metadata (Metabonk).
     fifo_stream_enabled: Optional[bool] = None
     fifo_stream_path: Optional[str] = None

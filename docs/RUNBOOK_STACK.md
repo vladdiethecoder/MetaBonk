@@ -31,6 +31,12 @@ ffprobe -v error -rw_timeout 5000000 -read_intervals %+1 \
   -of json http://127.0.0.1:<worker_port>/stream.mp4
 ```
 
+## Stream Watchdog (Black Frame)
+Environment knobs:
+- `METABONK_STREAM_BLACK_VAR` (default 1.0)
+- `METABONK_STREAM_BLACK_S` (default 8.0)
+- `METABONK_STREAM_BLACKCHECK_S` (default 5.0)
+
 ## Input Sanity
 - uinput:
 ```bash

@@ -44,6 +44,25 @@ def try_set_pipe_size(fd: int, size_bytes: int) -> bool:
         sz = int(size_bytes)
     except Exception:
         return False
+
+
+def _log_fifo_event(event: str, **fields: object) -> None:
+    if str(os.environ.get("METABONK_STREAM_LOG", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return
+    parts = [f"event={event}"]
+    instance = (
+        os.environ.get("METABONK_INSTANCE_ID")
+        or os.environ.get("MEGABONK_INSTANCE_ID")
+        or os.environ.get("INSTANCE_ID")
+        or ""
+    )
+    if instance:
+        parts.append(f"instance={instance}")
+    for k, v in fields.items():
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}={v}")
+    print("[stream] " + " ".join(parts))
     if sz <= 0:
         return False
     try:
@@ -84,9 +103,11 @@ class DemandPagedFifoWriter:
     def _run(self) -> None:
         idle_sleep = max(0.05, float(self.poll_s))
         backoff = max(idle_sleep, float(self.idle_backoff_s))
+        last_backpressure_log = 0.0
         while not self._stop.is_set():
             fd = None
             gen: Optional[Iterator[bytes]] = None
+            reader_connected = False
             try:
                 fd = try_open_fifo_writer(self.fifo_path)
                 if fd is None:
@@ -95,6 +116,8 @@ class DemandPagedFifoWriter:
                     continue
                 if self.pipe_size_bytes > 0:
                     try_set_pipe_size(fd, self.pipe_size_bytes)
+                reader_connected = True
+                _log_fifo_event("fifo_reader_connected", path=self.fifo_path, pipe_bytes=self.pipe_size_bytes)
 
                 gen = self.chunk_iter_factory()
                 for chunk in gen:
@@ -116,19 +139,26 @@ class DemandPagedFifoWriter:
                         except BrokenPipeError:
                             # Reader disconnected. Restart on next connect.
                             view = view[:0]
+                            _log_fifo_event("fifo_reader_disconnected", path=self.fifo_path, reason="broken_pipe")
                             break
                         except OSError as e:
                             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                                 # Reader is slow; prefer dropping over blocking the producer.
+                                now = time.time()
+                                if (now - last_backpressure_log) >= 5.0:
+                                    last_backpressure_log = now
+                                    _log_fifo_event("fifo_backpressure", path=self.fifo_path)
                                 self._stop.wait(idle_sleep)
                                 break
                             if e.errno == errno.EPIPE:
                                 view = view[:0]
+                                _log_fifo_event("fifo_reader_disconnected", path=self.fifo_path, reason="epipe")
                                 break
                             raise
                     # If we couldn't flush the whole chunk (slow reader), drop remainder.
             except Exception as e:  # pragma: no cover
                 self.last_error = str(e)
+                _log_fifo_event("fifo_error", path=self.fifo_path, error=str(e))
                 self._stop.wait(backoff)
             finally:
                 if gen is not None:
@@ -141,3 +171,5 @@ class DemandPagedFifoWriter:
                         os.close(fd)
                     except Exception:
                         pass
+                if reader_connected:
+                    _log_fifo_event("fifo_reader_closed", path=self.fifo_path)
