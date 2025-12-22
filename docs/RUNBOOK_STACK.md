@@ -48,6 +48,11 @@ image and `#hardware` tag (or explicit backend like `#hardware=vaapi/cuda`).
 Config path (generated at launch):
 - `temp/go2rtc.yaml` (or `${METABONK_GO2RTC_CONFIG}`)
 
+Health check:
+```bash
+curl -sf ${METABONK_GO2RTC_URL:-http://127.0.0.1:1984}/ >/dev/null
+```
+
 ## PipeWire Introspection
 Use PipeWire tools to inspect nodes/ports and validate capture targets:
 ```bash

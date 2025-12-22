@@ -177,6 +177,8 @@ if [[ "${GO2RTC_ENABLED}" == "1" ]]; then
   python - <<'PY'
 import os
 from pathlib import Path
+import urllib.request
+import urllib.error
 
 cfg = os.environ.get("METABONK_GO2RTC_CONFIG") or str(Path(__file__).resolve().parent.parent / "temp" / "go2rtc.yaml")
 mode = str(os.environ.get("METABONK_GO2RTC_MODE", "fifo") or "fifo").strip().lower()
@@ -185,7 +187,17 @@ if not os.path.exists(cfg):
 text = Path(cfg).read_text(errors="replace")
 if mode == "fifo" and "#raw" not in text:
     raise SystemExit("[smoke] go2rtc fifo config missing #raw passthrough tag")
-print("[smoke] go2rtc config OK")
+url = os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984").rstrip("/") + "/"
+try:
+    with urllib.request.urlopen(url, timeout=2.0) as resp:
+        code = getattr(resp, "status", 200)
+        if int(code) >= 400:
+            raise SystemExit(f"[smoke] go2rtc HTTP {code} at {url}")
+except urllib.error.HTTPError as e:
+    raise SystemExit(f"[smoke] go2rtc HTTP {e.code} at {url}") from e
+except Exception as e:
+    raise SystemExit(f"[smoke] go2rtc not reachable at {url}: {e}") from e
+print("[smoke] go2rtc config OK + api reachable")
 PY
 fi
 
