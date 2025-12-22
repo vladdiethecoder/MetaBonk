@@ -37,6 +37,29 @@ Environment knobs:
 - `METABONK_STREAM_BLACK_S` (default 8.0)
 - `METABONK_STREAM_BLACKCHECK_S` (default 5.0)
 
+## go2rtc Distribution (FIFO / Exec)
+MetaBonk’s default FIFO config uses raw H.264 passthrough to avoid any transcoding:
+- `exec:cat /streams/<instance>.h264#video=h264#raw`
+
+Hardware acceleration is only required if you enable FFmpeg transcoding in go2rtc
+(e.g. `#video=h264` without `#raw`/`#video=copy`). In that case use the hardware
+image and `#hardware` tag (or explicit backend like `#hardware=vaapi/cuda`).
+
+Config path (generated at launch):
+- `temp/go2rtc.yaml` (or `${METABONK_GO2RTC_CONFIG}`)
+
+## PipeWire Introspection
+Use PipeWire tools to inspect nodes/ports and validate capture targets:
+```bash
+pw-cli info 0
+pw-cli list-objects
+```
+PipeWire’s docs describe the node/port/link graph model and pw-cli usage.
+
+## BepInEx (IL2CPP)
+For IL2CPP builds on Linux/Wine, use the IL2CPP-specific BepInEx build and run
+the game once to generate `BepInEx/config/BepInEx.cfg` and logs.
+
 ## Input Sanity
 - uinput:
 ```bash

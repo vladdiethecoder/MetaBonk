@@ -173,6 +173,22 @@ print(f"[smoke] stream OK: {codec} {st.get('width')}x{st.get('height')} at {stre
 PY
 fi
 
+if [[ "${GO2RTC_ENABLED}" == "1" ]]; then
+  python - <<'PY'
+import os
+from pathlib import Path
+
+cfg = os.environ.get("METABONK_GO2RTC_CONFIG") or str(Path(__file__).resolve().parent.parent / "temp" / "go2rtc.yaml")
+mode = str(os.environ.get("METABONK_GO2RTC_MODE", "fifo") or "fifo").strip().lower()
+if not os.path.exists(cfg):
+    raise SystemExit(f"[smoke] go2rtc config missing: {cfg}")
+text = Path(cfg).read_text(errors="replace")
+if mode == "fifo" and "#raw" not in text:
+    raise SystemExit("[smoke] go2rtc fifo config missing #raw passthrough tag")
+print("[smoke] go2rtc config OK")
+PY
+fi
+
 if [[ "${INPUT_CHECK}" == "1" ]]; then
   if [[ "${METABONK_INPUT_BACKEND:-}" == "uinput" ]]; then
     python "${REPO_ROOT}/scripts/virtual_input.py" --tap-key ENTER

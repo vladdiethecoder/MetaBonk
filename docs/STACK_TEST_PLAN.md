@@ -45,6 +45,7 @@ Out of scope (for initial smoke):
 - Non-black frames detected (pixel variance > threshold)
 - Keyboard + mouse input causes observable UI change in-game (menu navigation)
 - Crash recovery: worker/game restart detected and recorded
+- go2rtc config uses raw H.264 passthrough (no unintended CPU transcode)
 
 ## Commands (Baseline)
 - Launch: `./start --mode train --workers 2 --go2rtc --go2rtc-mode fifo`
