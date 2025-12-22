@@ -31,6 +31,8 @@ from typing import Dict, List, Optional
 import json
 import glob
 
+from stack_banner import print_stack_banner
+
 
 def _spawn(
     name: str,
@@ -330,6 +332,9 @@ def main() -> int:
                 continue
     if game_dir:
         env["MEGABONK_GAME_DIR"] = game_dir
+
+    print_stack_banner(repo_root, game_dir=game_dir)
+    env["METABONK_BANNER_PRINTED"] = os.environ.get("METABONK_BANNER_PRINTED", "1")
 
     procs: List[subprocess.Popen] = []
     omega: Optional[subprocess.Popen] = None

@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from stack_banner import print_stack_banner
+
 
 @dataclass
 class Proc:
@@ -293,6 +295,8 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parent.parent
     py = sys.executable
+
+    print_stack_banner(repo_root, game_dir=args.game_dir)
 
     # Dream mode is an offline pipeline: run as a single subprocess and return its exit code.
     if args.mode == "dream":
