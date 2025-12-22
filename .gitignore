@@ -1,63 +1,61 @@
-# Ignore build/output artifacts directories anywhere in the repo
-artifacts/
-**/artifacts/
-
-# Large checkpoint/storage directories
-checkpoints/
-rollouts/
-game_states/
-skill_vectors/
-temp/
-
-# Large media/asset storage directories
-gameplay_videos/
-highlights/
-
-node_modules/
-dist/
-build/
+# === OS / IDE ===
 .DS_Store
-*.log
+Thumbs.db
+.vscode/
+.idea/
 
-# --- Dependencies ---
-node_modules/
-venv/
-.venv/
+# === Python ===
 __pycache__/
-
-# --- Build Artifacts (The likely culprit) ---
-dist/
-build/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 *.egg-info/
+.eggs/
+*.whl
 
-# --- Large AI Models & Data ( >100MB ) ---
-*.pth
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+.env/
+.env.*
+!.env.example
+
+# === Node / Frontend ===
+node_modules/
+**/dist/
+**/build/
+
+# === Logs ===
+*.log
+*.log.*
+
+# === Large data / artifacts ===
+/checkpoints/
+/rollouts/
+/game_states/
+/gameplay_videos/
+/highlights/
+/skill_vectors/
+/temp/
+/tmp/
+
+# === Models / datasets ===
 *.pt
+*.pth
 *.onnx
 *.bin
 *.h5
-datasets/
-models/
+/datasets/
+/models/
 
-# --- System/IDE ---
-.DS_Store
-.vscode/
-
-# --- Huge Data Folders ---
-rollouts/
-temp/
-checkpoints/
-game_states/
-megabonk assets/
-
-# --- Python Environments ---
-.venv-mb/
-.venv-cuda311/
-.venv-cuda/
-venv/
-__pycache__/
-
-# --- OS & IDE ---
-.DS_Store
-.vscode/
+# === Project-specific ===
+/megabonk assets/
+/artifacts/
 .aider*

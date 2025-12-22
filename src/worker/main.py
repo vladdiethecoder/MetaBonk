@@ -353,6 +353,7 @@ class WorkerService:
         self._last_loot_sig = None
         self._last_heal_sig = None
         self._last_pipewire_refresh_ts: float = 0.0
+        self._last_inventory_items: Optional[list[str]] = None
 
         # Episode metadata for milestone pinning (best-effort).
         self._last_stage: Optional[int] = None
@@ -2598,6 +2599,8 @@ class WorkerService:
                                 inventory_items = v
                         except Exception:
                             inventory_items = None
+                        if isinstance(inventory_items, list):
+                            self._last_inventory_items = list(inventory_items)
                         try:
                             v = vision_metrics.get("synergy_edges")
                             if isinstance(v, list):
@@ -3016,6 +3019,7 @@ class WorkerService:
                     )
                     if clip_url:
                         self.rollout.eval_clip_url = clip_url
+                        self._post_buildlab_clip(clip_url=clip_url, score=float(reward), tag="eval")
                 except Exception:
                     pass
 
@@ -3033,6 +3037,7 @@ class WorkerService:
                     tag="pb",
                 )
                 if clip_url:
+                    self._post_buildlab_clip(clip_url=clip_url, score=float(reward), tag="pb", run_id=run_id)
                     try:
                         from src.common.observability import Event
 
@@ -3059,6 +3064,35 @@ class WorkerService:
                     self.learner.push_rollout(batch)
 
             self._stop.wait(0.05)
+
+    def _post_buildlab_clip(
+        self,
+        *,
+        clip_url: str,
+        score: float,
+        tag: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> None:
+        if not requests:
+            return
+        rid = str(run_id or os.environ.get("METABONK_RUN_ID", "run-local"))
+        payload: dict[str, object] = {
+            "run_id": rid,
+            "worker_id": self.instance_id,
+            "timestamp": time.time(),
+            "clip_url": clip_url,
+            "final_score": float(score),
+            "match_duration_sec": int(max(0.0, time.time() - float(self._episode_start_ts))),
+        }
+        if self._last_inventory_items:
+            payload["inventory_snapshot"] = list(self._last_inventory_items)
+            payload["items"] = list(self._last_inventory_items)
+        if tag:
+            payload["tag"] = tag
+        try:
+            requests.post(f"{self.orch_url}/buildlab/runs", json=payload, timeout=1.0)
+        except Exception:
+            return
 
     def _stack_observation(self, obs: List[float]) -> List[float]:
         if self._frame_stack <= 1:
@@ -3439,6 +3473,7 @@ if app:
         )
         if not clip_url:
             raise HTTPException(status_code=500, detail="clip encode failed")
+        service._post_buildlab_clip(clip_url=clip_url, score=float(score), tag="clutch", run_id=run_id)
         return {"clip_url": clip_url}
 
     @app.post("/highlight/encode")
@@ -3477,6 +3512,7 @@ if app:
         )
         if not clip_url:
             raise HTTPException(status_code=500, detail="clip encode failed")
+        service._post_buildlab_clip(clip_url=clip_url, score=float(score), tag=tag, run_id=run_id)
         return {"clip_url": clip_url}
 
     @app.get("/config")
