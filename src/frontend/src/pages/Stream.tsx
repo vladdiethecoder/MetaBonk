@@ -1438,6 +1438,8 @@ export default function Stream() {
 
   const [railTab, setRailTab] = useState<RailTab>("moments");
   const [railAuto, setRailAuto] = useState(true);
+  const [replayQueue, setReplayQueue] = useState<Array<{ clipUrl: string; ts: number; label: string }>>([]);
+  const lastReplayKeyRef = useRef<string>("");
 
   const [directorOn, setDirectorOn] = useState(true);
   const [directorId, setDirectorId] = useState<string | null>(null);
@@ -1558,6 +1560,20 @@ export default function Stream() {
       hype: Math.round(hypeAvg * 100),
     };
   }, [events, workers]);
+
+  useEffect(() => {
+    const latest = events[events.length - 1];
+    if (!latest) return;
+    const payload = (latest as any)?.payload ?? {};
+    const rawClip = payload?.clip_url ?? payload?.clipUrl ?? null;
+    if (!rawClip) return;
+    const clipUrl = String(rawClip).startsWith("/api") ? String(rawClip) : `/api${rawClip}`;
+    const key = `${clipUrl}|${latest.event_id}`;
+    if (key === lastReplayKeyRef.current) return;
+    lastReplayKeyRef.current = key;
+    const label = latest.message || latest.event_type || "highlight";
+    setReplayQueue((prev) => [{ clipUrl, ts: latest.ts ?? Date.now() / 1000, label }, ...prev].slice(0, 3));
+  }, [events]);
 
   const workersById = useMemo(() => {
     const m: Record<string, Heartbeat> = {};
@@ -2482,6 +2498,27 @@ export default function Stream() {
                       runnerUp={leaderTop[1] ?? null}
                       pulse={highlightPulseUntil > Date.now()}
                     />
+
+                    <div className="stream-card stream-highlight" style={{ marginTop: 12 }}>
+                      <div className="stream-card-title">Replay Buffer</div>
+                      <div className="stream-highlight-media">
+                        {replayQueue.length ? (
+                          <div className="replay-queue">
+                            {replayQueue.map((r) => (
+                              <div key={r.clipUrl} className="replay-queue-item">
+                                <video className="replay-queue-video" src={r.clipUrl} autoPlay muted playsInline loop />
+                                <div className="replay-queue-label">
+                                  <span>{r.label}</span>
+                                  <span className="muted">{timeAgo(r.ts)}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="stream-highlight-placeholder">waiting for event-driven clips…</div>
+                        )}
+                      </div>
+                    </div>
 
                   <div className="stream-tabs">
                     <div className="stream-tabbar">
