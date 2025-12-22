@@ -765,6 +765,20 @@ body::before{
 .thumb-grid{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .thumb{ width: 100%; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); }
 
+.replay-queue{ display:flex; flex-direction:column; gap: 8px; padding: 10px; }
+.replay-queue-item{
+  display:grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px;
+  align-items:center;
+  background: rgba(9,12,16,.7);
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 10px;
+  padding: 6px;
+}
+.replay-queue-video{ width: 120px; height: 68px; object-fit: cover; border-radius: 8px; }
+.replay-queue-label{ display:flex; flex-direction:column; gap: 4px; font-size: 12px; }
+
 /* Stream-facing HUD (OBS browser source) */
 .hud{
   width: 100vw;
