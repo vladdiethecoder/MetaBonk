@@ -1,5 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import * as THREE from "three";
 import { Link, useLocation } from "react-router-dom";
 import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
 import { useEventStream } from "../hooks/useEventStream";
@@ -7,6 +9,26 @@ import useContextFilters from "../hooks/useContextFilters";
 import { useContextDrawer } from "../hooks/useContextDrawer";
 import { deriveReasonCode } from "../hooks/useIssues";
 import { clamp01, copyToClipboard, fmtFixed, fmtNum, fmtPct01, timeAgo } from "../lib/format";
+
+function InstanceLatticeViz() {
+  const ref = useRef<THREE.Mesh | null>(null);
+  useFrame((state) => {
+    if (!ref.current) return;
+    const t = state.clock.getElapsedTime();
+    ref.current.rotation.y = t * 0.3;
+    ref.current.rotation.z = t * 0.2;
+  });
+  return (
+    <Canvas className="instances-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.8} />
+      <mesh ref={ref}>
+        <icosahedronGeometry args={[1, 1]} />
+        <meshBasicMaterial wireframe color="#7bffe6" transparent opacity={0.45} />
+      </mesh>
+    </Canvas>
+  );
+}
 
 function Sparkline({ values, color }: { values: number[] | null | undefined; color: string }) {
   const vals = (values ?? []).filter((v) => Number.isFinite(v));
@@ -171,7 +193,33 @@ export default function Instances() {
   }, [timelineQ.data, selectedRow]);
 
   return (
-    <div className="grid" style={{ gridTemplateColumns: "1.3fr 0.7fr" }}>
+    <div className="grid instances-grid" style={{ gridTemplateColumns: "1.3fr 0.7fr" }}>
+      <section className="card instances-core-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="row-between">
+          <h2>Instance Lattice</h2>
+          <span className="badge">{fmtNum(Object.keys(instances).length)} live</span>
+        </div>
+        <div className="instances-core-body">
+          <div>
+            <div className="muted">Telemetry coherence • hazard fields • stream integrity</div>
+            <div className="instances-core-kpis">
+              <div>
+                <span className="label">Selected</span>
+                <strong>{selected ?? "—"}</strong>
+              </div>
+              <div>
+                <span className="label">Events</span>
+                <strong>{events.length}</strong>
+              </div>
+              <div>
+                <span className="label">Policy</span>
+                <strong>{policy === "all" ? "all" : policy}</strong>
+              </div>
+            </div>
+          </div>
+          <InstanceLatticeViz />
+        </div>
+      </section>
       <section className="card">
         <div className="row-between">
           <h2>Instances</h2>

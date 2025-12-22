@@ -15,9 +15,11 @@ import asyncio
 import base64
 import os
 import random
+import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import List, Optional, TYPE_CHECKING
 
 try:
@@ -183,6 +185,14 @@ class WorkerService:
         self._last_step_ts: float = 0.0
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
+        self._gameplay_started: bool = False
+        self._gameplay_start_ts: float = 0.0
+        self._action_source = self._normalize_action_source(
+            os.environ.get("METABONK_ACTION_SOURCE", "policy")
+        )
+        self._action_guard_enabled = os.environ.get("METABONK_ACTION_GUARD", "0") in ("1", "true", "True")
+        self._action_guard_path = os.environ.get("METABONK_ACTION_GUARD_PATH", "")
+        self._action_guard_violation: Optional[str] = None
 
         # Optional UnityBridge embodiment (BepInEx plugin).
         self._use_bridge = os.environ.get("METABONK_USE_UNITY_BRIDGE", "0") in ("1", "true", "True")
@@ -867,6 +877,100 @@ class WorkerService:
         with self._telemetry_lock:
             hist = list(self._telemetry_history)
         return hist[-limit:]
+
+    def _normalize_action_source(self, raw: Optional[str]) -> str:
+        val = str(raw or "").strip().lower()
+        if val in ("", "policy", "ppo", "learned", "agent", "default"):
+            return "policy"
+        if val in ("random", "rand", "baseline_random"):
+            return "random"
+        return "policy"
+
+    def _set_action_source(self, raw: Optional[str]) -> None:
+        self._action_source = self._normalize_action_source(raw)
+
+    def _sample_random_action(self, action_mask: Optional[List[int]]) -> tuple[List[float], List[int]]:
+        cfg = getattr(self.trainer, "cfg", None)
+        cont_dim = int(getattr(cfg, "continuous_dim", 2) or 2)
+        cont = [random.uniform(-1.0, 1.0) for _ in range(cont_dim)]
+        disc: List[int] = []
+        branches = list(getattr(cfg, "discrete_branches", (1,)) or (1,))
+        for b in branches:
+            try:
+                b = int(b)
+            except Exception:
+                b = 1
+            b = max(1, b)
+            if action_mask is not None and len(action_mask) == b:
+                valid = [i for i, m in enumerate(action_mask) if m == 1]
+                if valid:
+                    disc.append(int(random.choice(valid)))
+                else:
+                    disc.append(b - 1)
+            else:
+                disc.append(int(random.randrange(b)))
+        return cont, disc
+
+    def _update_gameplay_state(self, menu_hint: Optional[bool], game_state: dict) -> None:
+        if self._gameplay_started:
+            return
+        try:
+            from src.proof_harness.guards import should_mark_gameplay_started
+
+            if should_mark_gameplay_started(menu_hint, game_state):
+                self._gameplay_started = True
+                self._gameplay_start_ts = time.time()
+        except Exception:
+            return
+
+    def _flag_action_guard_violation(self, reason: str) -> None:
+        if self._action_guard_violation:
+            return
+        msg = f"[action-guard] {reason}"
+        self._action_guard_violation = msg
+        path = self._action_guard_path.strip() if self._action_guard_path else ""
+        if not path:
+            path = str(Path("temp") / "action_guard_violations" / f"{self.instance_id}.txt")
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(msg)
+        except Exception:
+            pass
+        print(f"[worker:{self.instance_id}] {msg}", file=sys.stderr)
+        try:
+            os._exit(2)
+        except Exception:
+            raise RuntimeError(msg)
+
+    def _action_guard_check(
+        self,
+        *,
+        action_source: str,
+        menu_override_active: bool,
+        forced_ui_click: Optional[tuple[int, int]],
+        input_bootstrap: bool,
+        sima2_action: Optional[List[float]],
+    ) -> None:
+        if not self._action_guard_enabled:
+            return
+        if not self._gameplay_started:
+            return
+        try:
+            from src.proof_harness.guards import action_guard_violation
+
+            reason = action_guard_violation(
+                gameplay_started=self._gameplay_started,
+                action_source=action_source,
+                menu_override_active=menu_override_active,
+                forced_ui_click=forced_ui_click,
+                input_bootstrap=input_bootstrap,
+                sima2_action=sima2_action,
+            )
+            if reason:
+                self._flag_action_guard_violation(reason)
+        except Exception:
+            return
 
     def _ensure_preview_jpeg(self) -> None:
         # Default-on: this runs at a low rate and keeps a cached JPEG for UI fallback/debug.
@@ -1952,6 +2056,8 @@ class WorkerService:
             if str(os.environ.get("METABONK_MENU_FORCE", "0")).lower() in ("1", "true", "yes"):
                 menu_hint = True
 
+            self._update_gameplay_state(menu_hint, game_state)
+
             if menu_hint is not None and menu_hint != self._last_menu_mode_log:
                 try:
                     cm_dbg = str(game_state.get("currentMenu") or "")
@@ -1961,8 +2067,10 @@ class WorkerService:
                 self._last_menu_mode_log = menu_hint
 
             menu_override_active = False
+            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_START
             if (
-                self._switching_controller is not None
+                not self._gameplay_started
+                and self._switching_controller is not None
                 and menu_hint
                 and latest_image_bytes is not None
             ):
@@ -1994,6 +2102,7 @@ class WorkerService:
                             )
                         except Exception:
                             forced_ui_click = None
+            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END
 
             ui_elements_cache = None
             action_mask_cache = None
@@ -2022,7 +2131,13 @@ class WorkerService:
 
             # Default policy action (PPO).
             action_mask_for_policy = action_mask if self._input_backend is None else None
-            a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask_for_policy)
+            action_source = self._action_source if self._gameplay_started else "policy"
+            if self._gameplay_started and action_source == "random":
+                a_cont, a_disc = self._sample_random_action(action_mask_for_policy or action_mask)
+                lp = 0.0
+                val = 0.0
+            else:
+                a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask_for_policy)
             action_mask_for_rollout = action_mask_for_policy
 
             # Optional SIMA2 backend override (inference).
@@ -2030,6 +2145,7 @@ class WorkerService:
                 self._use_sima2
                 and self._sima2_controller is not None
                 and latest_image_bytes is not None
+                and not (self._gameplay_started and action_source == "random")
             ):
                 try:
                     import io
@@ -2057,7 +2173,8 @@ class WorkerService:
                     sima2_action = None
 
             # Optional menu exploration: epsilon-greedy clicks when stuck in menus.
-            if menu_hint and action_mask and self._input_backend is None:
+            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_START
+            if (not self._gameplay_started) and menu_hint and action_mask and self._input_backend is None:
                 try:
                     eps = float(os.environ.get("METABONK_MENU_EPS", "0") or 0.0)
                 except Exception:
@@ -2072,7 +2189,8 @@ class WorkerService:
 
             # Optional Lobby Agent override for menus/level-up screens.
             if (
-                self._use_vlm_menu
+                (not self._gameplay_started)
+                and self._use_vlm_menu
                 and self._vlm_menu is not None
                 and latest_image_bytes is not None
                 and frame_size is not None
@@ -2164,15 +2282,29 @@ class WorkerService:
                         forced_ui_click = None
 
             input_bootstrap = False
-            if self._input_backend and (not menu_override_active) and self._input_should_bootstrap(menu_hint, game_state):
+            if (
+                self._input_backend
+                and (not menu_override_active)
+                and (not self._gameplay_started)
+                and self._input_should_bootstrap(menu_hint, game_state)
+            ):
                 self._run_menu_bootstrap()
                 input_bootstrap = True
             elif self._input_backend and (not menu_override_active):
                 self._input_send_actions(a_cont, a_disc)
+            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END
+
+            self._action_guard_check(
+                action_source=action_source,
+                menu_override_active=menu_override_active,
+                forced_ui_click=forced_ui_click,
+                input_bootstrap=input_bootstrap,
+                sima2_action=sima2_action,
+            )
 
             # Flight recorder: store last actions + thumbnails for Context Drawer.
             try:
-                action_label = "policy"
+                action_label = "random" if (self._gameplay_started and action_source == "random") else "policy"
                 if menu_override_active and menu_override_action is not None:
                     action_label = f"menu:{getattr(menu_override_action, 'kind', 'override')}"
                 elif forced_ui_click is not None:
@@ -3082,6 +3214,12 @@ class WorkerService:
                         self._last_done_sent = False
                         self._episode_idx += 1
                         self._episode_start_ts = now
+                        if self.rollout.eval_mode and self.rollout.eval_seed is not None:
+                            if self._action_source == "random":
+                                try:
+                                    random.seed(int(self.rollout.eval_seed) + int(self._episode_idx))
+                                except Exception:
+                                    pass
                         ev3 = Event(
                             event_id="",
                             run_id=os.environ.get("METABONK_RUN_ID", "run-local"),
@@ -3400,6 +3538,16 @@ class WorkerService:
         try:
             if cfg.config_poll_s is not None:
                 self._config_poll_s = float(cfg.config_poll_s)
+        except Exception:
+            pass
+        try:
+            raw = None
+            if hasattr(cfg, "action_source"):
+                raw = getattr(cfg, "action_source")
+            if raw is None:
+                raw = cfg.model_dump().get("action_source")
+            if raw is not None:
+                self._set_action_source(str(raw))
         except Exception:
             pass
         try:

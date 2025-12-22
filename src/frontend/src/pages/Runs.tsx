@@ -1,8 +1,30 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useRef } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import * as THREE from "three";
 import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
 import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
+
+function RunsCoreViz() {
+  const ref = useRef<THREE.Mesh | null>(null);
+  useFrame((state) => {
+    if (!ref.current) return;
+    const t = state.clock.getElapsedTime();
+    ref.current.rotation.x = t * 0.25;
+    ref.current.rotation.y = t * 0.35;
+  });
+  return (
+    <Canvas className="runs-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.8} />
+      <mesh ref={ref}>
+        <dodecahedronGeometry args={[1, 0]} />
+        <meshBasicMaterial wireframe color="#7bffe6" transparent opacity={0.45} />
+      </mesh>
+    </Canvas>
+  );
+}
 
 export default function Runs() {
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: fetchRuns, refetchInterval: 5000 });
@@ -106,7 +128,33 @@ export default function Runs() {
   };
 
   return (
-    <div className="grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
+    <div className="grid runs-grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
+      <section className="card runs-core-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="row-between">
+          <h2>Run Constellation</h2>
+          <span className="badge">{fmtNum(runs.length)} total</span>
+        </div>
+        <div className="runs-core-body">
+          <div>
+            <div className="muted">Temporal alignment • rollouts • policy drift</div>
+            <div className="runs-core-kpis">
+              <div>
+                <span className="label">Active runs</span>
+                <strong>{fmtNum(activeCount)}</strong>
+              </div>
+              <div>
+                <span className="label">Best reward</span>
+                <strong>{fmtFixed(bestOverall, 2)}</strong>
+              </div>
+              <div>
+                <span className="label">Compare set</span>
+                <strong>{compareSelection.length}</strong>
+              </div>
+            </div>
+          </div>
+          <RunsCoreViz />
+        </div>
+      </section>
       <section className="card">
         <div className="row-between">
           <h2>Runs</h2>

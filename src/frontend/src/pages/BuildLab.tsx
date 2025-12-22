@@ -3,9 +3,11 @@ import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import cytoscape, { Core } from "cytoscape";
 import { BuildLabExamplesResponse, Heartbeat, fetchBuildLabExamples, fetchWorkers } from "../api";
+import ForceGraph3D from "react-force-graph-3d";
+import * as THREE from "three";
 
 type Metric = "lift" | "deltaScore" | "pTop";
-type ViewMode = "web" | "tree";
+type ViewMode = "web" | "tree" | "forge3d";
 
 type BuildItem = {
   key: string;
@@ -495,6 +497,30 @@ export default function BuildLab() {
     return xs.slice(0, 90).map((x) => x.p);
   }, [pairs, metric]);
 
+  const itemCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const w of filteredWorkers) {
+      for (const it of parseBuildItems(w)) counts[it.key] = (counts[it.key] ?? 0) + 1;
+    }
+    return counts;
+  }, [filteredWorkers]);
+
+  const forceGraphData = useMemo(() => {
+    const nodes = Object.values(items).map((it) => ({
+      id: it.key,
+      name: it.label,
+      kind: it.kind,
+      size: Math.max(1, Math.min(14, itemCounts[it.key] ?? 1)),
+      color: colorForKind(it.kind),
+    }));
+    const links = rankedPairs.slice(0, 160).map((p) => ({
+      source: p.a,
+      target: p.b,
+      weight: metricValue(p, metric) ?? 0.1,
+    }));
+    return { nodes, links };
+  }, [items, rankedPairs, itemCounts, metric]);
+
   const selectedPartners = useMemo(() => {
     if (!selected) return [];
     const rel = pairs.filter((p) => p.a === selected || p.b === selected);
@@ -749,6 +775,13 @@ export default function BuildLab() {
     enabled: selectedComboItems.length > 0,
     refetchInterval: 8000,
   });
+  const predictedScore = useMemo(() => {
+    const ex = examplesQ.data?.examples ?? [];
+    if (!ex.length) return null;
+    const scores = ex.map((e) => Number(e.final_score ?? 0)).filter((v) => Number.isFinite(v));
+    if (!scores.length) return null;
+    return scores.reduce((a, b) => a + b, 0) / scores.length;
+  }, [examplesQ.data]);
 
   const treeLayout = useMemo(() => {
     return layoutRadialTree(treeData.root, treeSize.w, treeSize.h, Math.min(treeSize.w, treeSize.h) / (maxDepth + 1.8));
@@ -888,9 +921,53 @@ export default function BuildLab() {
 
   return (
     <div className="page buildlab">
+      <section className="forge-hero">
+        <div>
+          <div className="forge-title">Synergy Forge</div>
+          <div className="muted">Drag items into the crucible to reveal compatible neighbors.</div>
+          <div className="forge-kpis">
+            <div>
+              <span className="label">Active workers</span>
+              <strong>{workersTotal}</strong>
+            </div>
+            <div>
+              <span className="label">Known items</span>
+              <strong>{Object.keys(items).length}</strong>
+            </div>
+            <div>
+              <span className="label">Live edges</span>
+              <strong>{rankedPairs.length}</strong>
+            </div>
+          </div>
+        </div>
+        <div className="forge-crucible">
+          <div className="forge-crucible-title">Crucible</div>
+          {selectedComboItems.length ? (
+            <div className="forge-crucible-items">
+              {selectedComboItems.map((it) => (
+                <span key={it} className="chip chip-glow">
+                  {it}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <div className="muted">Drop an item from the graph to begin forging.</div>
+          )}
+          <div className="forge-gauge">
+            <span>Predicted reward</span>
+            <strong>{predictedScore == null ? "—" : predictedScore.toFixed(2)}</strong>
+          </div>
+        </div>
+      </section>
       <div className="row-between" style={{ alignItems: "baseline" }}>
         <h1 style={{ margin: 0 }}>Build Lab</h1>
-        <div className="muted">{viewMode === "web" ? "Synergy Web • combos • build intuition" : "Refinement Tree • build stages • next picks"}</div>
+        <div className="muted">
+          {viewMode === "web"
+            ? "Synergy Web • combos • build intuition"
+            : viewMode === "forge3d"
+              ? "Synergy Forge • 3D molecular graph"
+              : "Refinement Tree • build stages • next picks"}
+        </div>
       </div>
 
       <div className="card" style={{ marginTop: 12 }}>
@@ -900,6 +977,7 @@ export default function BuildLab() {
               <span className="muted">View</span>
               <select value={viewMode} onChange={(e) => setViewMode(e.target.value as ViewMode)}>
                 <option value="web">Synergy web</option>
+                <option value="forge3d">Forge 3D</option>
                 <option value="tree">Refinement tree</option>
               </select>
             </label>
@@ -1047,15 +1125,46 @@ export default function BuildLab() {
         <div className="card" style={{ minHeight: 520, position: "relative" }}>
           <div className="row-between" style={{ marginBottom: 8 }}>
             <div className="kpi">
-              <div className="label">{viewMode === "web" ? "Synergy Web" : "Refinement Tree"}</div>
+              <div className="label">
+                {viewMode === "web" ? "Synergy Web" : viewMode === "forge3d" ? "Synergy Forge" : "Refinement Tree"}
+              </div>
               <div className="value">{hasAnyItems ? "LIVE" : "EMPTY"}</div>
             </div>
             <div className="muted" style={{ textAlign: "right" }}>
-              {viewMode === "web" ? "click node → partners • pin nodes for screenshots" : "click node → next picks • rings = build stages"}
+              {viewMode === "web"
+                ? "click node → partners • pin nodes for screenshots"
+                : viewMode === "forge3d"
+                  ? "drag node → realign • click → set crucible"
+                  : "click node → next picks • rings = build stages"}
             </div>
           </div>
           {viewMode === "web" ? (
             <div className="buildlab-graph" ref={graphElRef} />
+          ) : viewMode === "forge3d" ? (
+            <div className="forge3d-wrap">
+              <ForceGraph3D
+                graphData={forceGraphData}
+                backgroundColor="#050709"
+                nodeRelSize={4}
+                linkOpacity={0.35}
+                linkWidth={(link: any) => Math.max(0.5, Math.min(2.5, (link.weight ?? 0.2) * 2))}
+                nodeColor={(node: any) => node.color}
+                nodeLabel={(node: any) => `${node.name ?? node.id}`}
+                onNodeClick={(node: any) => {
+                  setSelected(String(node.id));
+                  setSpotlightItems([String(node.id)]);
+                }}
+                onBackgroundClick={() => {
+                  setSelected(null);
+                  setSpotlightItems(null);
+                }}
+                nodeThreeObject={(node: any) => {
+                  const geom = new THREE.SphereGeometry(0.6 + (node.size ?? 1) * 0.05, 16, 16);
+                  const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(node.color ?? "#7bffe6") });
+                  return new THREE.Mesh(geom, mat);
+                }}
+              />
+            </div>
           ) : (
             <div className="buildlab-tree" ref={treeWrapRef}>
               <svg className="buildlab-tree-svg" width={treeSize.w} height={treeSize.h} viewBox={`0 0 ${treeSize.w} ${treeSize.h}`}>
@@ -1371,6 +1480,7 @@ export default function BuildLab() {
             </div>
           )}
         </div>
+      </div>
       </div>
 
       <div className="card" style={{ marginTop: 12 }}>

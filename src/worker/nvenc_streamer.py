@@ -42,6 +42,8 @@ _GST_ELEMENT_CACHE: dict[str, bool] = {}
 _GST_PROPS_CACHE: dict[str, set[str]] = {}
 _FFMPEG_ENCODER_CACHE: dict[str, bool] = {}
 _FFMPEG_ENCODERS_TXT: Optional[str] = None
+_FFMPEG_BSFS_CACHE: dict[str, bool] = {}
+_FFMPEG_BSFS_TXT: Optional[str] = None
 _STREAM_LOG_LAST: dict[str, float] = {}
 
 
@@ -179,6 +181,35 @@ def _ffmpeg_encoders_text() -> str:
     except Exception:
         _FFMPEG_ENCODERS_TXT = ""
     return _FFMPEG_ENCODERS_TXT
+
+
+def _ffmpeg_bsfs_text() -> str:
+    global _FFMPEG_BSFS_TXT
+    if _FFMPEG_BSFS_TXT is not None:
+        return _FFMPEG_BSFS_TXT
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        _FFMPEG_BSFS_TXT = ""
+        return ""
+    try:
+        out = subprocess.check_output([ffmpeg, "-hide_banner", "-bsfs"], stderr=subprocess.STDOUT, timeout=8.0)
+        _FFMPEG_BSFS_TXT = out.decode("utf-8", "replace")
+    except Exception:
+        _FFMPEG_BSFS_TXT = ""
+    return _FFMPEG_BSFS_TXT
+
+
+def _ffmpeg_bsf_available(name: str) -> bool:
+    n = str(name or "").strip()
+    if not n:
+        return False
+    cached = _FFMPEG_BSFS_CACHE.get(n)
+    if cached is not None:
+        return cached
+    txt = _ffmpeg_bsfs_text().lower()
+    ok = bool(txt) and (f"{n.lower()}\n" in txt or f"{n.lower()}\r\n" in txt)
+    _FFMPEG_BSFS_CACHE[n] = ok
+    return ok
 
 
 def _ffmpeg_encoder_available(name: str) -> bool:
@@ -1479,6 +1510,8 @@ class NVENCStreamer:
             cmd += ["-g", str(gop), "-bf", "0", "-forced-idr", "1"]
         else:
             cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop)]
+            if enc == "libx264":
+                cmd += ["-x264-params", "repeat-headers=1"]
 
         if extra_out:
             cmd += extra_out.split()
@@ -1486,7 +1519,15 @@ class NVENCStreamer:
         container = str(container or "mp4").strip().lower()
         if container not in ("mp4", "mpegts", "h264"):
             container = "mp4"
-        if container == "h264":
+
+        if container == "h264" and codec == "h264":
+            bsfs: list[str] = []
+            if _ffmpeg_bsf_available("h264_mp4toannexb"):
+                bsfs.append("h264_mp4toannexb")
+            if _ffmpeg_bsf_available("h264_metadata"):
+                bsfs.append("h264_metadata=aud=insert")
+            if bsfs:
+                cmd += ["-bsf:v", ",".join(bsfs)]
             cmd += ["-f", "h264", "pipe:1"]
         elif container == "mpegts":
             cmd += ["-f", "mpegts", "pipe:1"]

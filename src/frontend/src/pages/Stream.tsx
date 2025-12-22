@@ -1,5 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { type SyntheticEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { EffectComposer, Bloom, Scanline, ChromaticAberration, Glitch } from "@react-three/postprocessing";
+import { BlendFunction, GlitchMode } from "postprocessing";
+import * as THREE from "three";
 import type { AttractHighlights, Event, Heartbeat, HistoricLeaderboardEntry, HofEntry, TimelineFuse, TimelineState } from "../api";
 import {
   fetchAttractHighlights,
@@ -33,6 +37,14 @@ const computeTier = (w: number) => {
   if (w >= 2560) return "1440";
   if (w >= 1920) return "1080";
   return "720";
+};
+const hashString = (input: string) => {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 };
 
 function findAvc1Codec(init: Uint8Array): string | null {
@@ -105,11 +117,13 @@ function MseMp4Video({
   className,
   fallbackUrl,
   exclusiveKey,
+  onVideoReady,
 }: {
   url: string;
   className?: string;
   fallbackUrl?: string;
   exclusiveKey?: string;
+  onVideoReady?: (el: HTMLVideoElement | null) => void;
 }) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const [status, setStatus] = useState<"loading" | "playing" | "error">("loading");
@@ -119,6 +133,13 @@ function MseMp4Video({
   const [usingSnapshot, setUsingSnapshot] = useState(false);
   const [overlayOn, setOverlayOn] = useState(true);
   const [retryTick, setRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!onVideoReady) return;
+    const el = ref.current;
+    onVideoReady(el);
+    return () => onVideoReady(null);
+  }, [onVideoReady]);
 
   // Prevent multiple simultaneous /stream.mp4 connections to the same worker.
   // The worker stream endpoint is intentionally single-client by default to
@@ -138,6 +159,7 @@ function MseMp4Video({
   useEffect(() => {
     const el = ref.current;
     if (!el || !url) return;
+    if (onVideoReady) onVideoReady(el);
     setStatus("loading");
     setErrMsg("");
     setStillOk(false);
@@ -463,6 +485,110 @@ function MseMp4Video({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function CurvedScreen({
+  texture,
+  width = 1.6,
+  height = 0.9,
+  curvature = 0.22,
+}: {
+  texture: THREE.Texture | null;
+  width?: number;
+  height?: number;
+  curvature?: number;
+}) {
+  const geom = useMemo(() => {
+    const g = new THREE.PlaneGeometry(width, height, 64, 32);
+    const pos = g.attributes.position as THREE.BufferAttribute;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const z = -Math.pow(Math.abs(x) / width, 2) * curvature;
+      pos.setZ(i, z);
+    }
+    g.computeVertexNormals();
+    return g;
+  }, [width, height, curvature]);
+
+  useFrame(() => {
+    if (texture && "offset" in texture) {
+      texture.needsUpdate = true;
+    }
+  });
+
+  return (
+    <mesh geometry={geom}>
+      <meshBasicMaterial map={texture ?? undefined} toneMapped={false} />
+    </mesh>
+  );
+}
+
+function HoloStreamCanvas({
+  videoEl,
+  fallbackUrl,
+  surprise,
+  glitch,
+}: {
+  videoEl: HTMLVideoElement | null;
+  fallbackUrl?: string;
+  surprise: number;
+  glitch: boolean;
+}) {
+  const [texture, setTexture] = useState<THREE.Texture | null>(null);
+
+  useEffect(() => {
+    if (!videoEl) return;
+    const tex = new THREE.VideoTexture(videoEl);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    setTexture(tex);
+    return () => {
+      tex.dispose();
+    };
+  }, [videoEl]);
+
+  useEffect(() => {
+    if (!fallbackUrl || videoEl) return;
+    const loader = new THREE.TextureLoader();
+    loader.load(fallbackUrl, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      setTexture(tex);
+    });
+  }, [fallbackUrl, videoEl]);
+
+  const chromaOffset = 0.001 + surprise * 0.004;
+
+  return (
+    <Canvas
+      className="holo-r3f-canvas"
+      dpr={[1, 2]}
+      gl={{ antialias: true, alpha: true }}
+      camera={{ position: [0, 0, 2.2], fov: 45 }}
+    >
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.6} />
+      <group>
+        <CurvedScreen texture={texture} />
+        <mesh position={[0, 0, 0.01]}>
+          <planeGeometry args={[1.64, 0.94]} />
+          <meshBasicMaterial color={new THREE.Color(0x6fffe6)} opacity={0.05} transparent />
+        </mesh>
+      </group>
+      <EffectComposer>
+        <Bloom intensity={1.1} luminanceThreshold={0.2} />
+        <Scanline density={1.5} opacity={0.25} />
+        <ChromaticAberration blendFunction={BlendFunction.NORMAL} offset={[chromaOffset, 0]} />
+        <Glitch
+          delay={[0.6, 2.2]}
+          duration={[0.2, 0.45]}
+          strength={[0.2, 0.6]}
+          mode={GlitchMode.SPORADIC}
+          active={glitch}
+        />
+      </EffectComposer>
+    </Canvas>
   );
 }
 
@@ -907,6 +1033,7 @@ function StreamTile({
     lastFrameAgeS = null;
   }
   const [standbyStable, setStandbyStable] = useState(true);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     if (noFeed || lastFrameAgeS == null) {
@@ -945,6 +1072,22 @@ function StreamTile({
   const status = String(w?.status ?? "").toLowerCase();
   const menuStuck = status.includes("menu") || status.includes("stuck");
   const actionsPerMin = stepRate != null ? Math.max(0, stepRate) : null;
+  const surprise = clamp(Number(w?.action_entropy ?? danger), 0, 1);
+  const glitch = surprise > 0.75 || danger > 0.6;
+  const overlayBoxes = useMemo(() => {
+    const seed = hashString(String(w?.instance_id ?? slotLabel));
+    const boxes = Array.from({ length: 3 }, (_, i) => {
+      const r1 = ((seed >> (i * 4)) & 0xf) / 15;
+      const r2 = ((seed >> (i * 6 + 3)) & 0xf) / 15;
+      const r3 = ((seed >> (i * 5 + 7)) & 0xf) / 15;
+      const wPct = 18 + r1 * 32;
+      const hPct = 14 + r2 * 28;
+      const xPct = 6 + r3 * (100 - wPct - 12);
+      const yPct = 10 + ((r1 + r2) * 0.5) * (100 - hPct - 18);
+      return { xPct, yPct, wPct, hPct };
+    });
+    return boxes;
+  }, [w?.instance_id, slotLabel]);
 
   const policyKey: IconKey = "policy";
   const hypeKey: IconKey = "hype";
@@ -958,19 +1101,38 @@ function StreamTile({
       style={{ cursor: onClick ? "pointer" : "default" }}
       onClick={onClick}
     >
-      <div className="stream-tile-feed">
+      <div className={`stream-tile-feed holo-feed ${glitch ? "holo-glitch" : ""}`} style={{ ["--surprise" as any]: surprise }}>
         {cornerTag ? <div className="stream-tile-role">{cornerTag}</div> : null}
         {rankUp && rankUp > 0 ? (
           <div className="stream-rank-burst" aria-label={`rank up ${rankUp}`}>
             ▲ +{rankUp}
           </div>
         ) : null}
+        {focused ? (
+          <div className="holo-r3f">
+            <HoloStreamCanvas videoEl={videoEl} fallbackUrl={frameUrl || undefined} surprise={surprise} glitch={glitch} />
+          </div>
+        ) : null}
+        <div className="holo-frame" />
+        <div className="holo-ghost" />
+        <div className="holo-fovea" />
+        <div className="holo-scan" />
+        <div className="holo-boxes" aria-hidden="true">
+          {overlayBoxes.map((b, i) => (
+            <div
+              key={`box-${i}`}
+              className="holo-box"
+              style={{ left: `${b.xPct}%`, top: `${b.yPct}%`, width: `${b.wPct}%`, height: `${b.hPct}%` }}
+            />
+          ))}
+        </div>
         {streamUrl && isVideo ? (
           <MseMp4Video
-            className="stream-img"
+            className={`stream-img ${focused ? "holo-fallback" : ""}`}
             url={streamUrl}
             fallbackUrl={frameUrl || undefined}
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
+            onVideoReady={focused ? setVideoEl : undefined}
           />
         ) : null}
         {noFeed ? (

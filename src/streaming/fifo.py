@@ -44,6 +44,14 @@ def try_set_pipe_size(fd: int, size_bytes: int) -> bool:
         sz = int(size_bytes)
     except Exception:
         return False
+    if sz <= 0:
+        return False
+    try:
+        # Linux-specific fcntl. If unsupported, this raises.
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, sz)
+        return True
+    except Exception:
+        return False
 
 
 def _log_fifo_event(event: str, **fields: object) -> None:
@@ -63,14 +71,6 @@ def _log_fifo_event(event: str, **fields: object) -> None:
             continue
         parts.append(f"{k}={v}")
     print("[stream] " + " ".join(parts))
-    if sz <= 0:
-        return False
-    try:
-        # Linux-specific fcntl. If unsupported, this raises.
-        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, sz)
-        return True
-    except Exception:
-        return False
 
 
 @dataclass

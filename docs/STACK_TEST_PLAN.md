@@ -54,6 +54,7 @@ Out of scope (for initial smoke):
 - Stop: `python scripts/stop.py --all --go2rtc`
 - Diagnostics: `python scripts/stream_diagnostics.py --require-pipewire`
 - Smoke: `scripts/smoke_stack.sh`
+- GPU preflight (when required): `METABONK_REQUIRE_CUDA=1 pytest -k gpu_requirements`
 
 ## Expected Artifacts
 - Logs in `temp/`

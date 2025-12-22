@@ -58,6 +58,8 @@ class InstanceConfig(MBBaseModel):
     # Evaluation mode (fixed-seed evals, no training updates).
     eval_mode: Optional[bool] = None
     eval_seed: Optional[int] = None
+    # Action source override (policy | random). Used by proof harness.
+    action_source: Optional[str] = None
 
 
 class Heartbeat(MBBaseModel):

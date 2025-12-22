@@ -50,7 +50,7 @@ export default function ContextDrawer() {
   const frameUrl = useMemo(() => {
     const base = instance?.heartbeat?.control_url ?? "";
     if (!base) return "";
-    return `${String(base).replace(/\\/+$/, "")}/frame.jpg`;
+    return `${String(base).replace(/\/+$/, "")}/frame.jpg`;
   }, [instance]);
 
   const instanceEvents = useMemo(() => {
@@ -68,7 +68,7 @@ export default function ContextDrawer() {
       setFlight([]);
       return;
     }
-    const endpoint = `${String(controlUrl).replace(/\\/+$/, "")}/worker/${encodeURIComponent(String(iid))}/history?limit=24`;
+    const endpoint = `${String(controlUrl).replace(/\/+$/, "")}/worker/${encodeURIComponent(String(iid))}/history?limit=24`;
     let mounted = true;
     setFlightLoading(true);
     fetch(endpoint)

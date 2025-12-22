@@ -9,6 +9,11 @@
 ```bash
 scripts/smoke_stack.sh
 ```
+
+## GPU Preflight (Required GPU)
+```bash
+METABONK_REQUIRE_CUDA=1 pytest -k gpu_requirements
+```
 Options:
 - `METABONK_SMOKE_WORKERS=2`
 - `METABONK_SMOKE_STREAM=1`

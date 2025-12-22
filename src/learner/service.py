@@ -98,6 +98,16 @@ def _load_json_list(path: Path) -> List[Dict[str, Any]]:
     return []
 
 
+def _policy_list_from_env(var: str) -> set[str]:
+    raw = os.environ.get(var, "") or ""
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _policy_in_env_list(policy_name: str, var: str) -> bool:
+    pols = _policy_list_from_env(var)
+    return bool(policy_name and policy_name in pols)
+
+
 def _record_eval_metrics(metrics: Dict[str, Any]) -> None:
     path = _eval_history_path()
     best_path = _eval_best_path()
@@ -639,6 +649,9 @@ async def push_rollout(batch: RolloutBatch):
         _last_metrics[batch.policy_name] = {**_last_metrics.get(batch.policy_name, {}), **_sanitize_metrics(metrics)}
         return {"ok": True, "policy_name": batch.policy_name, "eval": metrics}
 
+    freeze_policy = _policy_in_env_list(batch.policy_name, "METABONK_FREEZE_POLICIES")
+    shuffle_reward = _policy_in_env_list(batch.policy_name, "METABONK_REWARD_SHUFFLE_POLICIES")
+
     obs_t = to_tensor(batch.obs)
     actions_cont_t = to_tensor(batch.actions_cont)
     actions_disc_t = to_tensor(batch.actions_disc, dtype=torch.long)
@@ -657,6 +670,19 @@ async def push_rollout(batch: RolloutBatch):
     dones_t = dones_t.to(device)
     if action_masks_t is not None:
         action_masks_t = action_masks_t.to(device)
+
+    if shuffle_reward:
+        try:
+            perm = torch.randperm(rewards_t.shape[0], device=rewards_t.device)
+            rewards_t = rewards_t[perm]
+        except Exception:
+            pass
+
+    if freeze_policy:
+        metrics = _eval_metrics_from_batch(batch)
+        metrics["frozen"] = True
+        _last_metrics[batch.policy_name] = {**_last_metrics.get(batch.policy_name, {}), **_sanitize_metrics(metrics)}
+        return {"ok": True, "policy_name": batch.policy_name, "frozen": True, "metrics": metrics}
 
     actions_flat = torch.cat([actions_cont_t, actions_disc_t.float()], dim=-1)
 

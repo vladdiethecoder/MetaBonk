@@ -604,6 +604,12 @@ def main() -> int:
         def _resolve_proton_bin(steam_library: Path) -> Optional[str]:
             # Prefer explicit path if provided (user intent is unambiguous).
             p = str(args.proton or "").strip()
+            if not p:
+                p = str(
+                    os.environ.get("MEGABONK_PROTON_PREFERENCE")
+                    or os.environ.get("METABONK_PROTON_PREFERENCE")
+                    or ""
+                ).strip()
             if p:
                 pp = Path(p).expanduser()
                 if pp.is_file():
@@ -619,9 +625,9 @@ def main() -> int:
             # Proton distributions over any random `proton` found in PATH; PATH entries
             # frequently point to helper scripts that are not Steam Proton.
             candidates += [
-                common / "Proton Hotfix" / "proton",
                 common / "Proton 9.0 (Beta)" / "proton",
                 common / "Proton 9.0" / "proton",
+                common / "Proton Hotfix" / "proton",
                 common / "Proton Experimental" / "proton",
                 common / "Proton - Experimental" / "proton",
             ]
@@ -703,6 +709,9 @@ def main() -> int:
             "if [ -n \\\"$WINEDLLOVERRIDES\\\" ]; then "
             "export WINEDLLOVERRIDES=\\\"winhttp=n,b;$WINEDLLOVERRIDES\\\"; "
             "else export WINEDLLOVERRIDES=\\\"winhttp=n,b\\\"; fi; "
+            "EXTRA_OVERRIDES=\\\"${METABONK_WINE_DLL_OVERRIDES:-}\\\"; "
+            "if [ -n \\\"$EXTRA_OVERRIDES\\\" ]; then "
+            "export WINEDLLOVERRIDES=\\\"$EXTRA_OVERRIDES;$WINEDLLOVERRIDES\\\"; fi; "
             f"export STEAM_COMPAT_CLIENT_INSTALL_PATH=\\\"{str(Path(args.steam_root).expanduser())}\\\"; "
             "export STEAM_COMPAT_DATA_PATH=\\\"$COMPAT\\\"; "
             "export SteamAppId=$APPID; export SteamGameId=$APPID; export WINEDEBUG=-all; "
@@ -787,7 +796,7 @@ def main() -> int:
                 procs.append(
                     _spawn(
                         f"xvfb-{iid}",
-                        ["Xvfb", f":{disp}", "-screen", "0", str(xvfb_size), "-nolisten", "tcp"],
+                        ["Xvfb", f":{disp}", "-screen", "0", str(xvfb_size), "-nolisten", "tcp", "-ac"],
                         env=wenv,
                         role="xvfb",
                     )

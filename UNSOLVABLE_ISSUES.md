@@ -36,3 +36,18 @@ This document captures remaining blockers that could not be fully resolved insid
 ---
 
 If you want, I can add the worker-side emitter that posts build runs when a clip is encoded.
+
+---
+
+## 3) Full E2E verification requires a GPU+game host
+
+**Why blocked:** The current environment cannot launch the game or validate PipeWire/NVENC streams. We cannot confirm that the live stack (orchestrator + workers + game + streams + input bridge) operates end-to-end without a host that has the game installed, GPU drivers, and PipeWire.
+
+**Attempts**
+1. **Deterministic smoke runner:** Added `scripts/smoke_stack.sh` to launch the stack, probe `/status` and `/workers`, validate stream frames, check go2rtc passthrough, and verify API readiness.
+2. **Failure recovery hooks:** Added worker supervision, game auto-restart watchdog, and smoke failover checks to ensure recovery can be validated when run on a real host.
+3. **Stream & GPU guardrails:** Added stream watchdog (black-frame detection), stream logging, go2rtc passthrough enforcement, and a GPU preflight test that fails when CUDA is required but NVENC is missing.
+
+**What is needed to unblock**
+- A machine with the game installed (`MEGABONK_GAME_DIR`), NVIDIA driver + CUDA, PipeWire, and go2rtc.
+- Run `scripts/smoke_stack.sh` with `METABONK_SMOKE_FAILOVER=1` and `METABONK_SMOKE_GAME_FAILOVER=1` to validate the full stack.

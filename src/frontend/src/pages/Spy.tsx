@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import * as THREE from "three";
 import {
   buildDreamPolicy,
   buildWorldModel,
@@ -19,6 +21,99 @@ import {
 import { useEventStream } from "../hooks";
 import { Link } from "react-router-dom";
 import { fmtFixed, timeAgo } from "../lib/format";
+
+function Swarm3D({ workers }: { workers: any[] }) {
+  const boids = useRef(
+    Array.from({ length: Math.max(10, Math.min(40, workers.length || 0)) }, (_, i) => ({
+      pos: new THREE.Vector3((Math.random() - 0.5) * 2.2, (Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2),
+      vel: new THREE.Vector3((Math.random() - 0.5) * 0.008, (Math.random() - 0.5) * 0.008, (Math.random() - 0.5) * 0.008),
+      policy: workers[i]?.policy_name ?? "core",
+      status: workers[i]?.status ?? "running",
+    }))
+  );
+
+  useEffect(() => {
+    boids.current = boids.current.map((b, i) => ({
+      ...b,
+      policy: workers[i]?.policy_name ?? b.policy,
+      status: workers[i]?.status ?? b.status,
+    }));
+  }, [workers]);
+
+  const instRef = useRef<THREE.InstancedMesh | null>(null);
+
+  useFrame(() => {
+    const inst = instRef.current;
+    if (!inst) return;
+    const dummy = new THREE.Object3D();
+    boids.current.forEach((b, i) => {
+      b.pos.add(b.vel);
+      ["x", "y", "z"].forEach((axis) => {
+        const limit = axis === "x" ? 1.4 : 0.8;
+        if ((b.pos as any)[axis] > limit || (b.pos as any)[axis] < -limit) (b.vel as any)[axis] *= -1;
+      });
+      dummy.position.copy(b.pos);
+      dummy.rotation.set(0, 0, Math.atan2(b.vel.y, b.vel.x));
+      dummy.updateMatrix();
+      inst.setMatrixAt(i, dummy.matrix);
+    });
+    inst.instanceMatrix.needsUpdate = true;
+  });
+
+  return (
+    <Canvas className="swarm-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4.2], fov: 50 }}>
+      <ambientLight intensity={0.6} />
+      <instancedMesh ref={instRef} args={[undefined, undefined, boids.current.length]}>
+        <coneGeometry args={[0.08, 0.22, 6]} />
+        <meshStandardMaterial color="#7bffe6" />
+      </instancedMesh>
+      <mesh>
+        <planeGeometry args={[3.6, 1.8]} />
+        <meshBasicMaterial color="#040608" transparent opacity={0.4} />
+      </mesh>
+    </Canvas>
+  );
+}
+
+function PipelineFactory3D({
+  demoCount,
+  labeledCount,
+}: {
+  demoCount: number;
+  labeledCount: number;
+}) {
+  const heat = demoCount > 0 ? Math.max(0, Math.min(1, 1 - labeledCount / demoCount)) : 0.3;
+  const spheres = useRef<THREE.Mesh[]>([]);
+
+  useFrame((state) => {
+    const t = state.clock.getElapsedTime();
+    spheres.current.forEach((s, i) => {
+      s.position.x = -1.4 + ((t * 0.6 + i * 0.2) % 2.8);
+      s.position.y = Math.sin(t * 1.2 + i) * 0.15;
+    });
+  });
+
+  return (
+    <Canvas className="pipeline-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4], fov: 50 }}>
+      <ambientLight intensity={0.7} />
+      <mesh>
+        <torusGeometry args={[1.25, 0.06, 12, 100]} />
+        <meshBasicMaterial color={heat > 0.6 ? "#ff8b5a" : "#7bffe6"} transparent opacity={0.6} />
+      </mesh>
+      {Array.from({ length: 10 }).map((_, i) => (
+        <mesh
+          key={`p-${i}`}
+          ref={(el) => {
+            if (el) spheres.current[i] = el;
+          }}
+        >
+          <sphereGeometry args={[0.06, 16, 16]} />
+          <meshStandardMaterial color={heat > 0.5 ? "#ff8b5a" : "#5df1da"} emissive="#ffb07a" emissiveIntensity={0.4} />
+        </mesh>
+      ))}
+    </Canvas>
+  );
+}
 
 function fmtNum(n: number | null | undefined) {
   if (n === null || n === undefined) return "—";
@@ -183,7 +278,33 @@ export default function Spy() {
   const tokenFeat = useMemo(() => (tokenDetail ? seqFeatures(tokenDetail.decoded_action_seq ?? []) : null), [tokenDetail]);
 
   return (
-    <div className="grid">
+    <div className="grid spy-grid">
+      <section className="card spy-swarm" style={{ gridColumn: "1 / -1" }}>
+        <div className="row-between">
+          <h2>Swarm Surveillance</h2>
+          <span className="badge">{workers.length} drones</span>
+        </div>
+        <div className="swarm-body">
+          <div>
+            <div className="muted">Boid telemetry • color = policy • failures fall silent</div>
+            <div className="swarm-kpis">
+              <div>
+                <span className="label">Active</span>
+                <strong>{workers.filter((w) => String(w.status ?? "").includes("running")).length}</strong>
+              </div>
+              <div>
+                <span className="label">Hot</span>
+                <strong>{workers.filter((w) => Number(w.enemy_count ?? 0) > 0).length}</strong>
+              </div>
+              <div>
+                <span className="label">Errors</span>
+                <strong>{workers.filter((w) => String(w.status ?? "").includes("error")).length}</strong>
+              </div>
+            </div>
+          </div>
+          <Swarm3D workers={workers} />
+        </div>
+      </section>
       <section className="card">
         <div className="row-between">
           <h2>Pretrain Status</h2>
@@ -346,6 +467,7 @@ export default function Spy() {
           <h2>Pipeline DAG</h2>
           <span className="badge">status</span>
         </div>
+        <PipelineFactory3D demoCount={demoCount} labeledCount={labeledCount} />
         {!pretrain ? (
           <div className="muted">loading…</div>
         ) : (

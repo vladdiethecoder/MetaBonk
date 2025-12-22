@@ -5,6 +5,7 @@ import CommandPalette from "./components/CommandPalette";
 import ContextDrawer from "./components/ContextDrawer";
 import IssuesDrawer from "./components/IssuesDrawer";
 import Overview from "./pages/Overview";
+import NeuroSynaptic from "./pages/NeuroSynaptic";
 import Runs from "./pages/Runs";
 import Instances from "./pages/Instances";
 import Skills from "./pages/Skills";
@@ -20,8 +21,12 @@ export default function App() {
   if (loc.pathname.startsWith("/stream")) {
     return <Stream />;
   }
+  if (loc.pathname === "/") {
+    return <NeuroSynaptic />;
+  }
   const nav = [
-    { to: "/", label: "Overview" },
+    { to: "/", label: "Neuro" },
+    { to: "/overview", label: "Overview" },
     { to: "/runs", label: "Runs" },
     { to: "/instances", label: "Instances" },
     { to: "/build", label: "Build Lab" },
@@ -50,7 +55,7 @@ export default function App() {
       <main className="main">
         <Suspense fallback={<div className="card">loading…</div>}>
           <Routes>
-            <Route path="/" element={<Overview />} />
+            <Route path="/overview" element={<Overview />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/instances" element={<Instances />} />
             <Route path="/build" element={<BuildLab />} />

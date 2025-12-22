@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import * as THREE from "three";
 import {
   fetchSkillEffects,
   fetchSkillPrototypes,
@@ -34,6 +36,120 @@ function fmtNum(v: number | null | undefined) {
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
+}
+
+const hashString = (input: string) => {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+};
+
+function AtlasStarfield({
+  atlas,
+  selectedToken,
+  onSelect,
+}: {
+  atlas: SkillsAtlasResponse | null;
+  selectedToken: number | null;
+  onSelect: (tok: number) => void;
+}) {
+  const points = useMemo(() => {
+    const pts = atlas?.points ?? [];
+    return pts.map((p) => {
+      const seed = hashString(String(p.token));
+      const z = ((seed % 1000) / 1000) * 2 - 1;
+      return { ...p, z };
+    });
+  }, [atlas]);
+
+  const ptsGeom = useMemo(() => {
+    const arr = new Float32Array(points.length * 3);
+    points.forEach((p, i) => {
+      arr[i * 3 + 0] = p.x;
+      arr[i * 3 + 1] = p.y;
+      arr[i * 3 + 2] = p.z;
+    });
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+    return g;
+  }, [points]);
+
+  const RotatingField = () => {
+    const ref = useRef<THREE.Points | null>(null);
+    useFrame((state) => {
+      if (!ref.current) return;
+      ref.current.rotation.y = state.clock.getElapsedTime() * 0.15;
+    });
+    return (
+      <points ref={ref} geometry={ptsGeom}>
+        <pointsMaterial color="#7bffe6" size={0.02} sizeAttenuation />
+      </points>
+    );
+  };
+
+  return (
+    <div className="atlas-starfield">
+      <Canvas className="atlas-r3f-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 2.6], fov: 50 }}>
+        <color attach="background" args={["#020405"]} />
+        <ambientLight intensity={0.8} />
+        <RotatingField />
+      </Canvas>
+      <div className="atlas-starfield-label">Latent Constellation</div>
+      <div className="atlas-starfield-hint">navigate clusters · click in 2D atlas to select</div>
+    </div>
+  );
+}
+
+function TokenHelix({ detail }: { detail: SkillTokenDetail }) {
+  const seq = detail.decoded_action_seq ?? [];
+  const Helix = () => {
+    const groupRef = useRef<THREE.Group | null>(null);
+    useFrame((state) => {
+      if (!groupRef.current) return;
+      groupRef.current.rotation.y = state.clock.getElapsedTime() * 0.4;
+    });
+    const turns = 6;
+    const seqLen = Math.max(seq.length, 120);
+    const points = Array.from({ length: seqLen }, (_, i) => {
+      const phase = (i / seqLen) * Math.PI * 2 * turns;
+      const y = -1 + (i / (seqLen - 1)) * 2;
+      return {
+        a: new THREE.Vector3(Math.cos(phase) * 0.6, y, Math.sin(phase) * 0.1),
+        b: new THREE.Vector3(Math.cos(phase + Math.PI) * 0.6, y, Math.sin(phase + Math.PI) * 0.1),
+        hue: (i * 7) % 360,
+      };
+    });
+    return (
+      <group ref={groupRef}>
+        {points.map((p, i) => (
+          <group key={`helix-${i}`}>
+            <mesh position={p.a}>
+              <sphereGeometry args={[0.04, 10, 10]} />
+              <meshStandardMaterial color={`hsl(${p.hue},90%,65%)`} />
+            </mesh>
+            <mesh position={p.b}>
+              <sphereGeometry args={[0.04, 10, 10]} />
+              <meshStandardMaterial color={`hsl(${p.hue},90%,65%)`} />
+            </mesh>
+          </group>
+        ))}
+      </group>
+    );
+  };
+
+  return (
+    <div className="token-helix">
+      <Canvas className="token-helix-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
+        <color attach="background" args={["#020405"]} />
+        <ambientLight intensity={0.8} />
+        <Helix />
+      </Canvas>
+      <div className="token-helix-label">Token DNA Helix</div>
+    </div>
+  );
 }
 
 function ActionSeqChart({ detail, maxDims = 6 }: { detail: SkillTokenDetail; maxDims?: number }) {
@@ -718,7 +834,11 @@ export default function Skills() {
               </div>
             </div>
 
-            <ActionSeqChart detail={detail} />
+            <TokenHelix detail={detail} />
+            <details className="details">
+              <summary className="muted">Decoded action chart</summary>
+              <ActionSeqChart detail={detail} />
+            </details>
             <details className="details">
               <summary className="muted">Raw decoded actions</summary>
               <pre className="code">{JSON.stringify(detail.decoded_action_seq.slice(0, 8), null, 2)}</pre>
@@ -741,6 +861,7 @@ export default function Skills() {
             </select>
           </div>
         </div>
+        <AtlasStarfield atlas={atlas ?? null} selectedToken={selectedToken} onSelect={(tok) => setSelectedToken(tok)} />
         <div className="split" style={{ marginTop: 10 }}>
           <div>
             <SkillAtlas

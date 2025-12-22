@@ -1,11 +1,101 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useEffect, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { EffectComposer, Bloom, Scanline } from "@react-three/postprocessing";
+import * as THREE from "three";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
 import { useEventStream } from "../hooks";
 import useIssues from "../hooks/useIssues";
 import { useContextDrawer } from "../hooks/useContextDrawer";
 import useContextFilters from "../hooks/useContextFilters";
 import { fmtFixed, fmtNum, timeAgo } from "../lib/format";
+
+const hashString = (input: string) => {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+};
+
+function HoloGlobe({
+  nodes,
+  errorRate = 0,
+}: {
+  nodes: Array<{ id: string; health: number; active: boolean }>;
+  errorRate?: number;
+}) {
+  const points = useMemo(() => {
+    return nodes.map((n) => {
+      const seed = hashString(n.id);
+      const u = (seed % 1000) / 1000;
+      const v = ((seed >> 10) % 1000) / 1000;
+      const theta = u * Math.PI * 2;
+      const phi = Math.acos(2 * v - 1);
+      const r = 1;
+      return new THREE.Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+    });
+  }, [nodes]);
+
+  const ringSpike = errorRate > 0.04;
+
+  const NodePoints = () => {
+    const geo = useMemo(() => {
+      const arr = new Float32Array(points.length * 3);
+      points.forEach((p, i) => {
+        arr[i * 3 + 0] = p.x;
+        arr[i * 3 + 1] = p.y;
+        arr[i * 3 + 2] = p.z;
+      });
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
+      return g;
+    }, [points]);
+    return (
+      <points geometry={geo}>
+        <pointsMaterial color="#7bffe6" size={0.04} sizeAttenuation />
+      </points>
+    );
+  };
+
+  const GlobeGroup = () => {
+    const ref = useRef<THREE.Group | null>(null);
+    useFrame((state) => {
+      if (!ref.current) return;
+      ref.current.rotation.y = state.clock.getElapsedTime() * 0.25;
+    });
+    return (
+      <group ref={ref}>
+        <mesh>
+          <icosahedronGeometry args={[1, 2]} />
+          <meshBasicMaterial wireframe color="#6fffe6" transparent opacity={0.35} />
+        </mesh>
+        <NodePoints />
+        <mesh rotation={[Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[1.25, 0.01, 12, 120]} />
+          <meshBasicMaterial color={ringSpike ? "#ff8b5a" : "#5df1da"} transparent opacity={0.5} />
+        </mesh>
+        <mesh rotation={[Math.PI / 3, 0.6, 0]}>
+          <torusGeometry args={[1.38, 0.008, 12, 120]} />
+          <meshBasicMaterial color="#7df0ff" transparent opacity={0.35} />
+        </mesh>
+      </group>
+    );
+  };
+
+  return (
+    <Canvas className="holo-globe-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.8} />
+      <GlobeGroup />
+      <EffectComposer>
+        <Bloom intensity={0.9} luminanceThreshold={0.2} />
+        <Scanline density={1.2} opacity={0.2} />
+      </EffectComposer>
+    </Canvas>
+  );
+}
 
 export default function Overview() {
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 2000 });
@@ -186,9 +276,44 @@ export default function Overview() {
   const health = healthQ.data;
   const overviewIssues = issuesQ.data ?? [];
   const issuesList = overviewIssues.length ? overviewIssues : issues;
+  const globeNodes = useMemo(
+    () =>
+      Object.values(workers).map((w) => ({
+        id: String(w.instance_id ?? ""),
+        health: Number(w.stream_ok ? 1 : 0.4),
+        active: Boolean(w.stream_ok),
+      })),
+    [workers]
+  );
 
   return (
-    <div className="grid" style={{ gridTemplateColumns: "1fr 1.35fr 0.85fr" }}>
+    <div className="grid overview-grid" style={{ gridTemplateColumns: "1fr 1.35fr 0.85fr" }}>
+      <section className="card warroom-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="row-between">
+          <h2>Global Hologram</h2>
+          <span className="badge">{healthQ.isError ? "offline" : "live"}</span>
+        </div>
+        <div className="warroom-body">
+          <div>
+            <div className="muted">Cluster topology • orbital health rings • traffic arcs</div>
+            <div className="warroom-kpis">
+              <div>
+                <span className="label">Active nodes</span>
+                <strong>{globeNodes.length}</strong>
+              </div>
+              <div>
+                <span className="label">Error rate</span>
+                <strong>{health ? fmtPct(health.api.error_rate, 2) : "—"}</strong>
+              </div>
+              <div>
+                <span className="label">Latency p95</span>
+                <strong>{health ? `${fmtFixed(health.api.p95_ms, 1)}ms` : "—"}</strong>
+              </div>
+            </div>
+          </div>
+          <HoloGlobe nodes={globeNodes} errorRate={health?.api.error_rate ?? 0} />
+        </div>
+      </section>
       <section className="card">
         <div className="row-between">
           <h2>Cluster Health</h2>
