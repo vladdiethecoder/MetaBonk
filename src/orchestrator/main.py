@@ -17,6 +17,7 @@ import os
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Dict, Optional
 import json
 import itertools
@@ -75,6 +76,23 @@ pbt = PBTManager()
 eval_ladder = build_eval_ladder()
 curriculum = CurriculumConfig()
 curriculum.phase = os.environ.get("METABONK_CURRICULUM_PHASE", curriculum.phase)
+
+# Telemetry aggregations (in-memory).
+_api_latency_lock = threading.Lock()
+_api_latency: deque[tuple[float, float, int, str]] = deque()
+_api_latency_max = int(os.environ.get("METABONK_API_LATENCY_MAX", "4000"))
+
+_heartbeat_lock = threading.Lock()
+_heartbeat_times: deque[float] = deque()
+_heartbeat_times_max = int(os.environ.get("METABONK_HEARTBEAT_MAX", "6000"))
+
+_instance_history_lock = threading.Lock()
+_instance_history: dict[str, deque[dict[str, Any]]] = {}
+_instance_history_max = int(os.environ.get("METABONK_INSTANCE_HISTORY_MAX", "240"))
+
+_run_metrics_lock = threading.Lock()
+_run_metrics: dict[str, deque[dict[str, Any]]] = {}
+_run_metrics_max = int(os.environ.get("METABONK_RUN_METRICS_MAX", "6000"))
 
 # Attract mode "Hall of Fame / Shame" clips (best-effort, real clips only).
 _attract_lock = threading.Lock()
@@ -217,6 +235,200 @@ def _load_feats() -> None:
         _feat_defs = load_feats(str(_feats_path()))
     except Exception:
         _feat_defs = []
+
+
+def _record_api_latency(path: str, status_code: int, latency_ms: float) -> None:
+    now = time.time()
+    with _api_latency_lock:
+        _api_latency.append((now, float(latency_ms), int(status_code), str(path)))
+        while len(_api_latency) > _api_latency_max:
+            _api_latency.popleft()
+
+
+def _record_heartbeat_ts(ts: float) -> None:
+    with _heartbeat_lock:
+        _heartbeat_times.append(float(ts))
+        while len(_heartbeat_times) > _heartbeat_times_max:
+            _heartbeat_times.popleft()
+
+
+def _instance_history_push(iid: str, payload: dict[str, Any]) -> None:
+    with _instance_history_lock:
+        hist = _instance_history.setdefault(iid, deque())
+        hist.append(payload)
+        while len(hist) > _instance_history_max:
+            hist.popleft()
+
+
+def _run_metrics_push(run_id: str, payload: dict[str, Any]) -> None:
+    with _run_metrics_lock:
+        hist = _run_metrics.setdefault(run_id, deque())
+        hist.append(payload)
+        while len(hist) > _run_metrics_max:
+            hist.popleft()
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    if pct <= 0:
+        return float(min(values))
+    if pct >= 100:
+        return float(max(values))
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(len(sorted_vals) - 1, f + 1)
+    if f == c:
+        return float(sorted_vals[f])
+    d0 = sorted_vals[f] * (c - k)
+    d1 = sorted_vals[c] * (k - f)
+    return float(d0 + d1)
+
+
+def _history_snapshot(iid: str, limit: int = 24) -> list[dict[str, Any]]:
+    with _instance_history_lock:
+        hist = list(_instance_history.get(iid, deque()))
+    if limit <= 0:
+        return hist
+    return hist[-limit:]
+
+
+def _sparkline(hist: list[dict[str, Any]], key: str, limit: int = 24) -> list[float]:
+    if not hist:
+        return []
+    vals: list[float] = []
+    for row in hist:
+        val = row.get(key)
+        if val is None:
+            continue
+        try:
+            vals.append(float(val))
+        except Exception:
+            continue
+    if limit <= 0:
+        return vals
+    return vals[-limit:]
+
+
+_ISSUE_HINTS: dict[str, str] = {
+    "STREAM_MISSING_NO_PIPEWIRE": "Check PipeWire + streamer service.",
+    "STREAM_MISSING_NO_URL": "Streamer not reporting URL.",
+    "STREAM_STALE_NO_FRAMES": "Encoder stalled; restart stream pipeline.",
+    "WORKER_OFFLINE": "Worker heartbeat stopped.",
+    "WORKER_CRASHED": "Check last crash logs.",
+    "INVENTORY_EMPTY": "Bridge inventory feed missing.",
+    "STUCK_MENU": "Game stuck in menus; verify input hook.",
+    "STREAM_MAX_CLIENTS": "Stream maxed out; reduce consumers.",
+}
+
+
+def _issue_severity(code: str) -> str:
+    c = code.upper()
+    if "CRASH" in c or "PIPEWIRE" in c:
+        return "high"
+    if "MISSING" in c or "STUCK" in c or "STALE" in c:
+        return "medium"
+    return "low"
+
+
+def _derive_reason_code_backend(hb: Heartbeat) -> Optional[str]:
+    if hb is None:
+        return None
+    status = str(getattr(hb, "status", "") or "").lower()
+    if status and status != "running":
+        if "crash" in status:
+            return "WORKER_CRASHED"
+        if "offline" in status:
+            return "WORKER_OFFLINE"
+        return f"WORKER_{status.upper()}"
+    if bool(getattr(hb, "pipewire_node_ok", True)) is False or "no_pipewire" in status:
+        return "STREAM_MISSING_NO_PIPEWIRE"
+    if not getattr(hb, "stream_url", None):
+        return "STREAM_MISSING_NO_URL"
+    if getattr(hb, "stream_ok", None) is False:
+        return "STREAM_STALE_NO_FRAMES"
+    # Stream max clients reached (optional telemetry).
+    try:
+        active = int(getattr(hb, "stream_active_clients", 0) or 0)
+        max_clients = int(getattr(hb, "stream_max_clients", 0) or 0)
+        if max_clients > 0 and active >= max_clients:
+            return "STREAM_MAX_CLIENTS"
+    except Exception:
+        pass
+    try:
+        inv = getattr(hb, "inventory_items", None)
+        if isinstance(inv, list) and len(inv) == 0 and getattr(hb, "step", 0) > 50:
+            return "INVENTORY_EMPTY"
+    except Exception:
+        pass
+    return None
+
+
+def _classify_event_issue(ev: Event) -> Optional[str]:
+    t = str(getattr(ev, "event_type", "") or "").lower()
+    msg = str(getattr(ev, "message", "") or "").lower()
+    if "error" in t or "error" in msg:
+        return "EVENT_ERRORS"
+    if "stuck" in t or "stuck" in msg:
+        return "STUCK_DETECTED"
+    if "menu" in t or "menu" in msg:
+        return "STUCK_MENU"
+    if "stream" in t and ("missing" in msg or "stale" in msg):
+        return "STREAM_GLITCHES"
+    return None
+
+
+def _collect_issues(window_s: float = 600.0) -> list[dict[str, Any]]:
+    now = time.time()
+    issues: dict[str, dict[str, Any]] = {}
+
+    def _push(code: str, iid: Optional[str], ts: Optional[float]):
+        if not code:
+            return
+        rec = issues.get(code)
+        if rec is None:
+            rec = {
+                "id": code,
+                "label": code.replace("_", " "),
+                "severity": _issue_severity(code),
+                "count": 0,
+                "instances": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "hint": _ISSUE_HINTS.get(code),
+            }
+        rec["count"] = int(rec.get("count", 0)) + 1
+        if iid and iid not in rec["instances"]:
+            rec["instances"].append(iid)
+        if ts is not None:
+            rec["first_seen"] = ts if rec.get("first_seen") is None else min(rec.get("first_seen"), ts)
+            rec["last_seen"] = ts if rec.get("last_seen") is None else max(rec.get("last_seen"), ts)
+        issues[code] = rec
+
+    for hb in workers.values():
+        code = _derive_reason_code_backend(hb)
+        if code:
+            _push(code, getattr(hb, "instance_id", None), getattr(hb, "ts", now))
+
+    for ev in events:
+        if window_s > 0 and (now - float(ev.ts or 0.0)) > window_s:
+            continue
+        code = _classify_event_issue(ev)
+        if code:
+            _push(code, getattr(ev, "instance_id", None), getattr(ev, "ts", None))
+
+    def _impact(rec: dict[str, Any]) -> float:
+        sev = {"high": 3.0, "medium": 2.0, "low": 1.0}.get(str(rec.get("severity")), 1.0)
+        cnt = float(rec.get("count") or 0.0)
+        first = rec.get("first_seen") or now
+        last = rec.get("last_seen") or now
+        dur = max(0.0, float(last) - float(first))
+        return sev * (1.0 + cnt) * (1.0 + dur / 60.0)
+
+    out = list(issues.values())
+    out.sort(key=_impact, reverse=True)
+    return out
 
 
 _load_feats()
@@ -1965,6 +2177,25 @@ except Exception:
 
 
 if app:
+    @app.middleware("http")
+    async def telemetry_middleware(request, call_next):
+        start = time.time()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = getattr(response, "status_code", 500)
+            return response
+        finally:
+            try:
+                path = request.url.path
+            except Exception:
+                path = ""
+            # Skip long-lived stream endpoints to avoid polluting latency stats.
+            if path.startswith("/events/stream") or path.startswith("/stream"):
+                return
+            elapsed_ms = (time.time() - start) * 1000.0
+            _record_api_latency(path, int(status_code), float(elapsed_ms))
+
     # Serve highlight clips directory if present.
     try:
         highlights_dir = os.environ.get("METABONK_HIGHLIGHTS_DIR", "highlights")
@@ -1982,6 +2213,71 @@ if app:
             "policies": list(pbt.population.keys()),
             "timestamp": time.time(),
         }
+
+    @app.get("/overview/health")
+    def overview_health(window: float = 300.0):
+        now = time.time()
+        window = float(window) if window is not None else 300.0
+        window = max(10.0, window)
+        # API metrics.
+        with _api_latency_lock:
+            samples = [s for s in _api_latency if (now - s[0]) <= window]
+        latencies = [s[1] for s in samples]
+        errors = sum(1 for s in samples if s[2] >= 500)
+        req_rate = (len(samples) / window) if window > 0 else 0.0
+        api_stats = {
+            "req_rate": req_rate,
+            "p95_ms": _percentile(latencies, 95.0) if latencies else 0.0,
+            "error_rate": (errors / len(samples)) if samples else 0.0,
+            "total": len(samples),
+        }
+
+        # Heartbeat metrics.
+        with _heartbeat_lock:
+            hb_times = [t for t in _heartbeat_times if (now - t) <= window]
+        hb_rate = (len(hb_times) / window) if window > 0 else 0.0
+        ttl = float(os.environ.get("METABONK_WORKER_TTL_S", "20.0"))
+        late_cutoff = ttl * 0.5
+        late = sum(1 for last in worker_last_seen.values() if (now - float(last)) > late_cutoff)
+        heartbeat_stats = {
+            "rate": hb_rate,
+            "late": late,
+            "workers": len(workers),
+            "ttl_s": ttl,
+        }
+
+        # Stream metrics.
+        ok = 0
+        stale = 0
+        missing = 0
+        frame_ages: list[float] = []
+        for hb in workers.values():
+            if not getattr(hb, "stream_url", None):
+                missing += 1
+            elif bool(getattr(hb, "stream_ok", False)):
+                ok += 1
+            else:
+                stale += 1
+            ts = getattr(hb, "stream_last_frame_ts", None)
+            if ts:
+                try:
+                    frame_ages.append(max(0.0, now - float(ts)))
+                except Exception:
+                    pass
+        stream_stats = {
+            "ok": ok,
+            "stale": stale,
+            "missing": missing,
+            "p95_frame_age_s": _percentile(frame_ages, 95.0) if frame_ages else None,
+        }
+
+        return {"window_s": window, "api": api_stats, "heartbeat": heartbeat_stats, "stream": stream_stats}
+
+    @app.get("/overview/issues")
+    def overview_issues(window: float = 600.0):
+        window = float(window) if window is not None else 600.0
+        window = max(60.0, window)
+        return _collect_issues(window_s=window)
 
     @app.get("/attract/highlights")
     def attract_highlights():
@@ -2347,6 +2643,47 @@ if app:
         # Update PBT scores if provided.
         if hb.policy_name and hb.steam_score is not None:
             pbt.update_score(hb.policy_name, hb.steam_score, policy_version=getattr(hb, "policy_version", None))
+        try:
+            _record_heartbeat_ts(now)
+            score = float(getattr(hb, "steam_score", None) or getattr(hb, "reward", 0.0) or 0.0)
+            reward = float(getattr(hb, "reward", None) or 0.0)
+            last_frame = getattr(hb, "stream_last_frame_ts", None)
+            stream_age = None
+            if last_frame is not None:
+                try:
+                    stream_age = max(0.0, now - float(last_frame))
+                except Exception:
+                    stream_age = None
+            entry = {
+                "ts": now,
+                "step": int(getattr(hb, "step", 0) or 0),
+                "score": score,
+                "reward": reward,
+                "stream_ok": bool(getattr(hb, "stream_ok", False)),
+                "stream_age_s": stream_age,
+                "stream_fps": getattr(hb, "stream_fps", None),
+                "obs_fps": getattr(hb, "obs_fps", None),
+                "act_hz": getattr(hb, "act_hz", None),
+                "action_entropy": getattr(hb, "action_entropy", None),
+            }
+            _instance_history_push(str(hb.instance_id), entry)
+            rid = getattr(hb, "run_id", None) or DEFAULT_RUN_ID
+            if rid:
+                _run_metrics_push(
+                    str(rid),
+                    {
+                        "ts": now,
+                        "step": int(getattr(hb, "step", 0) or 0),
+                        "reward": reward,
+                        "score": score,
+                        "obs_fps": getattr(hb, "obs_fps", None),
+                        "act_hz": getattr(hb, "act_hz", None),
+                        "action_entropy": getattr(hb, "action_entropy", None),
+                        "stream_fps": getattr(hb, "stream_fps", None),
+                    },
+                )
+        except Exception:
+            pass
         return {"ok": True}
 
     # --- Betting API ---
@@ -2816,6 +3153,52 @@ if app:
     def list_runs():
         return [r.model_dump() for r in runs.values()]
 
+    @app.get("/runs/metrics")
+    def runs_metrics(run_ids: str, metrics: str = "reward", window_s: float = 3600.0, stride: int = 1, start: Optional[float] = None):
+        """Time-series metrics for runs, aggregated from heartbeats."""
+        run_ids = [r.strip() for r in run_ids.split(",") if r.strip()]
+        metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
+        stride = max(1, int(stride or 1))
+        now = time.time()
+        window_s = float(window_s) if window_s is not None else 3600.0
+        cutoff = None
+        if start is not None:
+            try:
+                cutoff = float(start)
+            except Exception:
+                cutoff = None
+        if cutoff is None and window_s > 0:
+            cutoff = now - window_s
+
+        out = []
+        with _run_metrics_lock:
+            for rid in run_ids:
+                hist = list(_run_metrics.get(rid, deque()))
+                if cutoff is not None:
+                    hist = [h for h in hist if float(h.get("ts", 0.0)) >= cutoff]
+                if stride > 1:
+                    hist = hist[::stride]
+                for m in metric_list:
+                    pts = []
+                    for h in hist:
+                        if m not in h:
+                            continue
+                        try:
+                            v = float(h.get(m))
+                        except Exception:
+                            continue
+                        pts.append({"ts": float(h.get("ts", 0.0)), "step": int(h.get("step", 0) or 0), "value": v})
+                    out.append({"run_id": rid, "metric": m, "points": pts})
+        return out
+
+    @app.get("/runs/compare")
+    def runs_compare(runs: str, metrics: str = "reward", window_s: float = 3600.0, stride: int = 1, start: Optional[float] = None):
+        run_ids = [r.strip() for r in runs.split(",") if r.strip()]
+        metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
+        data = [runs[rid].model_dump() for rid in run_ids if rid in runs]
+        metrics_out = runs_metrics(run_ids=",".join(run_ids), metrics=",".join(metric_list), window_s=window_s, stride=stride, start=start)
+        return {"runs": data, "metrics": metrics_out, "artifacts": {}}
+
     @app.post("/runs")
     def create_run(run: Run):
         runs[run.run_id] = run
@@ -2834,11 +3217,43 @@ if app:
         out = {}
         for wid, hb in workers.items():
             cfg = configs.get(wid)
+            hist = _history_snapshot(str(wid), limit=32)
+            sparks = {
+                "score": _sparkline(hist, "score", limit=16),
+                "reward": _sparkline(hist, "reward", limit=16),
+                "stream_age_s": _sparkline(hist, "stream_age_s", limit=16),
+                "stream_fps": _sparkline(hist, "stream_fps", limit=16),
+                "entropy": _sparkline(hist, "action_entropy", limit=16),
+            }
             out[wid] = {
                 "heartbeat": hb.model_dump(),
                 "config": cfg.model_dump() if cfg else None,
+                "telemetry": {
+                    "history": hist,
+                    "sparks": sparks,
+                },
             }
         return out
+
+    @app.get("/instances/{instance_id}/timeline")
+    def instance_timeline(instance_id: str, window: float = 600.0, limit: int = 120):
+        """Per-instance timeline (recent heartbeat-derived telemetry + events)."""
+        now = time.time()
+        window = float(window) if window is not None else 600.0
+        limit = int(limit) if limit is not None else 120
+        hist = _history_snapshot(instance_id, limit=limit)
+        if window > 0:
+            hist = [row for row in hist if (now - float(row.get("ts", 0.0) or 0.0)) <= window]
+        evs = [e for e in events if str(e.instance_id or "") == str(instance_id)]
+        if window > 0:
+            evs = [e for e in evs if (now - float(e.ts or 0.0)) <= window]
+        evs = evs[-limit:]
+        return {
+            "instance_id": instance_id,
+            "window_s": window,
+            "points": hist,
+            "events": [e.model_dump() for e in evs],
+        }
 
     @app.get("/curriculum")
     def get_curriculum():
@@ -3879,6 +4294,35 @@ if app:
         """Return cached skill token names, if any."""
         return {"path": str(_skill_names_path()), "names": _get_skill_names()}
 
+    @app.post("/skills/names")
+    def skills_names_update(payload: dict[str, Any]):
+        token = payload.get("token")
+        if token is None:
+            raise HTTPException(status_code=400, detail="token required")
+        try:
+            tok = int(token)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid token")
+        names = _get_skill_names()
+        key = str(tok)
+        rec = names.get(key)
+        if not isinstance(rec, dict):
+            rec = {"token": tok}
+        if "name" in payload:
+            rec["name"] = payload.get("name")
+        if "subtitle" in payload:
+            rec["subtitle"] = payload.get("subtitle")
+        if "tags" in payload:
+            rec["tags"] = payload.get("tags")
+        rec["updated_ts"] = time.time()
+        names[key] = rec
+        _save_skill_names(names)
+        try:
+            _apply_skill_names(_skills_cache.get("summary") or {})
+        except Exception:
+            pass
+        return {"ok": True, "token": tok, "record": rec}
+
     @app.post("/skills/names/generate")
     def skills_names_generate(topk: int = 32, force: bool = False, tokens: Optional[str] = None):
         """Generate names for tokens (top-K by count by default)."""
@@ -4020,6 +4464,41 @@ if app:
                                 meta[k] = cfg[k]
             return meta
 
+        def _audit_npz_dir(p: Path, sample: int = 8) -> dict[str, Any]:
+            np = _safe_import_numpy()
+            if np is None or not p.exists():
+                return {"available": False}
+            files = list(p.glob("*.npz"))
+            if not files:
+                return {"available": True, "samples": 0}
+            sample = max(1, min(int(sample), len(files)))
+            corrupt = 0
+            lengths: list[int] = []
+            for f in files[:sample]:
+                try:
+                    with np.load(f, allow_pickle=False) as data:
+                        arr = None
+                        for key in ("actions", "obs", "frames", "rewards"):
+                            if key in data:
+                                arr = data[key]
+                                break
+                        if arr is not None and hasattr(arr, "shape") and len(arr.shape) > 0:
+                            lengths.append(int(arr.shape[0]))
+                except Exception:
+                    corrupt += 1
+            avg_len = sum(lengths) / len(lengths) if lengths else None
+            return {
+                "available": True,
+                "samples": sample,
+                "corrupt": corrupt,
+                "avg_len": avg_len,
+            }
+
+        audit = {
+            "video_demos": _audit_npz_dir(raw_dir, sample=int(os.environ.get("METABONK_AUDIT_SAMPLE", "8"))),
+            "video_labeled": _audit_npz_dir(labeled_dir, sample=int(os.environ.get("METABONK_AUDIT_SAMPLE", "8"))),
+        }
+
         return {
             "timestamp": time.time(),
             "datasets": {
@@ -4030,6 +4509,7 @@ if app:
                 "video_rollouts_pt_dir": str(pt_dir),
                 "video_rollouts_pt": _count_files(pt_dir, "*.pt"),
             },
+            "audit": audit,
             "artifacts": {
                 "idm_ckpt": {"path": str(idm_ckpt), "exists": idm_ckpt.exists(), "meta": _try_read_ckpt_meta(idm_ckpt)},
                 "reward_ckpt": {"path": str(reward_ckpt), "exists": reward_ckpt.exists(), "meta": _try_read_ckpt_meta(reward_ckpt)},

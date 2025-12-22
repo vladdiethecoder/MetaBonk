@@ -90,6 +90,10 @@ class Heartbeat(MBBaseModel):
     stream_error: Optional[str] = None
     streamer_last_error: Optional[str] = None
     stream_backend: Optional[str] = None
+    # Optional live stream telemetry.
+    stream_active_clients: Optional[int] = None
+    stream_max_clients: Optional[int] = None
+    stream_fps: Optional[float] = None
     # Optional FIFO/go2rtc distribution metadata (Metabonk).
     fifo_stream_enabled: Optional[bool] = None
     fifo_stream_path: Optional[str] = None
@@ -119,6 +123,12 @@ class Heartbeat(MBBaseModel):
     inventory_items: Optional[list[dict[str, Any]]] = None
     synergy_edges: Optional[list[dict[str, Any]]] = None
     evolution_recipes: Optional[list[dict[str, Any]]] = None
+    # Fast-loop telemetry (best-effort).
+    obs_fps: Optional[float] = None
+    act_hz: Optional[float] = None
+    action_entropy: Optional[float] = None
+    stuck: Optional[dict[str, Any]] = None
+    errors_recent: Optional[list[dict[str, Any]]] = None
     # Sponsor overlay (community agency).
     display_name: Optional[str] = None
     sponsor_user: Optional[str] = None

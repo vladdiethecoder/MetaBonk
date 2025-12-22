@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { fetchRuns, Run } from "../api";
+import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
 import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
 
@@ -12,6 +12,14 @@ export default function Runs() {
   const [status, setStatus] = useState<string>("all");
   const [sort, setSort] = useState<"updated" | "best" | "step">("updated");
   const [selected, setSelected] = useState<string | null>(null);
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareSelection, setCompareSelection] = useState<string[]>([]);
+
+  const compareQ = useQuery<RunCompareResponse>({
+    queryKey: ["runsCompare", compareSelection.join(",")],
+    queryFn: () => fetchRunsCompare(compareSelection, ["reward", "score"], { window_s: 6 * 3600, stride: 2 }),
+    enabled: compareSelection.length >= 2,
+  });
 
   const statuses = useMemo(() => {
     const s = new Set<string>();
@@ -46,6 +54,56 @@ export default function Runs() {
   const selectedRun = useMemo(() => filtered.find((r) => String(r.run_id) === String(selected)) ?? null, [filtered, selected]);
   const activeCount = useMemo(() => runs.filter((r) => String(r.status ?? "").toLowerCase() !== "completed").length, [runs]);
   const bestOverall = useMemo(() => runs.reduce((m, r) => Math.max(m, Number(r.best_reward ?? 0)), 0), [runs]);
+
+  const compareRuns = useMemo(() => (compareQ.data?.runs ?? []).map((r) => r.run_id), [compareQ.data]);
+  const metricsByRun = useMemo(() => {
+    const map: Record<string, RunMetricSeries[]> = {};
+    for (const series of compareQ.data?.metrics ?? []) {
+      (map[series.run_id] ??= []).push(series);
+    }
+    return map;
+  }, [compareQ.data]);
+
+  const diffKeys = useMemo(() => {
+    const selectedRuns = runs.filter((r) => compareSelection.includes(r.run_id));
+    if (selectedRuns.length < 2) return [];
+    const keys = new Set<string>();
+    selectedRuns.forEach((r) => Object.keys(r.config ?? {}).forEach((k) => keys.add(k)));
+    const out: string[] = [];
+    keys.forEach((k) => {
+      const vals = new Set(selectedRuns.map((r) => JSON.stringify((r.config ?? {})[k])));
+      if (vals.size > 1) out.push(k);
+    });
+    return out.sort();
+  }, [compareSelection, runs]);
+
+  const toggleCompare = (runId: string) => {
+    setCompareSelection((prev) => {
+      if (prev.includes(runId)) return prev.filter((id) => id !== runId);
+      return [...prev, runId];
+    });
+  };
+
+  const miniSeries = (series: RunMetricSeries | undefined) => {
+    const pts = series?.points ?? [];
+    if (pts.length < 2) return null;
+    const w = 160;
+    const h = 48;
+    const pad = 6;
+    const minV = Math.min(...pts.map((p) => p.value));
+    const maxV = Math.max(...pts.map((p) => p.value));
+    const span = Math.max(1e-6, maxV - minV);
+    const coords = pts.map((p, i) => {
+      const x = pad + (i / (pts.length - 1)) * (w - pad * 2);
+      const y = pad + (1 - (p.value - minV) / span) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    return (
+      <svg viewBox={`0 0 ${w} ${h}`} className="mini-chart">
+        <polyline fill="none" stroke="rgba(0,229,255,.9)" strokeWidth="2" points={coords.join(" ")} />
+      </svg>
+    );
+  };
 
   return (
     <div className="grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
@@ -84,6 +142,9 @@ export default function Runs() {
               <option value="best">sort: best</option>
               <option value="step">sort: step</option>
             </select>
+            <button className={`btn btn-ghost ${compareMode ? "active" : ""}`} onClick={() => setCompareMode((v) => !v)}>
+              compare
+            </button>
           </div>
           <div className="toolbar-right">
             <button
@@ -102,6 +163,7 @@ export default function Runs() {
         <table className="table table-hover" style={{ marginTop: 10 }}>
           <thead>
             <tr>
+              {compareMode ? <th /> : null}
               <th>Run</th>
               <th>Experiment</th>
               <th>Status</th>
@@ -119,6 +181,16 @@ export default function Runs() {
                 onClick={() => setSelected(r.run_id)}
                 style={{ cursor: "pointer" }}
               >
+                {compareMode ? (
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={compareSelection.includes(r.run_id)}
+                      onChange={() => toggleCompare(r.run_id)}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </td>
+                ) : null}
                 <td className="mono">{r.run_id}</td>
                 <td className="mono">{r.experiment_id}</td>
                 <td>
@@ -132,7 +204,7 @@ export default function Runs() {
             ))}
             {!filtered.length && (
               <tr>
-                <td colSpan={7} className="muted">
+                <td colSpan={compareMode ? 8 : 7} className="muted">
                   no runs yet
                 </td>
               </tr>
@@ -143,10 +215,53 @@ export default function Runs() {
 
       <section className="card">
         <div className="row-between">
-          <h2>Run Detail</h2>
-          <span className="badge">{selectedRun ? "selected" : "pick one"}</span>
+          <h2>{compareMode ? "Run Compare" : "Run Detail"}</h2>
+          <span className="badge">{compareMode ? `${fmtNum(compareSelection.length)} selected` : selectedRun ? "selected" : "pick one"}</span>
         </div>
-        {!selectedRun ? (
+        {compareMode ? (
+          <>
+            {compareSelection.length < 2 ? (
+              <div className="muted" style={{ marginTop: 10 }}>Select at least 2 runs to compare.</div>
+            ) : (
+              <>
+                <div className="panel" style={{ marginTop: 10 }}>
+                  <div className="muted">Compared runs</div>
+                  <div className="statline">
+                    {compareRuns.map((rid) => (
+                      <span key={rid} className="chip">{rid}</span>
+                    ))}
+                  </div>
+                </div>
+                <div className="panel" style={{ marginTop: 10 }}>
+                  <div className="muted">Metric preview</div>
+                  <div className="compare-grid">
+                    {compareRuns.map((rid) => (
+                      <div key={rid} className="compare-card">
+                        <div className="mono">{rid}</div>
+                        {miniSeries(metricsByRun[rid]?.find((m) => m.metric === "reward")) ?? <div className="muted">no data</div>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="panel" style={{ marginTop: 10 }}>
+                  <div className="muted">Config diff</div>
+                  {!diffKeys.length ? (
+                    <div className="muted">no config differences detected</div>
+                  ) : (
+                    <div className="kv" style={{ marginTop: 6 }}>
+                      {diffKeys.slice(0, 16).map((k) => (
+                        <div key={`${k}-row`} style={{ display: "contents" }}>
+                          <div className="k">{k}</div>
+                          <div className="v mono">differs</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </>
+        ) : !selectedRun ? (
           <div className="muted">Click a run row to inspect config + metadata.</div>
         ) : (
           <>
@@ -171,6 +286,18 @@ export default function Runs() {
             <div style={{ marginTop: 12 }}>
               <div className="muted">Config</div>
               <pre className="code code-tall">{JSON.stringify(selectedRun.config ?? {}, null, 2)}</pre>
+            </div>
+            <div className="panel" style={{ marginTop: 12 }}>
+              <div className="muted">Artifacts</div>
+              <div className="statline">
+                <span className="pill">config</span>
+                <span className="pill">checkpoint</span>
+                <span className="pill">rollouts</span>
+                <span className="pill">logs</span>
+              </div>
+              <div className="muted" style={{ marginTop: 6 }}>
+                Attachments populate when artifact lineage is enabled.
+              </div>
             </div>
           </>
         )}

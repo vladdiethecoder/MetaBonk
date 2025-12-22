@@ -1,6 +1,9 @@
-import { Suspense, lazy } from "react";
+import { Suspense, lazy, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import ContextBar from "./components/ContextBar";
+import CommandPalette from "./components/CommandPalette";
+import ContextDrawer from "./components/ContextDrawer";
+import IssuesDrawer from "./components/IssuesDrawer";
 import Overview from "./pages/Overview";
 import Runs from "./pages/Runs";
 import Instances from "./pages/Instances";
@@ -12,6 +15,7 @@ const BuildLab = lazy(() => import("./pages/BuildLab"));
 
 export default function App() {
   const loc = useLocation();
+  const [issuesOpen, setIssuesOpen] = useState(false);
   // Stream overlay wants a clean fullscreen surface (OBS browser source).
   if (loc.pathname.startsWith("/stream")) {
     return <Stream />;
@@ -36,6 +40,11 @@ export default function App() {
             </Link>
           ))}
         </nav>
+        <div className="topbar-actions">
+          <button className="btn btn-ghost" onClick={() => setIssuesOpen(true)}>
+            issues
+          </button>
+        </div>
       </header>
       <ContextBar />
       <main className="main">
@@ -51,6 +60,9 @@ export default function App() {
           </Routes>
         </Suspense>
       </main>
+      <IssuesDrawer open={issuesOpen} onClose={() => setIssuesOpen(false)} />
+      <ContextDrawer />
+      <CommandPalette />
     </div>
   );
 }

@@ -1543,6 +1543,22 @@ export default function Stream() {
     return arr;
   }, [workersQ.data]);
 
+  const memeStats = useMemo(() => {
+    const now = Date.now() / 1000;
+    const recent = events.filter((e) => (e.ts ?? 0) >= now - 120);
+    const bonks = recent.filter((e) => String(e.event_type ?? "").toLowerCase().includes("bonk") || String(e.message ?? "").toLowerCase().includes("bonk"));
+    const deaths = recent.filter((e) => String(e.event_type ?? "").toLowerCase().includes("death") || String(e.message ?? "").toLowerCase().includes("death"));
+    const borgars = workers.reduce((sum, w) => sum + Number((w as any)?.borgar_count ?? 0), 0);
+    const hype = workers.reduce((sum, w) => sum + Number((w as any)?.hype_score ?? 0), 0);
+    const hypeAvg = workers.length ? hype / workers.length : 0;
+    return {
+      bonksPerMin: bonks.length / 2,
+      deaths2m: deaths.length,
+      borgars,
+      hype: Math.round(hypeAvg * 100),
+    };
+  }, [events, workers]);
+
   const workersById = useMemo(() => {
     const m: Record<string, Heartbeat> = {};
     for (const w of Object.values(workersQ.data ?? {})) m[String(w.instance_id)] = w;
@@ -2183,6 +2199,12 @@ export default function Stream() {
                     </div>
                   </div>
                 </div>
+              </div>
+              <div className="stream-meme">
+                <div className="meme-pill">Bonks/min {memeStats.bonksPerMin.toFixed(1)}</div>
+                <div className="meme-pill">Borgars {memeStats.borgars}</div>
+                <div className="meme-pill">Deaths/2m {memeStats.deaths2m}</div>
+                <div className="meme-pill">Hype {memeStats.hype}</div>
               </div>
 
               {fuseViz ? (

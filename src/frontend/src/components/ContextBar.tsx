@@ -1,9 +1,25 @@
+import { useMemo, useState } from "react";
 import useContextFilters, { CONTEXT_WINDOW_OPTIONS } from "../hooks/useContextFilters";
+import useSavedViews from "../hooks/useSavedViews";
 
 export default function ContextBar() {
   const { ctx, setCtx, clearAll } = useContextFilters();
+  const { views, saveView, removeView } = useSavedViews();
+  const [viewName, setViewName] = useState("");
+  const [selectedViewId, setSelectedViewId] = useState<string>("");
   const hasFilters =
     ctx.run !== "all" || ctx.policy !== "all" || ctx.window !== "all" || ctx.env !== "all" || ctx.seed !== "all";
+  const selectedView = useMemo(() => views.find((v) => v.id === selectedViewId) ?? null, [views, selectedViewId]);
+
+  const applyView = (id: string) => {
+    const view = views.find((v) => v.id === id);
+    if (!view) return;
+    setCtx("run", view.filters.run);
+    setCtx("policy", view.filters.policy);
+    setCtx("window", view.filters.window);
+    setCtx("env", view.filters.env);
+    setCtx("seed", view.filters.seed);
+  };
 
   return (
     <section className="context-bar">
@@ -73,6 +89,56 @@ export default function ContextBar() {
         ) : (
           <span className="muted">context: all</span>
         )}
+      </div>
+      <div className="context-saved">
+        <div className="context-saved-row">
+          <input
+            className="input input-compact"
+            placeholder="save view name"
+            value={viewName}
+            onChange={(e) => setViewName(e.target.value)}
+          />
+          <button
+            className="btn btn-ghost btn-compact"
+            onClick={() => {
+              if (!viewName.trim()) return;
+              saveView(viewName.trim(), ctx);
+              setViewName("");
+            }}
+            disabled={!viewName.trim()}
+          >
+            save view
+          </button>
+        </div>
+        <div className="context-saved-row">
+          <select
+            className="select select-compact"
+            value={selectedViewId}
+            onChange={(e) => {
+              const id = e.target.value;
+              setSelectedViewId(id);
+              if (id) applyView(id);
+            }}
+          >
+            <option value="">saved views</option>
+            {views.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn btn-ghost btn-compact"
+            onClick={() => {
+              if (!selectedView) return;
+              removeView(selectedView.id);
+              setSelectedViewId("");
+            }}
+            disabled={!selectedView}
+          >
+            delete
+          </button>
+        </div>
       </div>
     </section>
   );

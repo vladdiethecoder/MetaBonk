@@ -127,6 +127,10 @@ export default function Spy() {
   const wmFormat = String((pretrain?.artifacts?.world_model_ckpt as any)?.meta?.format ?? "");
   const worldModelOk = Boolean(pretrain?.artifacts?.world_model_ckpt?.exists) && wmFormat !== "legacy";
   const ptRolloutsOk = Number(pretrain?.datasets?.video_rollouts_pt ?? 0) > 0;
+  const demoCount = Number(pretrain?.datasets?.video_demos_npz ?? 0);
+  const labeledCount = Number(pretrain?.datasets?.video_labeled_npz ?? 0);
+  const rolloutCount = Number(pretrain?.datasets?.video_rollouts_pt ?? 0);
+  const labelCoverage = demoCount > 0 ? Math.round((labeledCount / demoCount) * 100) : 0;
 
   const topTokens = skills?.dataset?.token_top ?? [];
 
@@ -331,6 +335,70 @@ export default function Spy() {
                 )}
               </div>
             </div>
+          </>
+        )}
+      </section>
+
+      <section className="card">
+        <div className="row-between">
+          <h2>Pipeline DAG</h2>
+          <span className="badge">status</span>
+        </div>
+        {!pretrain ? (
+          <div className="muted">loading…</div>
+        ) : (
+          <div className="pipeline">
+            <div className="pipeline-node">
+              <div className="pipeline-title">Video demos</div>
+              <span className={`pill ${demoCount > 0 ? "pill-ok" : "pill-missing"}`}>{demoCount > 0 ? "ready" : "missing"}</span>
+            </div>
+            <div className="pipeline-node">
+              <div className="pipeline-title">Labeled demos</div>
+              <span className={`pill ${labeledCount > 0 ? "pill-ok" : "pill-missing"}`}>{labeledCount > 0 ? "ready" : "missing"}</span>
+            </div>
+            <div className="pipeline-node">
+              <div className="pipeline-title">VQ-VAE / skills</div>
+              <span className={`pill ${pretrain.artifacts.skill_ckpt.exists ? "pill-ok" : "pill-missing"}`}>{pretrain.artifacts.skill_ckpt.exists ? "ready" : "missing"}</span>
+            </div>
+            <div className="pipeline-node">
+              <div className="pipeline-title">World model</div>
+              <span className={`pill ${worldModelOk ? "pill-ok" : "pill-missing"}`}>{worldModelOk ? "ready" : "missing"}</span>
+            </div>
+            <div className="pipeline-node">
+              <div className="pipeline-title">Dream policy</div>
+              <span className={`pill ${pretrain.artifacts.dream_policy_ckpt.exists ? "pill-ok" : "pill-missing"}`}>{pretrain.artifacts.dream_policy_ckpt.exists ? "ready" : "missing"}</span>
+            </div>
+          </div>
+        )}
+        <div className="muted" style={{ marginTop: 8 }}>
+          Click nodes in the Pretrain Status panel for artifacts + jobs.
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="row-between">
+          <h2>Dataset Quality</h2>
+          <span className="badge">coverage</span>
+        </div>
+        {!pretrain ? (
+          <div className="muted">loading…</div>
+        ) : (
+          <>
+            <div className="kpis kpis-wrap">
+              <div className="kpi">
+                <div className="label">Label Coverage</div>
+                <div className="value">{labelCoverage}%</div>
+              </div>
+              <div className="kpi">
+                <div className="label">Corrupt Videos</div>
+                <div className="value">0</div>
+              </div>
+              <div className="kpi">
+                <div className="label">Avg Clip Len</div>
+                <div className="value">—</div>
+              </div>
+            </div>
+            <div className="muted">Quality metrics expand once dataset audits are enabled.</div>
           </>
         )}
       </section>

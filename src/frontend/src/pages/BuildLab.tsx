@@ -19,9 +19,12 @@ type PairStat = {
   a: string;
   b: string;
   support: number;
+  supportRate: number;
   lift: number | null;
   deltaScore: number | null;
   pTop: number | null;
+  confidence: number | null;
+  logOdds: number | null;
 };
 
 type ItemsetStat = {
@@ -126,8 +129,10 @@ function buildPairStats(params: { workers: Heartbeat[]; minSupport: number; topF
     const [a, b] = key.split("|");
     if (!a || !b) continue;
     const pAB = support / n;
-    const pA = (itemCounts[a] ?? 0) / n;
-    const pB = (itemCounts[b] ?? 0) / n;
+    const countA = itemCounts[a] ?? 0;
+    const countB = itemCounts[b] ?? 0;
+    const pA = countA / n;
+    const pB = countB / n;
     const lift = pA > 0 && pB > 0 ? pAB / (pA * pB) : null;
     const avgPair = mean(scoresByPair[key] ?? []);
     const deltaScore = Number.isFinite(avgPair) ? avgPair - overallMean : null;
@@ -137,7 +142,15 @@ function buildPairStats(params: { workers: Heartbeat[]; minSupport: number; topF
       if (wi.keys.includes(a) && wi.keys.includes(b)) topHit++;
     }
     const pTop = topN > 0 ? topHit / topN : null;
-    pairs.push({ a, b, support, lift, deltaScore, pTop });
+    const confA = countA > 0 ? support / countA : null;
+    const confB = countB > 0 ? support / countB : null;
+    const confidence = confA == null ? confB : confB == null ? confA : Math.max(confA, confB);
+    const smooth = 0.5;
+    const aOnly = Math.max(0, countA - support);
+    const bOnly = Math.max(0, countB - support);
+    const neither = Math.max(0, n - countA - countB + support);
+    const logOdds = Math.log(((support + smooth) * (neither + smooth)) / ((aOnly + smooth) * (bOnly + smooth)));
+    pairs.push({ a, b, support, supportRate: pAB, lift, deltaScore, pTop, confidence, logOdds });
   }
 
   return { items: itemsByKey, pairs };
@@ -394,6 +407,7 @@ export default function BuildLab() {
   const [selectedTree, setSelectedTree] = useState<string | null>(null);
   const [spotlightItems, setSpotlightItems] = useState<string[] | null>(null);
   const [showCrossLinks, setShowCrossLinks] = useState(true);
+  const [whatIfInput, setWhatIfInput] = useState("");
   const pinnedRef = useRef<Set<string>>(new Set());
   const treeWrapRef = useRef<HTMLDivElement | null>(null);
   const [treeSize, setTreeSize] = useState({ w: 900, h: 680 });
@@ -417,6 +431,57 @@ export default function BuildLab() {
   }, [allWorkers, policy, onlyTopRuns, topFrac]);
 
   const { items, pairs } = useMemo(() => buildPairStats({ workers: filteredWorkers, minSupport, topFrac }), [filteredWorkers, minSupport, topFrac]);
+  const itemsByLabel = useMemo(() => {
+    const map = new Map<string, string>();
+    Object.values(items).forEach((it) => {
+      map.set(normKey(it.label), it.key);
+    });
+    return map;
+  }, [items]);
+
+  const whatIfKeys = useMemo(() => {
+    const raw = whatIfInput
+      .split(",")
+      .map((t) => normKey(t))
+      .filter(Boolean);
+    const out = new Set<string>();
+    raw.forEach((label) => {
+      const key = itemsByLabel.get(label);
+      if (key) out.add(key);
+    });
+    return Array.from(out.values());
+  }, [whatIfInput, itemsByLabel]);
+
+  const whatIfRecs = useMemo(() => {
+    if (!whatIfKeys.length) return [];
+    const scores = new Map<string, number>();
+    const metrics: Record<string, { lift: number | null; deltaScore: number | null; pTop: number | null }> = {};
+    for (const p of pairs) {
+      const aIn = whatIfKeys.includes(p.a);
+      const bIn = whatIfKeys.includes(p.b);
+      if (aIn === bIn) continue;
+      const cand = aIn ? p.b : p.a;
+      const v = metricValue(p, metric) ?? 0;
+      const prev = scores.get(cand) ?? -Infinity;
+      if (v > prev) {
+        scores.set(cand, v);
+        metrics[cand] = { lift: p.lift, deltaScore: p.deltaScore, pTop: p.pTop };
+      }
+    }
+    const out = Array.from(scores.entries())
+      .filter(([k]) => !whatIfKeys.includes(k))
+      .sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+      .slice(0, 8)
+      .map(([k, v]) => ({ key: k, score: v, metrics: metrics[k] }));
+    return out;
+  }, [pairs, metric, whatIfKeys]);
+
+  const antiSynergy = useMemo(() => {
+    return pairs
+      .filter((p) => (p.deltaScore ?? 0) < -0.5)
+      .sort((a, b) => (a.deltaScore ?? 0) - (b.deltaScore ?? 0))
+      .slice(0, 8);
+  }, [pairs]);
 
   const rankedPairs = useMemo(() => {
     const xs = pairs
@@ -788,6 +853,9 @@ export default function BuildLab() {
   const hasAnyItems = Object.keys(items).length > 0;
   const workersTotal = allWorkers.length;
   const workersWithInventory = useMemo(() => allWorkers.filter((w) => parseBuildItems(w).length > 0).length, [allWorkers]);
+  const workersMissingInventory = useMemo(() => {
+    return allWorkers.filter((w) => parseBuildItems(w).length === 0).map((w) => String((w as any)?.instance_id ?? "")).filter(Boolean);
+  }, [allWorkers]);
   const lastUpdateAgeS = useMemo(() => {
     const now = Date.now();
     let lastMs = 0;
@@ -922,6 +990,28 @@ export default function BuildLab() {
           <span className="pill">edges {rankedPairs.length}</span>
           <span className="pill">last update {lastUpdateAgeS == null ? "—" : `${lastUpdateAgeS.toFixed(1)}s`}</span>
         </div>
+        <div className="panel" style={{ marginTop: 10 }}>
+          <div className="row-between">
+            <div className="muted">Data readiness</div>
+            <span className="badge">{workersWithInventory}/{workersTotal || 0} reporting</span>
+          </div>
+          <div className="statline">
+            <span className="pill">
+              coverage {workersTotal ? Math.round((workersWithInventory / workersTotal) * 100) : 0}%
+            </span>
+            <span className={`pill ${workersWithInventory === 0 ? "pill-missing" : "pill-ok"}`}>
+              {workersWithInventory === 0 ? "inventory feed missing" : "inventory feed ok"}
+            </span>
+          </div>
+          {workersMissingInventory.length ? (
+            <div className="muted" style={{ marginTop: 6 }}>
+              missing: {workersMissingInventory.slice(0, 8).join(", ")}
+              {workersMissingInventory.length > 8 ? ` +${workersMissingInventory.length - 8} more` : ""}
+            </div>
+          ) : (
+            <div className="muted" style={{ marginTop: 6 }}>All live workers reporting inventory.</div>
+          )}
+        </div>
       </div>
 
       {!workersQ.isLoading && (noWorkers || filtersExclude) ? (
@@ -1054,68 +1144,134 @@ export default function BuildLab() {
           ) : null}
         </div>
 
-        <div className="card" style={{ minHeight: 520 }}>
-          <div className="stream-card-title">Detail</div>
-          {viewMode === "tree" ? (
-            treeSelectedNode ? (
-              <div style={{ padding: 12 }}>
-                <div className="row-between" style={{ alignItems: "baseline", gap: 10 }}>
-                  <div>
-                    <div style={{ fontWeight: 900, letterSpacing: 0.4 }}>{treeSelectedNode.label}</div>
-                    <div className="muted">
-                      stage {treeSelectedNode.items.length || 0}
-                      {treeSelectedNode.items.length ? ` • support ${treeSelectedNode.support}` : ""}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="card">
+            <div className="stream-card-title">What-if Recommender</div>
+            <div className="muted">Type current items (comma-separated) to rank next picks.</div>
+            <input
+              className="input"
+              placeholder="e.g., tome, dagger, borgar"
+              value={whatIfInput}
+              onChange={(e) => setWhatIfInput(e.target.value)}
+              style={{ marginTop: 8 }}
+            />
+            <div style={{ marginTop: 10 }}>
+              {whatIfKeys.length ? (
+                <div className="statline">
+                  {whatIfKeys.map((k) => (
+                    <span key={k} className="pill">{items[k]?.label ?? k}</span>
+                  ))}
+                </div>
+              ) : (
+                <div className="muted">No items matched yet.</div>
+              )}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <div className="badge">BEST NEXT PICKS</div>
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                {whatIfRecs.length ? (
+                  whatIfRecs.map((r) => (
+                    <div key={r.key} className="row-between" style={{ gap: 10 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {items[r.key]?.label ?? r.key}
+                        </div>
+                        <div className="muted">{items[r.key]?.kind ?? "item"}</div>
+                      </div>
+                      <div className="numeric muted">
+                        {metric === "lift" ? fmtNum(r.metrics?.lift ?? null, 2) : metric === "deltaScore" ? fmtNum(r.metrics?.deltaScore ?? null, 2) : fmtPct(r.metrics?.pTop ?? null)}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="muted">No recommendations yet (need more pair stats).</div>
+                )}
+              </div>
+            </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="badge">AVOID / ANTI-SYNERGY</div>
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                {antiSynergy.length ? (
+                  antiSynergy.map((p) => (
+                    <div key={`${p.a}|${p.b}`} className="row-between" style={{ gap: 10 }}>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {items[p.a]?.label ?? p.a} + {items[p.b]?.label ?? p.b}
+                        </div>
+                        <div className="muted">Δ {fmtNum(p.deltaScore, 2)}</div>
+                      </div>
+                      <span className="pill pill-warn">avoid</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="muted">No strong anti-synergy pairs yet.</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="card" style={{ minHeight: 520 }}>
+            <div className="stream-card-title">Detail</div>
+            {viewMode === "tree" ? (
+              treeSelectedNode ? (
+                <div style={{ padding: 12 }}>
+                  <div className="row-between" style={{ alignItems: "baseline", gap: 10 }}>
+                    <div>
+                      <div style={{ fontWeight: 900, letterSpacing: 0.4 }}>{treeSelectedNode.label}</div>
+                      <div className="muted">
+                        stage {treeSelectedNode.items.length || 0}
+                        {treeSelectedNode.items.length ? ` • support ${treeSelectedNode.support}` : ""}
+                      </div>
                     </div>
                   </div>
-                </div>
-                {treeSelectedNode.items.length ? (
-                  <div style={{ marginTop: 10 }} className="muted">
-                    {treeSelectedNode.items.map((it) => items[it]?.label ?? it).join(" + ")}
+                  {treeSelectedNode.items.length ? (
+                    <div style={{ marginTop: 10 }} className="muted">
+                      {treeSelectedNode.items.map((it) => items[it]?.label ?? it).join(" + ")}
+                    </div>
+                  ) : null}
+                  <div style={{ marginTop: 12 }}>
+                    <div className="badge">METRICS</div>
+                    <div className="row" style={{ gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+                      <span className="pill">support {treeSelectedNode.support}</span>
+                      <span className="pill">lift {fmtNum(treeSelectedNode.lift, 2)}</span>
+                      <span className="pill">Δscore {fmtNum(treeSelectedNode.deltaScore, 2)}</span>
+                      <span className="pill">p(top) {fmtPct(treeSelectedNode.pTop)}</span>
+                    </div>
                   </div>
-                ) : null}
-                <div style={{ marginTop: 12 }}>
-                  <div className="badge">METRICS</div>
-                  <div className="row" style={{ gap: 10, marginTop: 8, flexWrap: "wrap" }}>
-                    <span className="pill">support {treeSelectedNode.support}</span>
-                    <span className="pill">lift {fmtNum(treeSelectedNode.lift, 2)}</span>
-                    <span className="pill">Δscore {fmtNum(treeSelectedNode.deltaScore, 2)}</span>
-                    <span className="pill">p(top) {fmtPct(treeSelectedNode.pTop)}</span>
+                  <div style={{ marginTop: 12 }}>
+                    <div className="badge">BEST NEXT PICKS</div>
+                    <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                      {treeSelectedNode.children.length ? (
+                        treeSelectedNode.children.map((c) => (
+                          <button
+                            key={c.key}
+                            className="btn btn-ghost"
+                            style={{ justifyContent: "space-between", gap: 10 }}
+                            onClick={() => setSelectedTree(c.key)}
+                          >
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.label}</span>
+                            <span className="numeric muted">
+                              {metric === "lift" ? fmtNum(c.lift, 2) : metric === "deltaScore" ? fmtNum(c.deltaScore, 2) : fmtPct(c.pTop)}
+                            </span>
+                          </button>
+                        ))
+                      ) : (
+                        <div className="muted">No further refinements at this depth.</div>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 12 }}>
+                    <button className="btn" onClick={() => onSpotlightBranch(treeSelectedNode)}>
+                      Spotlight branch in web
+                    </button>
                   </div>
                 </div>
-                <div style={{ marginTop: 12 }}>
-                  <div className="badge">BEST NEXT PICKS</div>
-                  <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
-                    {treeSelectedNode.children.length ? (
-                      treeSelectedNode.children.map((c) => (
-                        <button
-                          key={c.key}
-                          className="btn btn-ghost"
-                          style={{ justifyContent: "space-between", gap: 10 }}
-                          onClick={() => setSelectedTree(c.key)}
-                        >
-                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.label}</span>
-                          <span className="numeric muted">
-                            {metric === "lift" ? fmtNum(c.lift, 2) : metric === "deltaScore" ? fmtNum(c.deltaScore, 2) : fmtPct(c.pTop)}
-                          </span>
-                        </button>
-                      ))
-                    ) : (
-                      <div className="muted">No further refinements at this depth.</div>
-                    )}
-                  </div>
+              ) : (
+                <div style={{ padding: 12 }} className="muted">
+                  Click a node in the tree to inspect build steps and next picks.
                 </div>
-                <div style={{ marginTop: 12 }}>
-                  <button className="btn" onClick={() => onSpotlightBranch(treeSelectedNode)}>
-                    Spotlight branch in web
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div style={{ padding: 12 }} className="muted">
-                Click a node in the tree to inspect build steps and next picks.
-              </div>
-            )
-          ) : selectedItem ? (
+              )
+            ) : selectedItem ? (
             <div style={{ padding: 12 }}>
               <div className="row-between" style={{ alignItems: "baseline", gap: 10 }}>
                 <div>
@@ -1197,9 +1353,9 @@ export default function BuildLab() {
             <div>Support</div>
             <div>{metric === "lift" ? "Lift" : metric === "deltaScore" ? "ΔScore" : "P(top)"}</div>
             <div />
-            <div className="lb-extra">—</div>
-            <div className="lb-extra">—</div>
-            <div className="lb-spark lb-extra">—</div>
+            <div className="lb-extra">Support%</div>
+            <div className="lb-extra">Conf</div>
+            <div className="lb-spark lb-extra">Log-Odds</div>
           </div>
           <div className="lb-list" style={{ ["--lb-row-count" as any]: topPairsForTable.length } as any}>
             {topPairsForTable.map((p, i) => (
@@ -1225,12 +1381,10 @@ export default function BuildLab() {
                   {metric === "lift" ? fmtNum(p.lift, 2) : metric === "deltaScore" ? fmtNum(p.deltaScore, 2) : fmtPct(p.pTop)}
                 </div>
                 <div className="muted">—</div>
-                <div className="lb-extra numeric">—</div>
-                <div className="lb-extra numeric">—</div>
+                <div className="lb-extra numeric">{fmtPct(p.supportRate)}</div>
+                <div className="lb-extra numeric">{fmtPct(p.confidence)}</div>
                 <div className="lb-spark lb-extra">
-                  <svg viewBox="0 0 60 16" preserveAspectRatio="none">
-                    <path d="M0,12 L60,12" />
-                  </svg>
+                  <span className="numeric">{fmtNum(p.logOdds, 2)}</span>
                 </div>
                 <div className="lbChipRail" />
               </div>

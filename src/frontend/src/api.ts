@@ -28,6 +28,11 @@ export type Heartbeat = {
   inventory_items?: any[] | null;
   synergy_edges?: any[] | null;
   evolution_recipes?: any[] | null;
+  obs_fps?: number | null;
+  act_hz?: number | null;
+  action_entropy?: number | null;
+  stuck?: Record<string, any> | null;
+  errors_recent?: Array<Record<string, any>> | null;
   status: string;
   stream_url?: string | null;
   stream_type?: string | null;
@@ -36,6 +41,9 @@ export type Heartbeat = {
   stream_error?: string | null;
   streamer_last_error?: string | null;
   stream_backend?: string | null;
+  stream_active_clients?: number | null;
+  stream_max_clients?: number | null;
+  stream_fps?: number | null;
   fifo_stream_enabled?: boolean | null;
   fifo_stream_path?: string | null;
   fifo_stream_last_error?: string | null;
@@ -83,6 +91,24 @@ export type Run = {
   config?: Record<string, unknown>;
 };
 
+export type RunMetricPoint = {
+  ts: number;
+  step: number;
+  value: number;
+};
+
+export type RunMetricSeries = {
+  run_id: string;
+  metric: string;
+  points: RunMetricPoint[];
+};
+
+export type RunCompareResponse = {
+  runs: Run[];
+  metrics: RunMetricSeries[];
+  artifacts?: Record<string, string[]>;
+};
+
 export type InstanceView = {
   heartbeat: Heartbeat;
   config?: {
@@ -93,6 +119,69 @@ export type InstanceView = {
     eval_mode?: boolean | null;
     eval_seed?: number | null;
   } | null;
+  telemetry?: {
+    history: InstanceTelemetryPoint[];
+    sparks: {
+      score: number[];
+      reward: number[];
+      stream_age_s: number[];
+      stream_fps: number[];
+      entropy: number[];
+    };
+  } | null;
+};
+
+export type InstanceTelemetryPoint = {
+  ts: number;
+  step: number;
+  score: number;
+  reward: number;
+  stream_ok?: boolean;
+  stream_age_s?: number | null;
+  stream_fps?: number | null;
+  obs_fps?: number | null;
+  act_hz?: number | null;
+  action_entropy?: number | null;
+};
+
+export type InstanceTimelineResponse = {
+  instance_id: string;
+  window_s: number;
+  points: InstanceTelemetryPoint[];
+  events: Event[];
+};
+
+export type OverviewHealth = {
+  window_s: number;
+  api: {
+    req_rate: number;
+    p95_ms: number;
+    error_rate: number;
+    total: number;
+  };
+  heartbeat: {
+    rate: number;
+    late: number;
+    workers: number;
+    ttl_s: number;
+  };
+  stream: {
+    ok: number;
+    stale: number;
+    missing: number;
+    p95_frame_age_s?: number | null;
+  };
+};
+
+export type OverviewIssue = {
+  id: string;
+  label: string;
+  severity: "low" | "medium" | "high";
+  count: number;
+  instances: string[];
+  first_seen?: number | null;
+  last_seen?: number | null;
+  hint?: string | null;
 };
 
 export type Event = {
@@ -370,6 +459,10 @@ export type PretrainStatus = {
     video_rollouts_pt_dir: string;
     video_rollouts_pt: number | null;
   };
+  audit?: {
+    video_demos?: { available: boolean; samples?: number; corrupt?: number; avg_len?: number | null };
+    video_labeled?: { available: boolean; samples?: number; corrupt?: number; avg_len?: number | null };
+  };
   artifacts: {
     idm_ckpt: PretrainArtifact;
     reward_ckpt: PretrainArtifact;
@@ -432,6 +525,16 @@ export async function fetchStatus(): Promise<OrchestratorStatus> {
   return fetchJson<OrchestratorStatus>(`${ORCH}/status`);
 }
 
+export async function fetchOverviewHealth(windowSeconds = 300): Promise<OverviewHealth> {
+  const qs = new URLSearchParams({ window: String(windowSeconds) });
+  return fetchJson<OverviewHealth>(`${ORCH}/overview/health?${qs.toString()}`);
+}
+
+export async function fetchOverviewIssues(windowSeconds = 600): Promise<OverviewIssue[]> {
+  const qs = new URLSearchParams({ window: String(windowSeconds) });
+  return fetchJson<OverviewIssue[]>(`${ORCH}/overview/issues?${qs.toString()}`);
+}
+
 export async function fetchWorkers(): Promise<Record<string, Heartbeat>> {
   return fetchJson(`${ORCH}/workers`);
 }
@@ -460,8 +563,41 @@ export async function fetchRuns(): Promise<Run[]> {
   return fetchJson(`${ORCH}/runs`);
 }
 
+export async function fetchRunMetrics(
+  runIds: string[],
+  metrics: string[] = ["reward", "score"],
+  params: { window_s?: number; stride?: number; start?: number } = {}
+): Promise<RunMetricSeries[]> {
+  const sp = new URLSearchParams();
+  sp.set("runs", runIds.join(","));
+  sp.set("metrics", metrics.join(","));
+  if (params.window_s != null) sp.set("window_s", String(params.window_s));
+  if (params.stride != null) sp.set("stride", String(params.stride));
+  if (params.start != null) sp.set("start", String(params.start));
+  return fetchJson(`${ORCH}/runs/metrics?${sp.toString()}`);
+}
+
+export async function fetchRunsCompare(
+  runIds: string[],
+  metrics: string[] = ["reward"],
+  params: { window_s?: number; stride?: number; start?: number } = {}
+): Promise<RunCompareResponse> {
+  const sp = new URLSearchParams();
+  sp.set("runs", runIds.join(","));
+  sp.set("metrics", metrics.join(","));
+  if (params.window_s != null) sp.set("window_s", String(params.window_s));
+  if (params.stride != null) sp.set("stride", String(params.stride));
+  if (params.start != null) sp.set("start", String(params.start));
+  return fetchJson(`${ORCH}/runs/compare?${sp.toString()}`);
+}
+
 export async function fetchInstances() {
   return fetchJson<Record<string, InstanceView>>(`${ORCH}/instances`);
+}
+
+export async function fetchInstanceTimeline(instanceId: string, windowSeconds = 600, limit = 120): Promise<InstanceTimelineResponse> {
+  const qs = new URLSearchParams({ window: String(windowSeconds), limit: String(limit) });
+  return fetchJson<InstanceTimelineResponse>(`${ORCH}/instances/${encodeURIComponent(instanceId)}/timeline?${qs.toString()}`);
 }
 
 export async function fetchEvents(limit = 200): Promise<Event[]> {
@@ -516,6 +652,14 @@ export async function fetchSkillPrototypes(tokenId: number, params: { limit?: nu
 
 export async function generateSkillNames(topk = 32, force = false): Promise<any> {
   return fetchJson(`${ORCH}/skills/names/generate?topk=${topk}&force=${force ? "1" : "0"}`, { method: "POST" });
+}
+
+export async function updateSkillName(payload: { token: number; name?: string | null; subtitle?: string | null; tags?: string[] | null }): Promise<any> {
+  return fetchJson(`${ORCH}/skills/names`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function fetchPretrainStatus(): Promise<PretrainStatus> {

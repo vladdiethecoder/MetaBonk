@@ -1,9 +1,59 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
-import { fetchHistoricLeaderboard, fetchInstances, HistoricLeaderboardEntry, InstanceView } from "../api";
+import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
+import { useEventStream } from "../hooks/useEventStream";
 import useContextFilters from "../hooks/useContextFilters";
+import { useContextDrawer } from "../hooks/useContextDrawer";
+import { deriveReasonCode } from "../hooks/useIssues";
 import { clamp01, copyToClipboard, fmtFixed, fmtNum, fmtPct01, timeAgo } from "../lib/format";
+
+function Sparkline({ values, color }: { values: number[] | null | undefined; color: string }) {
+  const vals = (values ?? []).filter((v) => Number.isFinite(v));
+  if (vals.length < 2) return <div className="sparkline muted">—</div>;
+  const w = 90;
+  const h = 24;
+  const pad = 3;
+  const minV = Math.min(...vals);
+  const maxV = Math.max(...vals);
+  const span = Math.max(1e-6, maxV - minV);
+  const pts = vals.map((v, i) => {
+    const x = pad + (i / (vals.length - 1)) * (w - pad * 2);
+    const y = pad + (1 - (v - minV) / span) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return (
+    <svg className="sparkline" viewBox={`0 0 ${w} ${h}`}>
+      <polyline fill="none" stroke={color} strokeWidth="2" points={pts.join(" ")} />
+    </svg>
+  );
+}
+
+function TelemetryChart({ points }: { points: Array<{ score?: number; reward?: number }> }) {
+  if (!points.length) return <div className="muted">no telemetry yet</div>;
+  const scores = points.map((p) => Number(p.score ?? 0));
+  const rewards = points.map((p) => Number(p.reward ?? 0));
+  const all = [...scores, ...rewards];
+  const minV = Math.min(...all);
+  const maxV = Math.max(...all);
+  const span = Math.max(1e-6, maxV - minV);
+  const w = 320;
+  const h = 120;
+  const pad = 10;
+  const toPts = (vals: number[]) =>
+    vals.map((v, i) => {
+      const x = pad + (i / Math.max(1, vals.length - 1)) * (w - pad * 2);
+      const y = pad + (1 - (v - minV) / span) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+  return (
+    <svg className="telemetry-chart" viewBox={`0 0 ${w} ${h}`}>
+      <rect x="0" y="0" width={w} height={h} rx="10" fill="rgba(6,8,12,.6)" stroke="rgba(43,21,60,.8)" />
+      <polyline fill="none" stroke="var(--blue)" strokeWidth="2" points={toPts(scores).join(" ")} />
+      <polyline fill="none" stroke="var(--yellow)" strokeWidth="2" points={toPts(rewards).join(" ")} />
+    </svg>
+  );
+}
 
 export default function Instances() {
   const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 2000 });
@@ -11,10 +61,18 @@ export default function Instances() {
   const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
   const loc = useLocation();
   const { ctx, windowSeconds } = useContextFilters();
+  const events = useEventStream(220);
   const [q, setQ] = useState("");
   const [policy, setPolicy] = useState<string>("all");
   const [sort, setSort] = useState<"score" | "step" | "seen">("score");
   const [selected, setSelected] = useState<string | null>(null);
+  const openContext = useContextDrawer();
+  const timelineQ = useQuery<InstanceTimelineResponse>({
+    queryKey: ["instanceTimeline", selected, windowSeconds],
+    queryFn: () => fetchInstanceTimeline(selected as string, windowSeconds ?? 600, 120),
+    enabled: Boolean(selected),
+    refetchInterval: 3000,
+  });
 
   useEffect(() => {
     const qs = new URLSearchParams(loc.search);
@@ -38,6 +96,7 @@ export default function Instances() {
       const streamOk = Boolean(hb?.stream_ok);
       const streamState = !streamUrl ? "missing" : streamOk ? "ok" : "stale";
       const streamError = hb?.stream_error ?? hb?.streamer_last_error ?? null;
+      const reason = deriveReasonCode(hb);
       const survival = hb?.survival_prob != null ? clamp01(Number(hb.survival_prob)) : null;
       const danger = hb?.danger_level != null ? clamp01(Number(hb.danger_level)) : survival != null ? clamp01(1 - survival) : null;
       const name = (hb?.display_name ?? id) as string;
@@ -56,12 +115,15 @@ export default function Instances() {
         streamError,
         streamUrl,
         hb,
+        reason,
         survival,
         danger,
         cfg: v.config ?? null,
         best_score: hist?.best_score ?? null,
         best_step: hist?.best_step ?? null,
         runId,
+        sparks: v.telemetry?.sparks ?? null,
+        history: v.telemetry?.history ?? [],
       };
     });
 
@@ -94,6 +156,19 @@ export default function Instances() {
   }, [rows]);
 
   const selectedRow = useMemo(() => rows.find((r) => String(r.id) === String(selected)) ?? null, [rows, selected]);
+  const selectedEvents = useMemo(() => {
+    if (!selectedRow) return [];
+    return events.filter((e) => String(e.instance_id ?? "") === String(selectedRow.id)).slice(-12).reverse();
+  }, [events, selectedRow]);
+  const frameUrl = useMemo(() => {
+    const base = selectedRow?.hb?.control_url ?? "";
+    if (!base) return "";
+    return `${String(base).replace(/\/+$/, "")}/frame.jpg`;
+  }, [selectedRow]);
+  const timelinePoints = useMemo(() => {
+    if (timelineQ.data?.points?.length) return timelineQ.data.points;
+    return selectedRow?.history ?? [];
+  }, [timelineQ.data, selectedRow]);
 
   return (
     <div className="grid" style={{ gridTemplateColumns: "1.3fr 0.7fr" }}>
@@ -142,7 +217,9 @@ export default function Instances() {
               <th>Policy</th>
               <th>Device</th>
               <th>Stream</th>
+              <th>Reason</th>
               <th>Score</th>
+              <th>Trends</th>
               <th>Step</th>
               <th>Survival</th>
               <th>Danger</th>
@@ -166,9 +243,18 @@ export default function Instances() {
                 <td>
                   <span className={`pill ${r.streamState === "ok" ? "pill-ok" : "pill-missing"}`}>{r.streamState}</span>
                 </td>
+                <td className="muted mono">{r.reason ?? "—"}</td>
                 <td>
                   <div>{fmtFixed(r.score, 2)}</div>
                   <div className="muted">best {r.best_score == null ? "—" : fmtFixed(r.best_score, 2)}</div>
+                </td>
+                <td>
+                  <div className="sparks">
+                    <Sparkline values={r.sparks?.score} color="var(--blue)" />
+                    <Sparkline values={r.sparks?.reward} color="var(--yellow)" />
+                    <Sparkline values={r.sparks?.entropy} color="var(--pink)" />
+                    <Sparkline values={r.sparks?.stream_fps} color="rgba(0,255,136,.9)" />
+                  </div>
                 </td>
                 <td>
                   <div>{fmtNum(r.step)}</div>
@@ -181,7 +267,7 @@ export default function Instances() {
             ))}
             {!rows.length && (
               <tr>
-                <td colSpan={9} className="muted">
+                <td colSpan={11} className="muted">
                   no instances yet
                 </td>
               </tr>
@@ -208,12 +294,18 @@ export default function Instances() {
               <div className="v">{selectedRow.policy}</div>
               <div className="k">status</div>
               <div className="v">{selectedRow.hb?.status ?? "—"}</div>
+              <div className="k">reason</div>
+              <div className="v mono">{selectedRow.reason ?? "—"}</div>
               <div className="k">device</div>
               <div className="v">{selectedRow.device}</div>
               <div className="k">stream</div>
               <div className="v">
                 <span className={`pill ${selectedRow.streamState === "ok" ? "pill-ok" : "pill-missing"}`}>{selectedRow.streamState}</span>
                 {selectedRow.streamError ? <span className="muted"> • {selectedRow.streamError}</span> : null}
+              </div>
+              <div className="k">clients</div>
+              <div className="v">
+                {selectedRow.hb?.stream_active_clients ?? 0}/{selectedRow.hb?.stream_max_clients ?? "—"}
               </div>
               <div className="k">score</div>
               <div className="v">
@@ -244,7 +336,14 @@ export default function Instances() {
                     <a className="btn btn-ghost" href={selectedRow.streamUrl} target="_blank" rel="noreferrer">
                       open stream
                     </a>
-                    <span className="muted">{selectedRow.hb?.stream_type ?? "—"}</span>
+                    <div className="row" style={{ gap: 8 }}>
+                      {frameUrl ? (
+                        <a className="btn btn-ghost" href={frameUrl} target="_blank" rel="noreferrer">
+                          frame.jpg
+                        </a>
+                      ) : null}
+                      <span className="muted">{selectedRow.hb?.stream_type ?? "—"}</span>
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -252,10 +351,51 @@ export default function Instances() {
               )}
             </div>
 
+            <div className="panel" style={{ marginTop: 10 }}>
+              <div className="row-between">
+                <div className="muted">Telemetry timeline</div>
+                <span className="badge">{fmtNum(timelinePoints.length)} pts</span>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <TelemetryChart points={timelinePoints} />
+                <div className="muted" style={{ marginTop: 6 }}>score (blue) • reward (yellow)</div>
+              </div>
+            </div>
+
             <details className="details">
               <summary className="muted">Raw heartbeat</summary>
               <pre className="code code-tall">{JSON.stringify(selectedRow.hb ?? {}, null, 2)}</pre>
             </details>
+            <div className="panel" style={{ marginTop: 10 }}>
+              <div className="row-between">
+                <div className="muted">Flight recorder</div>
+                <span className="badge">{fmtNum(selectedEvents.length)} events</span>
+              </div>
+              <div className="events" style={{ marginTop: 8 }}>
+                {selectedEvents.map((e) => (
+                  <div
+                    key={e.event_id}
+                    className="event"
+                    style={{ cursor: "pointer" }}
+                    onClick={() =>
+                      openContext({
+                        title: e.message,
+                        kind: "event",
+                        instanceId: e.instance_id ?? null,
+                        runId: e.run_id ?? null,
+                        ts: e.ts,
+                        details: e.payload ?? {},
+                      })
+                    }
+                  >
+                    <span className="badge">{e.event_type}</span>
+                    <span>{e.message}</span>
+                    <span className="muted">{timeAgo(e.ts)}</span>
+                  </div>
+                ))}
+                {!selectedEvents.length && <div className="muted">no recent events</div>}
+              </div>
+            </div>
             {selectedRow.cfg ? (
               <details className="details">
                 <summary className="muted">Assigned config</summary>

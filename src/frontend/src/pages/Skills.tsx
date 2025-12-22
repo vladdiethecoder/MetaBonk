@@ -9,6 +9,7 @@ import {
   fetchSkillsFiles,
   fetchSkillsSummary,
   generateSkillNames,
+  updateSkillName,
   SkillAtlasPoint,
   SkillEffectToken,
   SkillEffectsResponse,
@@ -503,6 +504,37 @@ export default function Skills() {
     },
   });
 
+  const [nameDraft, setNameDraft] = useState("");
+  const [subtitleDraft, setSubtitleDraft] = useState("");
+  const [tagsDraft, setTagsDraft] = useState("");
+  useEffect(() => {
+    setNameDraft(detail?.name ?? "");
+    setSubtitleDraft(detail?.subtitle ?? "");
+    setTagsDraft((detail?.tags ?? []).join(", "));
+  }, [detail?.name, detail?.subtitle, detail?.tags, selectedToken]);
+
+  const saveName = useMutation({
+    mutationFn: async () => {
+      if (selectedToken == null) return null;
+      const tags = tagsDraft
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+      return updateSkillName({
+        token: selectedToken,
+        name: nameDraft.trim() || null,
+        subtitle: subtitleDraft.trim() || null,
+        tags: tags.length ? tags : null,
+      });
+    },
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["skills", "summary"] });
+      if (selectedToken !== null) {
+        await qc.invalidateQueries({ queryKey: ["skills", "token", selectedToken] });
+      }
+    },
+  });
+
   const actionStats = useMemo(() => {
     const m = summary?.dataset?.action_mean;
     const s = summary?.dataset?.action_std;
@@ -637,6 +669,29 @@ export default function Skills() {
             {(tokenTags as any[]).length > 10 ? <span className="muted">+{(tokenTags as any[]).length - 10} more</span> : null}
           </div>
         )}
+        <div className="panel" style={{ marginTop: 10 }}>
+          <div className="muted">Naming workflow</div>
+          <div className="split" style={{ marginTop: 6 }}>
+            <div>
+              <label className="muted">Name</label>
+              <input className="input" value={nameDraft} onChange={(e) => setNameDraft(e.target.value)} placeholder="e.g. dodge-left microburst" />
+            </div>
+            <div>
+              <label className="muted">Subtitle</label>
+              <input className="input" value={subtitleDraft} onChange={(e) => setSubtitleDraft(e.target.value)} placeholder="context notes" />
+            </div>
+          </div>
+          <div style={{ marginTop: 6 }}>
+            <label className="muted">Tags</label>
+            <input className="input" value={tagsDraft} onChange={(e) => setTagsDraft(e.target.value)} placeholder="comma-separated tags" />
+          </div>
+          <div className="row-between" style={{ marginTop: 8 }}>
+            <span className="muted">Saved to skill_names.json</span>
+            <button className="btn btn-ghost" onClick={() => saveName.mutate()} disabled={saveName.isPending || selectedToken == null}>
+              {saveName.isPending ? "saving…" : "save name"}
+            </button>
+          </div>
+        </div>
 
         {tokenQ.isError ? (
           <div className="muted">Failed to decode token {selectedToken ?? "—"}.</div>

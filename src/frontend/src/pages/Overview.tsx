@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
+import { fetchOverviewHealth, fetchOverviewIssues, fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
 import { useEventStream } from "../hooks";
+import useIssues from "../hooks/useIssues";
+import { useContextDrawer } from "../hooks/useContextDrawer";
 import useContextFilters from "../hooks/useContextFilters";
 import { fmtFixed, fmtNum, timeAgo } from "../lib/format";
 
@@ -10,6 +12,18 @@ export default function Overview() {
   const status = statusQ.data;
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 2000 });
   const workers = workersQ.data ?? {};
+  const { ctx, windowSeconds } = useContextFilters();
+  const healthWindow = windowSeconds ?? 300;
+  const healthQ = useQuery({
+    queryKey: ["overviewHealth", healthWindow],
+    queryFn: () => fetchOverviewHealth(healthWindow),
+    refetchInterval: 4000,
+  });
+  const issuesQ = useQuery({
+    queryKey: ["overviewIssues", healthWindow],
+    queryFn: () => fetchOverviewIssues(Math.max(600, healthWindow)),
+    refetchInterval: 5000,
+  });
   const policiesQ = useQuery({ queryKey: ["policies"], queryFn: fetchPolicies, refetchInterval: 4000 });
   const pbtMuteQ = useQuery({ queryKey: ["pbtMute"], queryFn: fetchPbtMute, refetchInterval: 4000 });
   const qc = useQueryClient();
@@ -21,9 +35,14 @@ export default function Overview() {
     },
   });
   const events = useEventStream(100);
-  const { ctx, windowSeconds } = useContextFilters();
+  const issues = useIssues(200);
+  const openContext = useContextDrawer();
   const [eventType, setEventType] = useState<string>("all");
   const [q, setQ] = useState("");
+  const fmtPct = (v?: number | null, digits = 1) => {
+    if (v == null || !Number.isFinite(v)) return "—";
+    return `${(v * 100).toFixed(digits)}%`;
+  };
 
   const eventTypes = useMemo(() => {
     const s = new Set<string>();
@@ -164,6 +183,10 @@ export default function Overview() {
       });
   }, [policiesQ.data, pbtMuteQ.data]);
 
+  const health = healthQ.data;
+  const overviewIssues = issuesQ.data ?? [];
+  const issuesList = overviewIssues.length ? overviewIssues : issues;
+
   return (
     <div className="grid" style={{ gridTemplateColumns: "1fr 1.35fr 0.85fr" }}>
       <section className="card">
@@ -203,6 +226,74 @@ export default function Overview() {
                 </span>
               ))}
               {status.policies.length > 14 ? <span className="muted">+{status.policies.length - 14} more</span> : null}
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="card">
+        <div className="row-between">
+          <h2>Golden Signals</h2>
+          <span className="badge">{healthQ.isError ? "offline" : "live"}</span>
+        </div>
+        {!health ? (
+          <div className="muted">loading…</div>
+        ) : (
+          <div className="grid" style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12, marginTop: 10 }}>
+            <div className="panel">
+              <div className="muted">API (RED)</div>
+              <div className="kpis" style={{ marginTop: 6 }}>
+                <div className="kpi">
+                  <div className="label">Traffic</div>
+                  <div className="value">{fmtFixed(health.api.req_rate, 2)}/s</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Latency p95</div>
+                  <div className="value">{fmtFixed(health.api.p95_ms, 1)}ms</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Errors</div>
+                  <div className="value">{fmtPct(health.api.error_rate, 1)}</div>
+                </div>
+              </div>
+            </div>
+            <div className="panel">
+              <div className="muted">Heartbeats</div>
+              <div className="kpis" style={{ marginTop: 6 }}>
+                <div className="kpi">
+                  <div className="label">Rate</div>
+                  <div className="value">{fmtFixed(health.heartbeat.rate, 2)}/s</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Late</div>
+                  <div className="value">{fmtNum(health.heartbeat.late)}</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Workers</div>
+                  <div className="value">{fmtNum(health.heartbeat.workers)}</div>
+                </div>
+              </div>
+              <div className="muted" style={{ marginTop: 6 }}>TTL {fmtFixed(health.heartbeat.ttl_s, 1)}s</div>
+            </div>
+            <div className="panel">
+              <div className="muted">Streaming</div>
+              <div className="kpis" style={{ marginTop: 6 }}>
+                <div className="kpi">
+                  <div className="label">OK</div>
+                  <div className="value">{fmtNum(health.stream.ok)}</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Stale</div>
+                  <div className="value">{fmtNum(health.stream.stale)}</div>
+                </div>
+                <div className="kpi">
+                  <div className="label">Missing</div>
+                  <div className="value">{fmtNum(health.stream.missing)}</div>
+                </div>
+              </div>
+              <div className="muted" style={{ marginTop: 6 }}>
+                p95 frame age {health.stream.p95_frame_age_s == null ? "—" : `${fmtFixed(health.stream.p95_frame_age_s, 1)}s`}
+              </div>
             </div>
           </div>
         )}
@@ -278,13 +369,60 @@ export default function Overview() {
         </div>
         <div className="events" style={{ marginTop: 10 }}>
           {streamAlerts.map((a) => (
-            <div key={a.id} className="event">
+            <div
+              key={a.id}
+              className="event"
+              style={{ cursor: "pointer" }}
+              onClick={() =>
+                openContext({
+                  title: `Stream alert: ${a.name}`,
+                  kind: "stream",
+                  instanceId: a.id,
+                  details: { reason: a.reason },
+                })
+              }
+            >
               <span className="badge">alert</span>
               <span>{a.name}</span>
               <span className="muted">{a.reason || "issue"}</span>
             </div>
           ))}
           {!streamAlerts.length && <div className="muted">no stream alerts</div>}
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="row-between">
+          <h2>Top Issues</h2>
+          <span className="badge">{fmtNum(issuesList.length)} active</span>
+        </div>
+        <div className="events" style={{ marginTop: 10 }}>
+          {issuesList.map((issue) => (
+            <div
+              key={issue.id}
+              className="event"
+              style={{ cursor: "pointer" }}
+              onClick={() =>
+                openContext({
+                  title: issue.label,
+                  kind: "event",
+                  details: {
+                    count: issue.count,
+                    severity: issue.severity,
+                    hint: (issue as any).hint,
+                    instances: (issue as any).instances?.slice?.(0, 6) ?? [],
+                  },
+                })
+              }
+            >
+              <span className="badge">{issue.label}</span>
+              <span className="muted">{fmtNum(issue.count)} hits</span>
+              {(issue as any).last_seen || (issue as any).lastSeen ? (
+                <span className="muted">last {timeAgo((issue as any).last_seen ?? (issue as any).lastSeen)}</span>
+              ) : null}
+            </div>
+          ))}
+          {!issuesList.length && <div className="muted">no active issues</div>}
         </div>
       </section>
 
@@ -375,7 +513,21 @@ export default function Overview() {
         </div>
         <div className="events" style={{ marginTop: 10 }}>
           {filtered.map((e) => (
-            <div key={e.event_id} className="event">
+            <div
+              key={e.event_id}
+              className="event"
+              style={{ cursor: "pointer" }}
+              onClick={() =>
+                openContext({
+                  title: e.message,
+                  kind: "event",
+                  instanceId: e.instance_id ?? null,
+                  runId: e.run_id ?? null,
+                  ts: e.ts,
+                  details: e.payload ?? {},
+                })
+              }
+            >
               <span className="badge">{e.event_type}</span>
               <span>{e.message}</span>
               <span className="muted">{timeAgo(e.ts)}</span>
