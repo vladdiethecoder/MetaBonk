@@ -140,6 +140,7 @@ class Heartbeat(MBBaseModel):
     worker_device: Optional[str] = None
     vision_device: Optional[str] = None
     learned_reward_device: Optional[str] = None
+    worker_pid: Optional[int] = None
     reward_device: Optional[str] = None
     ts: float = Field(default_factory=time.time)
     # Episode context (worker-local timer; does not require game memory access).

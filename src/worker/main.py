@@ -1436,6 +1436,7 @@ class WorkerService:
                 vision_device=vision_device or None,
                 learned_reward_device=learned_reward_device or None,
                 reward_device=reward_device or None,
+                worker_pid=os.getpid(),
                 control_url=self.control_url(),
             )
             if requests:

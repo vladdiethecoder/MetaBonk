@@ -62,6 +62,7 @@ def test_status_and_workers():
     assert sample.get("instance_id")
     assert "step" in sample
     assert sample.get("status")
+    assert sample.get("worker_pid") is not None
 
 
 def test_overview_health():

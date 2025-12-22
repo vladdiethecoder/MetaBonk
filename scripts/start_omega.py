@@ -38,9 +38,21 @@ from stack_banner import print_stack_banner
 class Proc:
     name: str
     popen: subprocess.Popen
+    role: str = "service"
+    cmd: Optional[List[str]] = None
+    env: Optional[Dict[str, str]] = None
+    restart_count: int = 0
+    last_start_ts: float = 0.0
 
 
-def _spawn(name: str, cmd: List[str], *, env: Optional[Dict[str, str]] = None) -> Proc:
+def _spawn(
+    name: str,
+    cmd: List[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    role: str = "service",
+    restart_count: int = 0,
+) -> Proc:
     print(f"[start_omega] starting {name}: {' '.join(cmd)}")
     preexec_fn = None
     if os.name == "posix":
@@ -59,7 +71,15 @@ def _spawn(name: str, cmd: List[str], *, env: Optional[Dict[str, str]] = None) -
             preexec_fn = _bind_to_job_pgid
 
     p = subprocess.Popen(cmd, env=env, preexec_fn=preexec_fn)
-    return Proc(name=name, popen=p)
+    return Proc(
+        name=name,
+        popen=p,
+        role=role,
+        cmd=list(cmd),
+        env=dict(env) if env else None,
+        restart_count=int(restart_count),
+        last_start_ts=time.time(),
+    )
 
 
 def _terminate_all(procs: List[Proc]) -> None:
@@ -78,6 +98,52 @@ def _wait_until_exit(procs: List[Proc]) -> int:
             if ret is not None:
                 print(f"[start_omega] {pr.name} exited with {ret}")
                 return int(ret)
+        time.sleep(0.5)
+
+
+def _supervise(
+    procs: List[Proc],
+    *,
+    supervise_workers: bool,
+    max_restarts: int,
+    backoff_s: float,
+) -> int:
+    max_restarts = max(0, int(max_restarts))
+    backoff_s = max(0.1, float(backoff_s))
+    while True:
+        for idx, pr in list(enumerate(list(procs))):
+            ret = pr.popen.poll()
+            if ret is None:
+                continue
+            if pr.role not in ("worker", "xvfb"):
+                print(f"[start_omega] {pr.name} exited with {ret}")
+                return int(ret)
+            if not supervise_workers:
+                print(f"[start_omega] {pr.name} exited with {ret}")
+                return int(ret)
+            if pr.restart_count >= max_restarts:
+                print(f"[start_omega] {pr.name} restart limit reached ({pr.restart_count}/{max_restarts})")
+                # Keep stack alive, but stop supervising this proc.
+                try:
+                    procs.remove(pr)
+                except Exception:
+                    pass
+                continue
+            now = time.time()
+            if (now - pr.last_start_ts) < backoff_s:
+                continue
+            print(f"[start_omega] restarting {pr.name} (exit {ret}, attempt {pr.restart_count + 1})")
+            try:
+                new_pr = _spawn(
+                    pr.name,
+                    list(pr.cmd or []),
+                    env=dict(pr.env) if pr.env else None,
+                    role=pr.role,
+                    restart_count=int(pr.restart_count) + 1,
+                )
+                procs[idx] = new_pr
+            except Exception as e:
+                print(f"[start_omega] failed to restart {pr.name}: {e}")
         time.sleep(0.5)
 
 
@@ -391,6 +457,7 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_WIDTH", env.get("MEGABONK_WIDTH"))
     env.setdefault("METABONK_STREAM_HEIGHT", env.get("MEGABONK_HEIGHT"))
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
+    env.setdefault("METABONK_SUPERVISE_WORKERS", "1")
     if (
         str(env.get("METABONK_USE_RESEARCH_SHM") or "0").strip().lower() in ("1", "true", "yes", "on")
         and Path("/dev/shm").exists()
@@ -652,6 +719,7 @@ def main() -> int:
                     "orchestrator",
                     [py, "-m", "src.orchestrator.main", "--port", str(args.orch_port)],
                     env=env,
+                    role="service",
                 )
             )
         if not args.no_vision:
@@ -670,6 +738,7 @@ def main() -> int:
                         str(env.get("METABONK_VISION_DEVICE", "") or ""),
                     ],
                     env=env,
+                    role="service",
                 )
             )
         if not args.no_learner:
@@ -678,6 +747,7 @@ def main() -> int:
                     "learner",
                     [py, "-m", "src.learner.service", "--port", str(args.learner_port)],
                     env=env,
+                    role="service",
                 )
             )
 
@@ -719,6 +789,7 @@ def main() -> int:
                         f"xvfb-{iid}",
                         ["Xvfb", f":{disp}", "-screen", "0", str(xvfb_size), "-nolisten", "tcp"],
                         env=wenv,
+                        role="xvfb",
                     )
                 )
             procs.append(
@@ -736,6 +807,7 @@ def main() -> int:
                         args.policy_name,
                     ],
                     env=wenv,
+                    role="worker",
                 )
             )
 
@@ -754,7 +826,19 @@ def main() -> int:
         signal.signal(signal.SIGINT, _handle)
         signal.signal(signal.SIGTERM, _handle)
 
-        ret = _wait_until_exit(procs)
+        supervise = str(env.get("METABONK_SUPERVISE_WORKERS", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+        try:
+            max_restarts = int(env.get("METABONK_WORKER_RESTART_MAX", "3"))
+        except Exception:
+            max_restarts = 3
+        try:
+            backoff_s = float(env.get("METABONK_WORKER_RESTART_BACKOFF_S", "2.0"))
+        except Exception:
+            backoff_s = 2.0
+        if supervise:
+            ret = _supervise(procs, supervise_workers=True, max_restarts=max_restarts, backoff_s=backoff_s)
+        else:
+            ret = _wait_until_exit(procs)
         _terminate_all(procs)
         return ret
     finally:

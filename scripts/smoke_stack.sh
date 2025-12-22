@@ -12,6 +12,7 @@ GO2RTC_ENABLED="${METABONK_SMOKE_GO2RTC:-1}"
 GO2RTC_MODE="${METABONK_SMOKE_GO2RTC_MODE:-fifo}"
 UI_ENABLED="${METABONK_SMOKE_UI:-0}"
 INPUT_CHECK="${METABONK_SMOKE_INPUT:-0}"
+FAILOVER_CHECK="${METABONK_SMOKE_FAILOVER:-0}"
 
 LOG_DIR="${REPO_ROOT}/temp/smoke"
 mkdir -p "${LOG_DIR}"
@@ -209,6 +210,56 @@ if [[ "${INPUT_CHECK}" == "1" ]]; then
   else
     echo "[smoke] input check skipped (set METABONK_INPUT_BACKEND=uinput|xdotool)"
   fi
+fi
+
+if [[ "${FAILOVER_CHECK}" == "1" ]]; then
+  export METABONK_SUPERVISE_WORKERS=1
+  python - <<'PY'
+import json
+import os
+import signal
+import time
+import urllib.request
+
+orch = os.environ.get("METABONK_SMOKE_ORCH_URL", "http://127.0.0.1:8040").rstrip("/")
+expected = int(os.environ.get("METABONK_SMOKE_WORKERS", "1"))
+
+def _get_json(url: str, timeout: float = 2.0):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+workers = _get_json(f"{orch}/workers", timeout=2.0)
+target = None
+for hb in workers.values():
+    pid = hb.get("worker_pid")
+    iid = hb.get("instance_id")
+    if pid and iid:
+        target = (int(pid), str(iid))
+        break
+if not target:
+    raise SystemExit("[smoke] failover: no worker_pid found in heartbeats")
+
+pid, iid = target
+print(f"[smoke] failover: killing worker {iid} pid={pid}")
+os.kill(pid, signal.SIGTERM)
+
+deadline = time.time() + 60
+new_pid = None
+while time.time() < deadline:
+    workers = _get_json(f"{orch}/workers", timeout=2.0)
+    hb = workers.get(iid)
+    if hb:
+        cur = hb.get("worker_pid")
+        if cur and int(cur) != pid:
+            new_pid = int(cur)
+            break
+    time.sleep(1.0)
+
+if not new_pid:
+    raise SystemExit("[smoke] failover: worker did not restart")
+
+print(f"[smoke] failover: worker restarted pid={new_pid}")
+PY
 fi
 
 echo "[smoke] OK"

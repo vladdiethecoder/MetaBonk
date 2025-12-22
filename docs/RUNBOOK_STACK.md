@@ -17,6 +17,7 @@ Options:
 - `METABONK_SMOKE_WAIT_S=120`
 - `METABONK_SMOKE_UI=0`
 - `METABONK_SMOKE_INPUT=1`
+- `METABONK_SMOKE_FAILOVER=1`
 
 ## Verify (Manual)
 - API: `curl -s http://127.0.0.1:8040/status`
@@ -90,4 +91,12 @@ METABONK_INPUT_BACKEND=xdotool xdotool -v
 ## Stop
 ```bash
 python scripts/stop.py --all --go2rtc
+```
+
+## Worker Supervision
+Enable automatic worker restart if a worker exits unexpectedly:
+```bash
+export METABONK_SUPERVISE_WORKERS=1
+export METABONK_WORKER_RESTART_MAX=3
+export METABONK_WORKER_RESTART_BACKOFF_S=2.0
 ```
