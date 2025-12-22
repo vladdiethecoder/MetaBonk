@@ -2853,9 +2853,14 @@ if app:
                 "stream_ok": bool(getattr(hb, "stream_ok", False)),
                 "stream_age_s": stream_age,
                 "stream_fps": getattr(hb, "stream_fps", None),
+                "stream_frame_var": getattr(hb, "stream_frame_var", None),
+                "stream_black_since_s": getattr(hb, "stream_black_since_s", None),
                 "obs_fps": getattr(hb, "obs_fps", None),
                 "act_hz": getattr(hb, "act_hz", None),
                 "action_entropy": getattr(hb, "action_entropy", None),
+                "step_age_s": getattr(hb, "step_age_s", None),
+                "launcher_alive": getattr(hb, "launcher_alive", None),
+                "game_restart_count": getattr(hb, "game_restart_count", None),
             }
             _instance_history_push(str(hb.instance_id), entry)
             rid = getattr(hb, "run_id", None) or DEFAULT_RUN_ID
@@ -3422,7 +3427,10 @@ if app:
                 "reward": _sparkline(hist, "reward", limit=16),
                 "stream_age_s": _sparkline(hist, "stream_age_s", limit=16),
                 "stream_fps": _sparkline(hist, "stream_fps", limit=16),
+                "stream_frame_var": _sparkline(hist, "stream_frame_var", limit=16),
+                "stream_black_since_s": _sparkline(hist, "stream_black_since_s", limit=16),
                 "entropy": _sparkline(hist, "action_entropy", limit=16),
+                "step_age_s": _sparkline(hist, "step_age_s", limit=16),
             }
             out[wid] = {
                 "heartbeat": hb.model_dump(),

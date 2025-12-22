@@ -100,6 +100,7 @@ class Heartbeat(MBBaseModel):
     launcher_alive: Optional[bool] = None
     game_restart_count: Optional[int] = None
     game_restart_failed: Optional[bool] = None
+    step_age_s: Optional[float] = None
     # Optional FIFO/go2rtc distribution metadata (Metabonk).
     fifo_stream_enabled: Optional[bool] = None
     fifo_stream_path: Optional[str] = None

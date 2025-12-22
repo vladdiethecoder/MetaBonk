@@ -179,6 +179,8 @@ class WorkerService:
         self._game_restart_count = 0
         self._last_game_restart_ts = 0.0
         self._game_restart_failed = False
+        self._last_step_seen: int = 0
+        self._last_step_ts: float = 0.0
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
 
@@ -1459,12 +1461,17 @@ class WorkerService:
             vision_device = str(os.environ.get("METABONK_VISION_DEVICE", "") or "")
             learned_reward_device = str(os.environ.get("METABONK_LEARNED_REWARD_DEVICE", "") or "")
             reward_device = str(os.environ.get("METABONK_REWARD_DEVICE", "") or "")
+            step_now = int(getattr(self.trainer, "step_count", 0) or 0)
+            if step_now != self._last_step_seen:
+                self._last_step_seen = step_now
+                self._last_step_ts = now
+            step_age_s = (now - self._last_step_ts) if self._last_step_ts > 0 else None
             hb = Heartbeat(
                 run_id=os.environ.get("METABONK_RUN_ID"),
                 instance_id=self.instance_id,
                 policy_name=self.policy_name,
                 policy_version=self._policy_version,
-                step=self.trainer.step_count,
+                step=step_now,
                 reward=self.trainer.last_reward,
                 steam_score=self.trainer.last_reward,
                 episode_idx=int(self._episode_idx),
@@ -1500,6 +1507,7 @@ class WorkerService:
                 launcher_alive=launcher_alive,
                 game_restart_count=self._game_restart_count,
                 game_restart_failed=self._game_restart_failed,
+                step_age_s=step_age_s,
                 control_url=self.control_url(),
             )
             if requests:

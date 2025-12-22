@@ -47,6 +47,7 @@ Out of scope (for initial smoke):
 - Crash recovery: worker/game restart detected and recorded
 - go2rtc config uses raw H.264 passthrough (no unintended CPU transcode)
 - go2rtc API responds on configured URL
+- Instance history includes step_age_s and stream_frame_var fields
 
 ## Commands (Baseline)
 - Launch: `./start --mode train --workers 2 --go2rtc --go2rtc-mode fifo`
