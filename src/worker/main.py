@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import os
 import random
 import threading
@@ -368,6 +369,15 @@ class WorkerService:
         # Latest JPEG frame bytes (e.g., from BonkLink) for UI streaming fallback.
         self._latest_jpeg_bytes: Optional[bytes] = None
         self._latest_frame_ts: float = 0.0
+        self._latest_thumb_b64: Optional[str] = None
+        # Flight recorder: last N actions + thumbnails for Context Drawer.
+        try:
+            cap = int(os.environ.get("METABONK_TELEMETRY_HISTORY", "64"))
+        except Exception:
+            cap = 64
+        self._telemetry_capacity = max(1, cap)
+        self._telemetry_history: deque[dict] = deque(maxlen=self._telemetry_capacity)
+        self._telemetry_lock = threading.Lock()
         # Optional low-rate JPEG preview (CPU) for UI fallback/debug.
         self._preview_stream: Optional[CaptureStream] = None
         self._preview_stop = threading.Event()
@@ -790,6 +800,53 @@ class WorkerService:
         except Exception:
             pass
 
+    def _set_latest_jpeg(self, data: Optional[bytes]) -> None:
+        if not data:
+            return
+        self._latest_jpeg_bytes = data
+        self._latest_frame_ts = time.time()
+        try:
+            import io
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(data)).convert("RGB")
+            thumb = img.copy()
+            thumb.thumbnail((256, 144))
+            buf_thumb = io.BytesIO()
+            thumb.save(buf_thumb, format="JPEG", quality=60)
+            self._latest_thumb_b64 = base64.b64encode(buf_thumb.getvalue()).decode("ascii")
+        except Exception:
+            self._latest_thumb_b64 = None
+
+    def _record_flight_frame(
+        self,
+        *,
+        action_label: str,
+        input_vector: Optional[List[float]] = None,
+        model_entropy: Optional[float] = None,
+    ) -> None:
+        if self._telemetry_capacity <= 0:
+            return
+        entry = {
+            "step_id": int(getattr(self.trainer, "step_count", 0) or 0),
+            "timestamp_ms": int(time.time() * 1000),
+            "action_label": str(action_label),
+            "input_vector": [float(x) for x in (input_vector or [])],
+            "frame_thumbnail_b64": self._latest_thumb_b64,
+            "model_entropy": float(model_entropy) if model_entropy is not None else None,
+        }
+        try:
+            with self._telemetry_lock:
+                self._telemetry_history.append(entry)
+        except Exception:
+            pass
+
+    def telemetry_history(self, limit: int = 50) -> list[dict]:
+        limit = max(1, int(limit))
+        with self._telemetry_lock:
+            hist = list(self._telemetry_history)
+        return hist[-limit:]
+
     def _ensure_preview_jpeg(self) -> None:
         # Default-on: this runs at a low rate and keeps a cached JPEG for UI fallback/debug.
         if os.environ.get("METABONK_PREVIEW_JPEG", "0") in ("0", "false", "False"):
@@ -836,8 +893,7 @@ class WorkerService:
                         )
                         buf = io.BytesIO()
                         img.save(buf, format="JPEG", quality=80)
-                        self._latest_jpeg_bytes = buf.getvalue()
-                        self._latest_frame_ts = time.time()
+                        self._set_latest_jpeg(buf.getvalue())
                     except Exception:
                         pass
                     try:
@@ -1619,8 +1675,7 @@ class WorkerService:
                                 frame_size = img.size
                                 reward_frame_hwc = None
 
-                            self._latest_jpeg_bytes = latest_image_bytes
-                            self._latest_frame_ts = now
+                            self._set_latest_jpeg(latest_image_bytes)
                             used_pixels = True
                             try:
                                 if reward_frame_hwc is None:
@@ -1749,12 +1804,7 @@ class WorkerService:
 
             # Persist latest frame bytes for UI fallback/debug endpoints.
             if latest_image_bytes is not None:
-                self._latest_jpeg_bytes = latest_image_bytes
-                try:
-                    if not float(getattr(self, "_latest_frame_ts", 0.0) or 0.0):
-                        self._latest_frame_ts = now
-                except Exception:
-                    self._latest_frame_ts = now
+                self._set_latest_jpeg(latest_image_bytes)
             elif (
                 str(os.environ.get("METABONK_MENU_SNAPSHOT_FALLBACK", "1")).lower() in ("1", "true", "yes")
                 and self.streamer is not None
@@ -1769,8 +1819,7 @@ class WorkerService:
                     snap = None
                 if snap:
                     latest_image_bytes = snap
-                    self._latest_jpeg_bytes = snap
-                    self._latest_frame_ts = now
+                    self._set_latest_jpeg(snap)
 
             menu_hint: Optional[bool] = None
             if isinstance(vision_metrics, dict):
@@ -2012,6 +2061,29 @@ class WorkerService:
                 input_bootstrap = True
             elif self._input_backend and (not menu_override_active):
                 self._input_send_actions(a_cont, a_disc)
+
+            # Flight recorder: store last actions + thumbnails for Context Drawer.
+            try:
+                action_label = "policy"
+                if menu_override_active and menu_override_action is not None:
+                    action_label = f"menu:{getattr(menu_override_action, 'kind', 'override')}"
+                elif forced_ui_click is not None:
+                    action_label = "click_xy"
+                elif input_bootstrap:
+                    action_label = "bootstrap"
+                elif a_disc:
+                    action_label = f"disc:{int(a_disc[0])}"
+                elif a_cont:
+                    action_label = "cont"
+                entropy = getattr(self.trainer, "last_entropy", None)
+                input_vec = [float(x) for x in (a_cont or [])] + [float(x) for x in (a_disc or [])]
+                self._record_flight_frame(
+                    action_label=action_label,
+                    input_vector=input_vec,
+                    model_entropy=entropy,
+                )
+            except Exception:
+                pass
 
             # Optional causal Scientist updates for item/build discovery.
             if self._use_causal_scientist and self._causal_graph is not None:
@@ -3318,6 +3390,32 @@ if app:
             )
 
         raise HTTPException(status_code=404, detail="no jpeg frame available")
+
+    @app.get("/worker/{worker_id}/history")
+    def worker_history(worker_id: str, limit: int = 50):
+        """Return last N action+frame records for Context Drawer."""
+        if not service:
+            raise HTTPException(status_code=404, detail="service not initialized")
+        if str(worker_id) != str(service.instance_id):
+            raise HTTPException(status_code=404, detail="worker not found")
+        hist = service.telemetry_history(limit=limit)
+        return {
+            "worker_id": service.instance_id,
+            "buffer_capacity": service._telemetry_capacity,
+            "history": hist,
+        }
+
+    @app.get("/telemetry/history")
+    def telemetry_history(limit: int = 50):
+        """Return last N action+frame records for this worker."""
+        if not service:
+            raise HTTPException(status_code=404, detail="service not initialized")
+        hist = service.telemetry_history(limit=limit)
+        return {
+            "worker_id": service.instance_id,
+            "buffer_capacity": service._telemetry_capacity,
+            "history": hist,
+        }
 
     @app.post("/highlight/clutch")
     def highlight_clutch():

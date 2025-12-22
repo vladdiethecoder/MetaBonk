@@ -6,9 +6,20 @@ import { contextDrawerEventName, ContextDrawerPayload } from "../hooks/useContex
 import { useEventStream } from "../hooks/useEventStream";
 import { fmtNum, timeAgo } from "../lib/format";
 
+type FlightEntry = {
+  step_id: number;
+  timestamp_ms: number;
+  action_label: string;
+  input_vector?: number[];
+  frame_thumbnail_b64?: string | null;
+  model_entropy?: number | null;
+};
+
 export default function ContextDrawer() {
   const [open, setOpen] = useState(false);
   const [payload, setPayload] = useState<ContextDrawerPayload | null>(null);
+  const [flight, setFlight] = useState<FlightEntry[]>([]);
+  const [flightLoading, setFlightLoading] = useState(false);
   const events = useEventStream(240);
   const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 2500 });
 
@@ -49,6 +60,36 @@ export default function ContextDrawer() {
       .slice(-8)
       .reverse();
   }, [events, payload?.instanceId]);
+
+  useEffect(() => {
+    const iid = payload?.instanceId;
+    const controlUrl = instance?.heartbeat?.control_url ?? "";
+    if (!iid || !controlUrl || typeof window === "undefined") {
+      setFlight([]);
+      return;
+    }
+    const endpoint = `${String(controlUrl).replace(/\\/+$/, "")}/worker/${encodeURIComponent(String(iid))}/history?limit=24`;
+    let mounted = true;
+    setFlightLoading(true);
+    fetch(endpoint)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!mounted) return;
+        const hist = Array.isArray(data?.history) ? (data.history as FlightEntry[]) : [];
+        setFlight(hist.slice(-24).reverse());
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setFlight([]);
+      })
+      .finally(() => {
+        if (!mounted) return;
+        setFlightLoading(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [payload?.instanceId, instance?.heartbeat?.control_url]);
 
   const detailEntries = useMemo(() => Object.entries(payload?.details ?? {}).slice(0, 12), [payload?.details]);
   const frameUrls = useMemo(() => {
@@ -123,6 +164,33 @@ export default function ContextDrawer() {
               </div>
             </div>
           ) : null}
+
+          <div className="panel">
+            <div className="row-between">
+              <div className="muted">Flight recorder</div>
+              <span className="badge">{flightLoading ? "loading" : fmtNum(flight.length)}</span>
+            </div>
+            <div className="events" style={{ marginTop: 6 }}>
+              {flight.map((f, idx) => (
+                <div key={`${f.step_id}-${idx}`} className="event">
+                  {f.frame_thumbnail_b64 ? (
+                    <img
+                      className="thumb"
+                      src={`data:image/jpeg;base64,${f.frame_thumbnail_b64}`}
+                      alt="frame"
+                      style={{ width: 64, height: 40 }}
+                    />
+                  ) : (
+                    <span className="badge">frame</span>
+                  )}
+                  <span className="mono">{f.action_label}</span>
+                  <span className="muted">step {fmtNum(f.step_id)}</span>
+                  <span className="muted">{timeAgo(f.timestamp_ms / 1000)}</span>
+                </div>
+              ))}
+              {!flight.length && <div className="muted">no recent action frames</div>}
+            </div>
+          </div>
 
           {frameUrls.length ? (
             <div className="panel">

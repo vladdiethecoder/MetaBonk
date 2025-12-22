@@ -14,6 +14,7 @@ import base64
 import hashlib
 import io
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -37,6 +38,30 @@ except Exception as e:  # pragma: no cover
     _import_error = e
 else:
     _import_error = None
+
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
+except Exception:  # pragma: no cover
+    sentry_sdk = None  # type: ignore
+    SentryAsgiMiddleware = None  # type: ignore
+
+try:
+    from opentelemetry import trace  # type: ignore
+    from opentelemetry.sdk.resources import Resource  # type: ignore
+    from opentelemetry.sdk.trace import TracerProvider  # type: ignore
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter  # type: ignore
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor  # type: ignore
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor  # type: ignore
+except Exception:  # pragma: no cover
+    trace = None  # type: ignore
+    Resource = None  # type: ignore
+    TracerProvider = None  # type: ignore
+    BatchSpanProcessor = None  # type: ignore
+    OTLPSpanExporter = None  # type: ignore
+    FastAPIInstrumentor = None  # type: ignore
+    RequestsInstrumentor = None  # type: ignore
 
 from src.common.schemas import (
     ACEContextResponse,
@@ -237,6 +262,40 @@ def _load_feats() -> None:
         _feat_defs = []
 
 
+def _init_observability() -> None:
+    """Best-effort Sentry + OpenTelemetry setup (optional deps)."""
+    if sentry_sdk and os.environ.get("SENTRY_DSN"):
+        try:
+            sentry_sdk.init(
+                dsn=os.environ.get("SENTRY_DSN"),
+                environment=os.environ.get("SENTRY_ENVIRONMENT", "development"),
+                traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+                release=os.environ.get("GIT_SHA"),
+            )
+        except Exception:
+            pass
+    if trace and TracerProvider and OTLPSpanExporter and Resource:
+        endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if endpoint:
+            try:
+                service_name = os.environ.get("OTEL_SERVICE_NAME", "metabonk-orchestrator")
+                resource_attrs = {"service.name": service_name}
+                extra = os.environ.get("OTEL_RESOURCE_ATTRIBUTES")
+                if extra:
+                    for kv in extra.split(","):
+                        if "=" in kv:
+                            k, v = kv.split("=", 1)
+                            resource_attrs[k.strip()] = v.strip()
+                provider = TracerProvider(resource=Resource.create(resource_attrs))
+                exporter = OTLPSpanExporter(endpoint=endpoint)
+                provider.add_span_processor(BatchSpanProcessor(exporter))
+                trace.set_tracer_provider(provider)
+                if RequestsInstrumentor:
+                    RequestsInstrumentor().instrument()
+            except Exception:
+                pass
+
+
 def _record_api_latency(path: str, status_code: int, latency_ms: float) -> None:
     now = time.time()
     with _api_latency_lock:
@@ -429,6 +488,104 @@ def _collect_issues(window_s: float = 600.0) -> list[dict[str, Any]]:
     out = list(issues.values())
     out.sort(key=_impact, reverse=True)
     return out
+
+
+def _build_db_path() -> Path:
+    return Path(os.environ.get("METABONK_BUILD_RUNS_DB", "checkpoints/build_runs.db"))
+
+
+def _build_db() -> Optional[sqlite3.Connection]:
+    global _build_db_conn
+    with _build_db_lock:
+        if _build_db_conn is not None:
+            return _build_db_conn
+        try:
+            path = _build_db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path), check_same_thread=False)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS build_runs (
+                    run_id TEXT PRIMARY KEY,
+                    worker_id TEXT,
+                    timestamp REAL DEFAULT (strftime('%s','now')),
+                    build_hash TEXT,
+                    inventory_snapshot TEXT,
+                    clip_url TEXT,
+                    is_verified INTEGER DEFAULT 0,
+                    match_duration_sec INTEGER,
+                    final_score REAL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS build_runs_hash_idx ON build_runs(build_hash);")
+            conn.commit()
+            _build_db_conn = conn
+            return conn
+        except Exception:
+            _build_db_conn = None
+            return None
+
+
+def _normalize_build_items(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for it in items:
+        s = str(it or "").strip().lower()
+        if s:
+            out.append(s)
+    return sorted(set(out))
+
+
+def _build_hash(items: list[str]) -> str:
+    raw = "|".join(_normalize_build_items(items))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else ""
+
+
+def _store_build_run(payload: dict[str, Any]) -> Optional[str]:
+    conn = _build_db()
+    if conn is None:
+        return None
+    run_id = str(payload.get("run_id") or payload.get("id") or "")
+    if not run_id:
+        return None
+    worker_id = str(payload.get("worker_id") or payload.get("instance_id") or "")
+    items = payload.get("items") or payload.get("inventory_items") or payload.get("inventory") or []
+    if isinstance(items, str):
+        items = [s.strip() for s in items.split(",") if s.strip()]
+    if not isinstance(items, list):
+        items = []
+    build_hash = str(payload.get("build_hash") or "") or _build_hash([str(x) for x in items])
+    inv_snapshot = payload.get("inventory_snapshot")
+    if inv_snapshot is None and isinstance(items, list):
+        inv_snapshot = items
+    clip_url = payload.get("clip_url") or payload.get("clipUrl")
+    is_verified = 1 if bool(payload.get("is_verified") or payload.get("verified")) else 0
+    match_duration_sec = payload.get("match_duration_sec")
+    final_score = payload.get("final_score") or payload.get("score")
+    try:
+        with _build_db_lock:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO build_runs
+                (run_id, worker_id, timestamp, build_hash, inventory_snapshot, clip_url, is_verified, match_duration_sec, final_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    run_id,
+                    worker_id or None,
+                    float(payload.get("timestamp") or time.time()),
+                    build_hash or None,
+                    json.dumps(inv_snapshot) if inv_snapshot is not None else None,
+                    str(clip_url) if clip_url else None,
+                    int(is_verified),
+                    int(match_duration_sec) if match_duration_sec is not None else None,
+                    float(final_score) if final_score is not None else None,
+                ),
+            )
+            conn.commit()
+        return build_hash
+    except Exception:
+        return None
 
 
 _load_feats()
@@ -1025,6 +1182,10 @@ MAX_EVENTS = 2000
 experiments: Dict[str, Experiment] = {}
 runs: Dict[str, Run] = {}
 
+# Build Lab archive (sqlite).
+_build_db_lock = threading.Lock()
+_build_db_conn: Optional[sqlite3.Connection] = None
+
 _skills_cache: dict[str, Any] = {"ts": 0.0, "summary": None, "model": None, "model_cfg": None}
 _skill_names_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 _skill_names_lock = threading.Lock()
@@ -1096,6 +1257,25 @@ def emit_event(
     events.append(ev)
     if len(events) > MAX_EVENTS:
         del events[: len(events) - MAX_EVENTS]
+    # Best-effort: persist build-run evidence when provided by events.
+    try:
+        if event_type in ("BuildRun", "BuildCombo") or ("build_hash" in (payload or {}) or "inventory_snapshot" in (payload or {})):
+            _store_build_run(
+                {
+                    "run_id": run_id or payload.get("run_id") if payload else run_id,
+                    "instance_id": instance_id or payload.get("instance_id") if payload else instance_id,
+                    "build_hash": payload.get("build_hash") if payload else None,
+                    "inventory_snapshot": payload.get("inventory_snapshot") if payload else None,
+                    "items": payload.get("items") if payload else None,
+                    "clip_url": payload.get("clip_url") if payload else None,
+                    "is_verified": payload.get("is_verified") if payload else None,
+                    "match_duration_sec": payload.get("match_duration_sec") if payload else None,
+                    "final_score": payload.get("final_score") if payload else None,
+                    "timestamp": payload.get("timestamp") if payload else None,
+                }
+            )
+    except Exception:
+        pass
     # Persist to the World Line ledger (append-only history).
     try:
         worldline.append(
@@ -2177,6 +2357,17 @@ except Exception:
 
 
 if app:
+    _init_observability()
+    if sentry_sdk and SentryAsgiMiddleware and os.environ.get("SENTRY_DSN"):
+        try:
+            app.add_middleware(SentryAsgiMiddleware)
+        except Exception:
+            pass
+    if FastAPIInstrumentor:
+        try:
+            FastAPIInstrumentor.instrument_app(app)
+        except Exception:
+            pass
     @app.middleware("http")
     async def telemetry_middleware(request, call_next):
         start = time.time()
@@ -3154,9 +3345,17 @@ if app:
         return [r.model_dump() for r in runs.values()]
 
     @app.get("/runs/metrics")
-    def runs_metrics(run_ids: str, metrics: str = "reward", window_s: float = 3600.0, stride: int = 1, start: Optional[float] = None):
+    def runs_metrics(
+        run_ids: str = "",
+        runs: str = "",
+        metrics: str = "reward",
+        window_s: float = 3600.0,
+        stride: int = 1,
+        start: Optional[float] = None,
+    ):
         """Time-series metrics for runs, aggregated from heartbeats."""
-        run_ids = [r.strip() for r in run_ids.split(",") if r.strip()]
+        raw = run_ids or runs
+        run_ids = [r.strip() for r in str(raw).split(",") if r.strip()]
         metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
         stride = max(1, int(stride or 1))
         now = time.time()
@@ -3234,6 +3433,78 @@ if app:
                 },
             }
         return out
+
+    @app.post("/buildlab/runs")
+    def buildlab_runs(req: dict):
+        """Ingest a build run + clip metadata into the Build Lab archive."""
+        if not isinstance(req, dict):
+            raise HTTPException(status_code=400, detail="invalid payload")
+        build_hash = _store_build_run(req)
+        if not build_hash:
+            raise HTTPException(status_code=400, detail="failed to store build run")
+        return {"ok": True, "build_hash": build_hash}
+
+    @app.get("/buildlab/examples")
+    def buildlab_examples(items: str = "", build_hash: str = "", limit: int = 5, verified_only: int = 0):
+        """Return archived example runs for a given item combo."""
+        conn = _build_db()
+        if conn is None:
+            return {"combo_hash": "", "total_runs_indexed": 0, "examples": []}
+        item_list = [s.strip() for s in str(items or "").split(",") if s.strip()]
+        combo_hash = str(build_hash or "") or _build_hash(item_list)
+        if not combo_hash:
+            return {"combo_hash": "", "total_runs_indexed": 0, "examples": []}
+        try:
+            with _build_db_lock:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM build_runs;")
+                total = cur.fetchone()[0] or 0
+                if verified_only:
+                    cur.execute(
+                        """
+                        SELECT run_id, worker_id, timestamp, inventory_snapshot, clip_url, is_verified, match_duration_sec, final_score
+                        FROM build_runs
+                        WHERE build_hash = ? AND is_verified = 1
+                        ORDER BY final_score DESC, timestamp DESC
+                        LIMIT ?;
+                        """,
+                        (combo_hash, int(limit)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT run_id, worker_id, timestamp, inventory_snapshot, clip_url, is_verified, match_duration_sec, final_score
+                        FROM build_runs
+                        WHERE build_hash = ?
+                        ORDER BY final_score DESC, timestamp DESC
+                        LIMIT ?;
+                        """,
+                        (combo_hash, int(limit)),
+                    )
+                rows = cur.fetchall()
+        except Exception:
+            return {"combo_hash": combo_hash, "total_runs_indexed": 0, "examples": []}
+
+        examples = []
+        for row in rows:
+            run_id, worker_id, ts, inv_raw, clip_url, is_verified, match_duration, final_score = row
+            try:
+                inv = json.loads(inv_raw) if inv_raw else None
+            except Exception:
+                inv = None
+            examples.append(
+                {
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "timestamp": ts,
+                    "inventory_snapshot": inv,
+                    "clip_url": clip_url,
+                    "is_verified": bool(is_verified),
+                    "match_duration_sec": match_duration,
+                    "final_score": final_score,
+                }
+            )
+        return {"combo_hash": combo_hash, "total_runs_indexed": total, "examples": examples}
 
     @app.get("/instances/{instance_id}/timeline")
     def instance_timeline(instance_id: str, window: float = 600.0, limit: int = 120):

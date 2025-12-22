@@ -1,55 +1,38 @@
 # Unsolvable Issues (with attempts)
 
-This document captures items from the research-grade UI plan that could not be fully implemented with the current repository state. Each issue includes at least three concrete attempts and the outcome.
+This document captures remaining blockers that could not be fully resolved inside the repo alone. Each issue includes at least three concrete attempts and the outcome.
 
 ---
 
-## 1) End-to-end OpenTelemetry + Sentry correlation (frontend + orchestrator)
+## 1) External OTel/Sentry infra still required (collector + DSN)
 
-**Why blocked:** No OTel/Sentry dependencies or configuration exist in the repo; adding them would require new packages, deployment config, and DSNs that are not present.
+**Why blocked:** The repo now contains optional Sentry/OTel wiring, but end-to-end correlation still depends on external infrastructure (Sentry project/DSN and an OTLP collector endpoint) which cannot be provisioned inside the codebase.
 
 **Attempts**
-1. **Dependency search:** `rg -n "opentelemetry|sentry" src requirements*.txt docs` → no references or packages found.
-2. **Tracing hooks search:** `rg -n "otel|trace|tracing" src` → only internal “reasoning trace” mentions; no actual OTel instrumentation or exporter wiring.
-3. **Config/env search:** `rg -n "SENTRY|sentry" -S .` → no DSN/env vars or config blocks present.
+1. **Dependency wiring:** Added Sentry + OpenTelemetry packages to `requirements.txt` and guarded initialization in `src/orchestrator/main.py` (best-effort, no crash if missing).
+2. **Trace propagation:** Added W3C `traceparent` generation and injection in `src/frontend/src/api.ts` so browser → orchestrator requests carry trace context.
+3. **FastAPI instrumentation:** Added optional `FastAPIInstrumentor` + OTLP exporter configuration in `src/orchestrator/main.py` (activates when `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
 
 **What is needed to unblock**
-- Add dependencies (`opentelemetry-*`, `sentry-sdk`) to `requirements.txt` and frontend package.json.
-- Provide DSN/service endpoints + sampling config in env.
-- Decide on exporter targets (OTLP endpoint, Sentry org/project) and release versioning (git SHA).
+- Real Sentry DSN + project for `SENTRY_DSN`.
+- OTLP collector endpoint reachable by the orchestrator.
+- (Optional) a frontend OTel SDK if you want full browser spans instead of generated traceparent only.
 
 ---
 
-## 2) Context Drawer “Last N frames/keys/actions” flight recorder
+## 2) Build Lab archive ingestion pipeline (automatic)
 
-**Why blocked:** Worker does not store or expose action history or a frame buffer beyond the latest JPEG; no API exists to query per-step input history.
+**Why blocked:** The Build Lab DB + endpoints are in place, but no automated producer is emitting `BuildRun` events with inventory + clip data. Without producers, the archive remains empty unless manually populated.
 
 **Attempts**
-1. **Action history search:** `rg -n "action_history|last_actions|action_seq|inputs" src/worker src/input` → no action buffer or key history found.
-2. **Frame buffer search:** `rg -n "latest_frame|jpeg|frame" src/worker/nvenc_streamer.py` → only on-demand `capture_jpeg()` and latest JPEG cache; no ring buffer of frames.
-3. **Entropy/telemetry integration search:** `rg -n "action_entropy|entropy" src/worker src/learner src/streaming` → entropy exists in learners, but not forwarded to worker heartbeat or API.
+1. **Storage + endpoints:** Implemented SQLite store + `/buildlab/runs` and `/buildlab/examples` in `src/orchestrator/main.py`.
+2. **Best-effort event hook:** Added persistence when events include `build_hash`/`inventory_snapshot` in `emit_event()`.
+3. **UI wiring:** `src/frontend/src/pages/BuildLab.tsx` now queries archived examples and displays clip links when available.
 
 **What is needed to unblock**
-- Implement a ring buffer in worker (recent frames + decoded inputs).
-- Extend worker heartbeat payload or new `/telemetry` endpoint to expose action sequences.
-- Add capture/serialization to avoid blowing up bandwidth.
+- A worker or post-process job to POST build runs (items + clip_url) to `/buildlab/runs`.
+- Or emit `BuildRun` events with `inventory_snapshot` + `clip_url` from the highlight/clip pipeline.
 
 ---
 
-## 3) Build Lab “example runs + clips per combo”
-
-**Why blocked:** Highlights/clip system exists but does not capture inventory combos nor queryable clip metadata; Build Lab currently uses live heartbeats only.
-
-**Attempts**
-1. **Highlight system scan:** `rg -n "highlight|clip" src/orchestrator` → highlight endpoints exist, but no build combo linkage or combo query endpoints.
-2. **Inventory metadata scan:** `rg -n "inventory_items" src/orchestrator src/worker` → inventory is present only in heartbeats; no persistence for historical runs/clips.
-3. **BuildLab UI scan:** checked `src/frontend/src/pages/BuildLab.tsx` → “EXAMPLE RUNS” list only uses currently live workers and does not have clip URLs or historical store.
-
-**What is needed to unblock**
-- Persist build inventories per episode/run (DB or structured artifact store).
-- Attach inventory snapshot metadata to highlight encode requests.
-- Add new backend endpoints `/buildlab/examples?combo=...` returning clip URLs + run metadata.
-
----
-
-If you want, I can draft the storage schema and endpoint contracts for these three items.
+If you want, I can add the worker-side emitter that posts build runs when a clip is encoded.

@@ -184,6 +184,23 @@ export type OverviewIssue = {
   hint?: string | null;
 };
 
+export type BuildLabExample = {
+  run_id: string;
+  worker_id?: string | null;
+  timestamp?: number | null;
+  inventory_snapshot?: any[] | null;
+  clip_url?: string | null;
+  is_verified?: boolean;
+  match_duration_sec?: number | null;
+  final_score?: number | null;
+};
+
+export type BuildLabExamplesResponse = {
+  combo_hash: string;
+  total_runs_indexed: number;
+  examples: BuildLabExample[];
+};
+
 export type Event = {
   event_id: string;
   run_id?: string | null;
@@ -513,8 +530,30 @@ export type PbtMuteState = {
 
 const ORCH = "/api";
 
+const getTraceContext = () => {
+  if (typeof window === "undefined" || !(window.crypto?.getRandomValues)) return null;
+  const g = window as any;
+  if (!g.__MB_TRACE_ID__) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    g.__MB_TRACE_ID__ = Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+  const spanBytes = new Uint8Array(8);
+  window.crypto.getRandomValues(spanBytes);
+  const spanId = Array.from(spanBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const traceId = g.__MB_TRACE_ID__;
+  return { traceparent: `00-${traceId}-${spanId}-01` };
+};
+
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init);
+  const ctx = getTraceContext();
+  const headers = new Headers(init?.headers ?? {});
+  if (ctx && !headers.get("traceparent")) headers.set("traceparent", ctx.traceparent);
+  const r = await fetch(url, { ...init, headers });
   if (!r.ok) {
     throw new Error(`${r.status} ${r.statusText}`);
   }
@@ -598,6 +637,14 @@ export async function fetchInstances() {
 export async function fetchInstanceTimeline(instanceId: string, windowSeconds = 600, limit = 120): Promise<InstanceTimelineResponse> {
   const qs = new URLSearchParams({ window: String(windowSeconds), limit: String(limit) });
   return fetchJson<InstanceTimelineResponse>(`${ORCH}/instances/${encodeURIComponent(instanceId)}/timeline?${qs.toString()}`);
+}
+
+export async function fetchBuildLabExamples(items: string[], limit = 5, verifiedOnly = false): Promise<BuildLabExamplesResponse> {
+  const qs = new URLSearchParams();
+  if (items.length) qs.set("items", items.join(","));
+  qs.set("limit", String(limit));
+  if (verifiedOnly) qs.set("verified_only", "1");
+  return fetchJson<BuildLabExamplesResponse>(`${ORCH}/buildlab/examples?${qs.toString()}`);
 }
 
 export async function fetchEvents(limit = 200): Promise<Event[]> {

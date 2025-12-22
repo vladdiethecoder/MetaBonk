@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import cytoscape, { Core } from "cytoscape";
-import { Heartbeat, fetchWorkers } from "../api";
+import { BuildLabExamplesResponse, Heartbeat, fetchBuildLabExamples, fetchWorkers } from "../api";
 
 type Metric = "lift" | "deltaScore" | "pTop";
 type ViewMode = "web" | "tree";
@@ -737,6 +737,19 @@ export default function BuildLab() {
     return treeData.byKey[selectedTree] ?? null;
   }, [selectedTree, treeData.byKey]);
 
+  const selectedComboItems = useMemo(() => {
+    if (viewMode === "tree" && treeSelectedNode?.items?.length) return treeSelectedNode.items;
+    if (selected) return [selected];
+    return [];
+  }, [viewMode, treeSelectedNode, selected]);
+
+  const examplesQ = useQuery<BuildLabExamplesResponse>({
+    queryKey: ["buildlabExamples", selectedComboItems.join("|")],
+    queryFn: () => fetchBuildLabExamples(selectedComboItems, 6, false),
+    enabled: selectedComboItems.length > 0,
+    refetchInterval: 8000,
+  });
+
   const treeLayout = useMemo(() => {
     return layoutRadialTree(treeData.root, treeSize.w, treeSize.h, Math.min(treeSize.w, treeSize.h) / (maxDepth + 1.8));
   }, [treeData.root, treeSize, maxDepth]);
@@ -1313,7 +1326,27 @@ export default function BuildLab() {
               <div style={{ marginTop: 12 }}>
                 <div className="badge">EXAMPLE RUNS</div>
                 <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
-                  {selectedWorkers.length ? (
+                  {(examplesQ.data?.examples ?? []).length ? (
+                    (examplesQ.data?.examples ?? []).map((ex) => (
+                      <div key={ex.run_id} className="row-between" style={{ gap: 10 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontWeight: 900, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {ex.run_id}
+                          </div>
+                          <div className="muted">{ex.worker_id ?? "archived run"}</div>
+                          {ex.clip_url ? (
+                            <a className="btn btn-ghost btn-compact" href={ex.clip_url} target="_blank" rel="noreferrer">
+                              clip
+                            </a>
+                          ) : null}
+                        </div>
+                        <div style={{ textAlign: "right" }}>
+                          <div className="numeric">{ex.final_score == null ? "—" : fmtNum(ex.final_score, 2)}</div>
+                          <div className="muted">{ex.is_verified ? "verified" : "unverified"}</div>
+                        </div>
+                      </div>
+                    ))
+                  ) : selectedWorkers.length ? (
                     selectedWorkers.map((r) => (
                       <div key={r.iid} className="row-between" style={{ gap: 10 }}>
                         <div style={{ minWidth: 0 }}>
@@ -1327,7 +1360,7 @@ export default function BuildLab() {
                       </div>
                     ))
                   ) : (
-                    <div className="muted">No visible workers currently carrying this node.</div>
+                    <div className="muted">No archived or live examples yet for this combo.</div>
                   )}
                 </div>
               </div>
