@@ -23,9 +23,13 @@ htmlcov/
 .venv/
 .venv-*/
 venv/
+.env
 .env/
 .env.*
 !.env.example
+__pypackages__/
+.direnv/
+.envrc
 
 # === Node / Frontend ===
 node_modules/
@@ -57,10 +61,41 @@ node_modules/
 *.onnx
 *.bin
 *.h5
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.arrow
+*.feather
 /datasets/
 /models/
+
+# === Media / archives (prefer Git LFS) ===
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
 
 # === Project-specific ===
 /megabonk assets/
 /artifacts/
 .aider*
+
+# === Experiment tooling ===
+.ipynb_checkpoints/
+wandb/
+lightning_logs/
+mlruns/
+ray_results/
+events.out.tfevents*
+*.tfevents*
