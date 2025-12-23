@@ -818,14 +818,17 @@ def main() -> int:
     proton_log_dir = out_dir / "logs" / "proton"
     proton_crash_dir = out_dir / "logs" / "proton_crash"
     dotnet_dump_dir = out_dir / "logs" / "dumps"
+    dotnet_trace_dir = out_dir / "logs" / "dotnet"
     proton_log_dir.mkdir(parents=True, exist_ok=True)
     proton_crash_dir.mkdir(parents=True, exist_ok=True)
     dotnet_dump_dir.mkdir(parents=True, exist_ok=True)
+    dotnet_trace_dir.mkdir(parents=True, exist_ok=True)
     env.setdefault("METABONK_PROTON_LOG", "1")
     env.setdefault("METABONK_PROTON_LOG_DIR", str(proton_log_dir))
     env.setdefault("METABONK_PROTON_CRASH_DIR", str(proton_crash_dir))
     env.setdefault("METABONK_WINEDEBUG", "-all,+seh,+tid,+timestamp,+loaddll")
     env.setdefault("METABONK_DOTNET_DUMP_DIR", str(dotnet_dump_dir))
+    env.setdefault("METABONK_DOTNET_TRACE_DIR", str(dotnet_trace_dir))
     gamescope_enabled = _env_truthy(os.environ.get("METABONK_E2E_GAMESCOPE", "1"))
     omega_cmd = [
         sys.executable,

@@ -13,6 +13,7 @@ import Spy from "./pages/Spy";
 import Stream from "./pages/Stream";
 
 const BuildLab = lazy(() => import("./pages/BuildLab"));
+const CCTV3D = lazy(() => import("./pages/CCTV3D"));
 
 export default function App() {
   const loc = useLocation();
@@ -20,6 +21,13 @@ export default function App() {
   // Stream overlay wants a clean fullscreen surface (OBS browser source).
   if (loc.pathname.startsWith("/stream")) {
     return <Stream />;
+  }
+  if (loc.pathname.startsWith("/cctv")) {
+    return (
+      <Suspense fallback={<div className="card">Booting System...</div>}>
+        <CCTV3D />
+      </Suspense>
+    );
   }
   if (loc.pathname === "/") {
     return <NeuroSynaptic />;
@@ -33,6 +41,7 @@ export default function App() {
     { to: "/skills", label: "Skills" },
     { to: "/spy", label: "Spy" },
     { to: "/stream", label: "Stream" },
+    { to: "/cctv", label: "CCTV" },
   ];
   return (
     <div className="app">
@@ -62,6 +71,7 @@ export default function App() {
             <Route path="/skills" element={<Skills />} />
             <Route path="/spy" element={<Spy />} />
             <Route path="/stream" element={<Stream />} />
+            <Route path="/cctv" element={<CCTV3D />} />
           </Routes>
         </Suspense>
       </main>

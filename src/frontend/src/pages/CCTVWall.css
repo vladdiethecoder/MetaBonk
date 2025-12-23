@@ -1,0 +1,77 @@
+.cctv-wall {
+  width: 100vw;
+  height: 100vh;
+  background: radial-gradient(circle at 30% 20%, rgba(10,28,24,0.35), rgba(2,4,6,0.95));
+  color: #e6f7f2;
+  overflow: hidden;
+  font-family: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  position: relative;
+}
+
+.cctv-canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.cctv-hud {
+  position: absolute;
+  left: 40px;
+  bottom: 40px;
+  padding: 16px 20px;
+  border: 1px solid rgba(120,255,200,0.25);
+  background: rgba(4,12,10,0.5);
+  color: #9dffca;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+  font-size: 12px;
+}
+.cctv-hud::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(180deg, rgba(160,255,220,0.08) 0 1px, transparent 1px 3px);
+  opacity: 0.35;
+  pointer-events: none;
+}
+.hud-title {
+  font-size: 15px;
+  margin-bottom: 6px;
+}
+.hud-sub {
+  font-size: 11px;
+  margin-bottom: 10px;
+  color: rgba(157,255,202,0.8);
+}
+.hud-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 4px;
+}
+.hud-label {
+  color: rgba(157,255,202,0.6);
+}
+.hud-value {
+  color: #caffee;
+}
+
+.wall-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle, transparent 60%, rgba(0,0,0,0.8) 100%);
+  z-index: 100;
+}
+
+@keyframes cctvBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (max-width: 1100px) {
+  .cctv-hud {
+    left: 20px;
+    bottom: 20px;
+  }
+}

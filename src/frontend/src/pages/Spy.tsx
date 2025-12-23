@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
-import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
 import AutoSizer from "react-virtualized-auto-sizer";
 import {
   buildDreamPolicy,
@@ -44,31 +44,36 @@ function Swarm3D({ workers }: { workers: any[] }) {
 
   const instRef = useRef<THREE.InstancedMesh | null>(null);
 
-  useFrame(() => {
-    const inst = instRef.current;
-    if (!inst) return;
-    const dummy = new THREE.Object3D();
-    boids.current.forEach((b, i) => {
-      b.pos.add(b.vel);
-      ["x", "y", "z"].forEach((axis) => {
-        const limit = axis === "x" ? 1.4 : 0.8;
-        if ((b.pos as any)[axis] > limit || (b.pos as any)[axis] < -limit) (b.vel as any)[axis] *= -1;
+  const SwarmField = () => {
+    useFrame(() => {
+      const inst = instRef.current;
+      if (!inst) return;
+      const dummy = new THREE.Object3D();
+      boids.current.forEach((b, i) => {
+        b.pos.add(b.vel);
+        ["x", "y", "z"].forEach((axis) => {
+          const limit = axis === "x" ? 1.4 : 0.8;
+          if ((b.pos as any)[axis] > limit || (b.pos as any)[axis] < -limit) (b.vel as any)[axis] *= -1;
+        });
+        dummy.position.copy(b.pos);
+        dummy.rotation.set(0, 0, Math.atan2(b.vel.y, b.vel.x));
+        dummy.updateMatrix();
+        inst.setMatrixAt(i, dummy.matrix);
       });
-      dummy.position.copy(b.pos);
-      dummy.rotation.set(0, 0, Math.atan2(b.vel.y, b.vel.x));
-      dummy.updateMatrix();
-      inst.setMatrixAt(i, dummy.matrix);
+      inst.instanceMatrix.needsUpdate = true;
     });
-    inst.instanceMatrix.needsUpdate = true;
-  });
-
-  return (
-    <Canvas className="swarm-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4.2], fov: 50 }}>
-      <ambientLight intensity={0.6} />
+    return (
       <instancedMesh ref={instRef} args={[undefined, undefined, boids.current.length]}>
         <coneGeometry args={[0.08, 0.22, 6]} />
         <meshStandardMaterial color="#7bffe6" />
       </instancedMesh>
+    );
+  };
+
+  return (
+    <Canvas className="swarm-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4.2], fov: 50 }}>
+      <ambientLight intensity={0.6} />
+      <SwarmField />
       <mesh>
         <planeGeometry args={[3.6, 1.8]} />
         <meshBasicMaterial color="#040608" transparent opacity={0.4} />
@@ -86,14 +91,30 @@ function PipelineFactory3D({
 }) {
   const heat = demoCount > 0 ? Math.max(0, Math.min(1, 1 - labeledCount / demoCount)) : 0.3;
   const spheres = useRef<THREE.Mesh[]>([]);
-
-  useFrame((state) => {
-    const t = state.clock.getElapsedTime();
-    spheres.current.forEach((s, i) => {
-      s.position.x = -1.4 + ((t * 0.6 + i * 0.2) % 2.8);
-      s.position.y = Math.sin(t * 1.2 + i) * 0.15;
+  const FlowParticles = () => {
+    useFrame((state) => {
+      const t = state.clock.getElapsedTime();
+      spheres.current.forEach((s, i) => {
+        s.position.x = -1.4 + ((t * 0.6 + i * 0.2) % 2.8);
+        s.position.y = Math.sin(t * 1.2 + i) * 0.15;
+      });
     });
-  });
+    return (
+      <>
+        {Array.from({ length: 10 }).map((_, i) => (
+          <mesh
+            key={`p-${i}`}
+            ref={(el) => {
+              if (el) spheres.current[i] = el;
+            }}
+          >
+            <sphereGeometry args={[0.06, 16, 16]} />
+            <meshStandardMaterial color={heat > 0.5 ? "#ff8b5a" : "#5df1da"} emissive="#ffb07a" emissiveIntensity={0.4} />
+          </mesh>
+        ))}
+      </>
+    );
+  };
 
   return (
     <Canvas className="pipeline-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4], fov: 50 }}>
@@ -102,17 +123,7 @@ function PipelineFactory3D({
         <torusGeometry args={[1.25, 0.06, 12, 100]} />
         <meshBasicMaterial color={heat > 0.6 ? "#ff8b5a" : "#7bffe6"} transparent opacity={0.6} />
       </mesh>
-      {Array.from({ length: 10 }).map((_, i) => (
-        <mesh
-          key={`p-${i}`}
-          ref={(el) => {
-            if (el) spheres.current[i] = el;
-          }}
-        >
-          <sphereGeometry args={[0.06, 16, 16]} />
-          <meshStandardMaterial color={heat > 0.5 ? "#ff8b5a" : "#5df1da"} emissive="#ffb07a" emissiveIntensity={0.4} />
-        </mesh>
-      ))}
+      <FlowParticles />
     </Canvas>
   );
 }
@@ -728,9 +739,9 @@ export default function Spy() {
         <div className="events" style={{ height: 360 }}>
           <AutoSizer>
             {({ height, width }) => (
-              <List height={height} width={width} itemCount={events.length || 1} itemSize={32}>
+              <VirtualList height={height} width={width} itemCount={events.length || 1} itemSize={32}>
                 {EventRow}
-              </List>
+              </VirtualList>
             )}
           </AutoSizer>
         </div>

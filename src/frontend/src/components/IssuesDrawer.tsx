@@ -21,6 +21,12 @@ export default function IssuesDrawer({ open, onClose }: Props) {
     mutationFn: ({ id, muted }: { id: string; muted: boolean }) => muteIssue(id, muted),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["overviewIssues"] }),
   });
+  const formatEvidenceUrl = (url: string) => {
+    if (!url) return url;
+    if (url.startsWith("/api")) return url;
+    if (url.startsWith("/")) return `/api${url}`;
+    return url;
+  };
 
   return (
     <>
@@ -53,7 +59,7 @@ export default function IssuesDrawer({ open, onClose }: Props) {
                 {issue.evidence?.length ? (
                   <div className="issue-evidence">
                     {issue.evidence.slice(0, 3).map((ev) => (
-                      <a key={ev.url} className="chip chip-compact" href={ev.url} target="_blank" rel="noreferrer">
+                      <a key={ev.url} className="chip chip-compact" href={formatEvidenceUrl(ev.url)} target="_blank" rel="noreferrer">
                         {ev.label ?? ev.kind}
                       </a>
                     ))}

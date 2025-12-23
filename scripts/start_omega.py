@@ -493,6 +493,12 @@ def main() -> int:
             "yes",
             "on",
         )
+        disable_bonklink = str(env.get("METABONK_DISABLE_BONKLINK", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         src = Path(args.game_dir).expanduser().resolve()
         exe = src / "Megabonk.exe"
         if not exe.exists():
@@ -563,6 +569,61 @@ def main() -> int:
             except Exception:
                 pass
 
+        def _set_ini_value(cfg_path: Path, section: str, key: str, value: str) -> None:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if not cfg_path.exists():
+                    cfg_path.write_text(f"[{section}]\n{key} = {value}\n")
+                    return
+                lines = cfg_path.read_text().splitlines(keepends=True)
+            except Exception:
+                return
+
+            target_section = section.strip().lower()
+            target_key = key.strip().lower()
+            current_section = None
+            section_header_idx = None
+            key_idx = None
+
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    current_section = stripped[1:-1].strip().lower()
+                    if current_section == target_section:
+                        section_header_idx = i
+                    continue
+                if current_section != target_section:
+                    continue
+                if not stripped or stripped.startswith(";"):
+                    continue
+                if "=" not in line:
+                    continue
+                if stripped.split("=", 1)[0].strip().lower() == target_key:
+                    key_idx = i
+                    break
+
+            if key_idx is not None:
+                newline = "\n" if lines[key_idx].endswith("\n") else ""
+                lines[key_idx] = f"{key} = {value}{newline}"
+            elif section_header_idx is not None:
+                insert_at = section_header_idx + 1
+                lines.insert(insert_at, f"{key} = {value}\n")
+            else:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] = lines[-1] + "\n"
+                lines.append(f"[{section}]\n{key} = {value}\n")
+            try:
+                cfg_path.write_text("".join(lines))
+            except Exception:
+                pass
+
+        def _maybe_patch_bepinex_logging(cfg_path: Path) -> None:
+            raw = str(env.get("METABONK_BEPINEX_UNITY_LOG_LISTENING", "") or "").strip()
+            if not raw:
+                return
+            enabled = raw.lower() in ("1", "true", "yes", "on")
+            _set_ini_value(cfg_path, "Logging", "UnityLogListening", "true" if enabled else "false")
+
         for i in range(n):
             iid = f"{args.instance_prefix}-{i}"
             inst = inst_root / iid
@@ -597,17 +658,31 @@ def main() -> int:
             except Exception as e:
                 print(f"[start_omega] WARN: failed to prepare BepInEx for {iid}: {e}")
                 continue
-            # Configure BonkLink per instance.
-            cfg_dir = inst / "BepInEx" / "config"
-            _write_bonklink_cfg(
-                cfg_dir / "com.metabonk.bonklink.cfg",
-                args.bonklink_base_port + i,
-            )
-            # Legacy filename for older installs/scripts.
-            _write_bonklink_cfg(
-                cfg_dir / "BonkLink.BonkLinkPlugin.cfg",
-                args.bonklink_base_port + i,
-            )
+            _maybe_patch_bepinex_logging(inst / "BepInEx" / "config" / "BepInEx.cfg")
+            # Configure BonkLink per instance unless disabled.
+            if disable_bonklink:
+                try:
+                    plugins_root = inst / "BepInEx" / "plugins"
+                    candidates = [
+                        plugins_root / "BonkLink.dll",
+                        plugins_root / "BonkLink" / "BonkLink.dll",
+                    ]
+                    for plugin_dll in candidates:
+                        if plugin_dll.exists():
+                            plugin_dll.rename(plugin_dll.with_suffix(".dll.bak"))
+                except Exception:
+                    pass
+            else:
+                cfg_dir = inst / "BepInEx" / "config"
+                _write_bonklink_cfg(
+                    cfg_dir / "com.metabonk.bonklink.cfg",
+                    args.bonklink_base_port + i,
+                )
+                # Legacy filename for older installs/scripts.
+                _write_bonklink_cfg(
+                    cfg_dir / "BonkLink.BonkLinkPlugin.cfg",
+                    args.bonklink_base_port + i,
+                )
 
         # Auto-generate a launcher template if the caller didn't provide one.
         existing_tmpl = str(env.get("MEGABONK_CMD_TEMPLATE") or "")
@@ -744,6 +819,13 @@ def main() -> int:
             "export DOTNET_DbgEnableMiniDump=1; "
             "export DOTNET_DbgMiniDumpType=2; "
             "export DOTNET_DbgMiniDumpName=\\\"$METABONK_DOTNET_DUMP_DIR/${IID}_%d.dmp\\\"; "
+            "export DOTNET_CreateDumpDiagnostics=1; "
+            "export DOTNET_CreateDumpVerboseDiagnostics=1; "
+            "export DOTNET_CreateDumpLogToFile=\\\"$METABONK_DOTNET_DUMP_DIR/${IID}_createdump.log\\\"; "
+            "fi; "
+            "if [ -n \\\"${METABONK_DOTNET_TRACE_DIR:-}\\\" ]; then "
+            "export COREHOST_TRACE=1; "
+            "export COREHOST_TRACEFILE=\\\"$METABONK_DOTNET_TRACE_DIR/${IID}_corehost.txt\\\"; "
             "fi; "
             f"export STEAM_COMPAT_CLIENT_INSTALL_PATH=\\\"{str(Path(args.steam_root).expanduser())}\\\"; "
             "export STEAM_COMPAT_DATA_PATH=\\\"$COMPAT\\\"; "

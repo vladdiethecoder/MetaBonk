@@ -3,7 +3,7 @@ import { useMemo, useRef, useEffect, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { EffectComposer, Bloom, Scanline } from "@react-three/postprocessing";
 import * as THREE from "three";
-import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
 import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
 import { useEventStream } from "../hooks";
@@ -232,7 +232,8 @@ export default function Overview() {
           status: hb.status ?? "—",
           streamError: hb.stream_error ?? hb.streamer_last_error ?? "",
           streamBackend: hb.stream_backend ?? "",
-          pipewireOk: hb.pipewire_node_ok,
+          pipewireOk: hb.pipewire_ok ?? hb.pipewire_node_ok,
+          pipewireSessionOk: hb.pipewire_session_ok,
           runId: hb.run_id ?? null,
         };
       })
@@ -674,9 +675,9 @@ export default function Overview() {
         <div className="events" style={{ marginTop: 10, height: 360 }}>
           <AutoSizer>
             {({ height, width }) => (
-              <List height={height} width={width} itemCount={filtered.length || 1} itemSize={32}>
+              <VirtualList height={height} width={width} itemCount={filtered.length || 1} itemSize={32}>
                 {EventRow}
-              </List>
+              </VirtualList>
             )}
           </AutoSizer>
         </div>

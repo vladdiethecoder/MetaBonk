@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { type SyntheticEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { EffectComposer, Bloom, Scanline, ChromaticAberration, Glitch } from "@react-three/postprocessing";
 import { BlendFunction, GlitchMode } from "postprocessing";
@@ -23,6 +24,7 @@ import { iconIndex, iconVariantClass, type IconKey, type IconVariant } from "../
 import { PROGRESS_GOALS, type GoalTier, type ProgressGoal } from "../lib/megabonk_progress";
 import { UI_TOKENS } from "../lib/ui_tokens";
 import { timeAgo } from "../lib/format";
+import MseMp4Video from "../components/MseMp4Video";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
@@ -46,447 +48,6 @@ const hashString = (input: string) => {
   }
   return h >>> 0;
 };
-
-function findAvc1Codec(init: Uint8Array): string | null {
-  // Minimal MP4 sniff: find "avcC" and parse AVCProfileIndication/profile_compatibility/AVCLevelIndication.
-  // avcC box layout: size(4) type(4) configurationVersion(1) profile(1) compat(1) level(1) ...
-  const needle = [0x61, 0x76, 0x63, 0x43]; // "avcC"
-  for (let i = 0; i < init.length - 16; i++) {
-    if (init[i] !== needle[0]) continue;
-    if (init[i + 1] !== needle[1] || init[i + 2] !== needle[2] || init[i + 3] !== needle[3]) continue;
-    const base = i + 4;
-    const configurationVersion = init[base];
-    if (configurationVersion !== 1) continue;
-    const profile = init[base + 1];
-    const compat = init[base + 2];
-    const level = init[base + 3];
-    const hex = (n: number) => n.toString(16).padStart(2, "0").toUpperCase();
-    return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
-  }
-  return null;
-}
-
-type Mp4Box = { type: string; data: Uint8Array };
-
-function _u32be(b: Uint8Array, o: number) {
-  return ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
-}
-
-function _ascii4(b: Uint8Array, o: number) {
-  return String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
-}
-
-function tryParseMp4Box(buf: Uint8Array): { box: Mp4Box; rest: Uint8Array } | null {
-  // Minimal MP4 box parser (big-endian size + 4-char type). Supports 64-bit size.
-  if (buf.length < 8) return null;
-  const size32 = _u32be(buf, 0);
-  const type = _ascii4(buf, 4);
-  let header = 8;
-  let size = size32;
-  if (size32 === 1) {
-    if (buf.length < 16) return null;
-    const hi = _u32be(buf, 8);
-    const lo = _u32be(buf, 12);
-    // JS can't safely represent >2^53; but fMP4 fragments here are small.
-    size = hi * 2 ** 32 + lo;
-    header = 16;
-  } else if (size32 === 0) {
-    // "extends to EOF" isn't meaningful for live streaming; treat as incomplete.
-    return null;
-  }
-  if (!Number.isFinite(size) || size < header) return null;
-  if (buf.length < size) return null;
-  const data = buf.slice(0, size);
-  const rest = buf.slice(size);
-  return { box: { type, data }, rest };
-}
-
-function concatParts(parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((a, p) => a + p.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
-}
-
-function MseMp4Video({
-  url,
-  className,
-  fallbackUrl,
-  exclusiveKey,
-  onVideoReady,
-}: {
-  url: string;
-  className?: string;
-  fallbackUrl?: string;
-  exclusiveKey?: string;
-  onVideoReady?: (el: HTMLVideoElement | null) => void;
-}) {
-  const ref = useRef<HTMLVideoElement | null>(null);
-  const [status, setStatus] = useState<"loading" | "playing" | "error">("loading");
-  const [errMsg, setErrMsg] = useState<string>("");
-  const [stillTick, setStillTick] = useState(0);
-  const [stillOk, setStillOk] = useState(false);
-  const [usingSnapshot, setUsingSnapshot] = useState(false);
-  const [overlayOn, setOverlayOn] = useState(true);
-  const [retryTick, setRetryTick] = useState(0);
-
-  useEffect(() => {
-    if (!onVideoReady) return;
-    const el = ref.current;
-    onVideoReady(el);
-    return () => onVideoReady(null);
-  }, [onVideoReady]);
-
-  // Prevent multiple simultaneous /stream.mp4 connections to the same worker.
-  // The worker stream endpoint is intentionally single-client by default to
-  // avoid PipeWire buffer starvation and fragmented MP4 corruption.
-  // The Stream UI can show the focused agent both in the main view and in the
-  // mosaic, so we need a per-instance lock to avoid self-contention.
-  // If lock acquisition fails, we fall back to snapshot mode for that tile.
-  const STREAM_LOCKS = (globalThis as any).__METABONK_STREAM_LOCKS__ as Map<string, number> | undefined;
-  const LOCKS: Map<string, number> =
-    STREAM_LOCKS ??
-    (() => {
-      const m = new Map<string, number>();
-      (globalThis as any).__METABONK_STREAM_LOCKS__ = m;
-      return m;
-    })();
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || !url) return;
-    if (onVideoReady) onVideoReady(el);
-    setStatus("loading");
-    setErrMsg("");
-    setStillOk(false);
-    setUsingSnapshot(false);
-    const MediaSourceImpl = (window as any).MediaSource as typeof MediaSource | undefined;
-    if (!MediaSourceImpl) {
-      el.src = url;
-      return;
-    }
-
-    const lockKey = String(exclusiveKey || "").trim();
-    let lockToken: number | null = null;
-    if (lockKey) {
-      if (LOCKS.has(lockKey)) {
-        // Another tile is already streaming this worker; use snapshots here.
-        setErrMsg("stream already in use by another tile");
-        setStatus("error");
-        try {
-          el.removeAttribute("src");
-          el.load();
-        } catch {}
-        return;
-      }
-      lockToken = Date.now() + Math.floor(Math.random() * 100000);
-      LOCKS.set(lockKey, lockToken);
-    }
-
-    const ms = new MediaSourceImpl();
-    const objUrl = URL.createObjectURL(ms);
-    el.src = objUrl;
-    el.muted = true;
-    el.playsInline = true;
-    el.autoplay = true;
-    el.preload = "auto";
-
-    const ac = new AbortController();
-    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-    let sb: SourceBuffer | null = null;
-    let queue: Uint8Array[] = [];
-    let started = false;
-    let initBuf = new Uint8Array(0);
-    let ended = false;
-
-    const cleanup = () => {
-      try {
-        ac.abort();
-      } catch {}
-      try {
-        if (reader) reader.cancel().catch(() => {});
-      } catch {}
-      try {
-        if (!ended && ms.readyState === "open") ms.endOfStream();
-      } catch {}
-      ended = true;
-      if (lockKey && lockToken != null) {
-        try {
-          if (LOCKS.get(lockKey) === lockToken) LOCKS.delete(lockKey);
-        } catch {}
-      }
-      try {
-        URL.revokeObjectURL(objUrl);
-      } catch {}
-    };
-
-    const fallbackToSnapshot = (msg?: string) => {
-      if (msg) setErrMsg(msg);
-      setStatus("error");
-      cleanup();
-      try {
-        el.removeAttribute("src");
-        el.load();
-      } catch {
-        // ignore
-      }
-    };
-
-    const pump = () => {
-      if (!sb || sb.updating) return;
-      const next = queue.shift();
-      if (!next) return;
-      try {
-        sb.appendBuffer(next);
-      } catch {
-        queue = [];
-        fallbackToSnapshot("appendBuffer failed (bad segment boundary or buffer error)");
-      }
-    };
-
-    const trim = () => {
-      if (!sb || sb.updating) return;
-      try {
-        const t = el.currentTime;
-        if (t > 15) sb.remove(0, t - 10);
-      } catch {
-        // ignore
-      }
-    };
-
-    const onOpen = async () => {
-      try {
-        // Stream endpoint allows only one client per worker by default to avoid PipeWire buffer starvation.
-        // If we're racing a warm-up probe (or another viewer), retry a few times on 429.
-        let r: Response | null = null;
-        for (let attempt = 0; attempt < 8; attempt++) {
-          r = await fetch(url, { signal: ac.signal, cache: "no-store" });
-          if (r.status !== 429) break;
-          try {
-            await new Promise((res) => setTimeout(res, 350));
-          } catch {
-            break;
-          }
-        }
-        if (!r || !r.ok || !r.body) throw new Error(`stream fetch failed: ${r?.status ?? "no-response"}`);
-        reader = r.body.getReader();
-
-        // MSE is picky: it wants complete "init segment" then complete "media segments".
-        // Fetch returns arbitrary chunk boundaries, so we re-chunk into MP4 box-aligned segments:
-        // - init: ftyp+moov (and friends)
-        // - media: styp? + moof + mdat (one segment per moof/mdat pair)
-        let mp4Buf = new Uint8Array(0);
-        let initParts: Uint8Array[] = [];
-        let initReady = false;
-        let segParts: Uint8Array[] = [];
-        let sawMoof = false;
-
-        const feedBytes = (value: Uint8Array) => {
-          const merged = new Uint8Array(mp4Buf.length + value.length);
-          merged.set(mp4Buf, 0);
-          merged.set(value, mp4Buf.length);
-          mp4Buf = merged;
-
-          while (true) {
-            const parsed = tryParseMp4Box(mp4Buf);
-            if (!parsed) break;
-            const { box, rest } = parsed;
-            mp4Buf = rest;
-
-            if (!initReady) {
-              initParts.push(box.data);
-              if (box.type === "moov") {
-                const initSeg = concatParts(initParts);
-                const sniffed = findAvc1Codec(initSeg);
-                const codecCandidates = sniffed
-                  ? [sniffed]
-                  : [
-                      // Conservative H.264 fallbacks for fMP4 streams when avcC sniffing fails.
-                      // Chrome/Firefox generally accept one of these for NVENC outputs.
-                      "avc1.42E01E", // baseline
-                      "avc1.4D401E", // main
-                      "avc1.64001E", // high
-                    ];
-                let picked: string | null = null;
-                for (const c of codecCandidates) {
-                  const mime = `video/mp4; codecs="${c}"`;
-                  try {
-                    if ((MediaSourceImpl as any).isTypeSupported(mime)) {
-                      picked = c;
-                      break;
-                    }
-                  } catch {
-                    // ignore
-                  }
-                }
-                if (!picked) {
-                  fallbackToSnapshot(`MSE codec unsupported (sniffed=${sniffed ?? "none"})`);
-                  return;
-                }
-                sb = ms.addSourceBuffer(`video/mp4; codecs="${picked}"`);
-                sb.mode = "segments";
-                sb.addEventListener("updateend", () => {
-                  pump();
-                  trim();
-                });
-                queue.push(initSeg);
-                initParts = [];
-                initReady = true;
-                started = true;
-                pump();
-              }
-              continue;
-            }
-
-            // Media segmentation: include styp/moof/mdat (and any small boxes between),
-            // but only flush after we have moof+mdat.
-            if (!segParts.length) {
-              if (box.type === "styp" || box.type === "moof") {
-                segParts.push(box.data);
-                sawMoof = box.type === "moof";
-              }
-              continue;
-            }
-            segParts.push(box.data);
-            if (box.type === "moof") sawMoof = true;
-            if (box.type === "mdat" && sawMoof) {
-              queue.push(concatParts(segParts));
-              segParts = [];
-              sawMoof = false;
-              pump();
-            }
-          }
-        };
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (!value || !value.length) continue;
-          feedBytes(value);
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e ?? "stream error");
-        setErrMsg(msg);
-        setStatus("error");
-        fallbackToSnapshot(msg);
-      } finally {
-        try {
-          if (!ended && ms.readyState === "open") ms.endOfStream();
-        } catch {}
-        ended = true;
-      }
-    };
-
-    ms.addEventListener("sourceopen", onOpen, { once: true });
-    el.play().catch(() => {});
-    return cleanup;
-  }, [url, exclusiveKey, retryTick]);
-
-  useEffect(() => {
-    if (!fallbackUrl) return;
-    // Only poll snapshots after we know video isn't playing.
-    // Polling while loading can create unnecessary PipeWire/GStreamer churn.
-    if (status !== "error") return;
-    const id = window.setInterval(() => setStillTick((t) => (t + 1) % 10_000), 1500);
-    return () => window.clearInterval(id);
-  }, [fallbackUrl, status]);
-
-  useEffect(() => {
-    // Auto-retry video when it drops into snapshot mode.
-    // This keeps the UI resilient to transient PipeWire/encoder hiccups.
-    if (status !== "error") return;
-    if (errMsg.includes("stream already in use")) return;
-    const id = window.setTimeout(() => setRetryTick((t) => (t + 1) % 10_000), 3500);
-    return () => window.clearTimeout(id);
-  }, [status, errMsg]);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const onPlaying = () => setStatus("playing");
-    const onError = () => {
-      setStatus("error");
-      try {
-        const me = (el as any).error;
-        if (me && typeof me.code === "number") setErrMsg(`media error (code ${me.code})`);
-      } catch {}
-    };
-    const onTime = () => {
-      // Some browsers/devtools combos don't reliably fire "playing" for MSE streams.
-      // Treat time progress as "playing".
-      try {
-        if (!el.paused && Number.isFinite(el.currentTime) && el.currentTime > 0) setStatus("playing");
-      } catch {}
-    };
-    el.addEventListener("playing", onPlaying);
-    el.addEventListener("error", onError);
-    el.addEventListener("timeupdate", onTime);
-    return () => {
-      el.removeEventListener("playing", onPlaying);
-      el.removeEventListener("error", onError);
-      el.removeEventListener("timeupdate", onTime);
-    };
-  }, []);
-
-  const showOverlayRaw = status !== "playing" && !(fallbackUrl && stillOk);
-
-  useEffect(() => {
-    const delay = showOverlayRaw ? 450 : 260;
-    const id = window.setTimeout(() => setOverlayOn(showOverlayRaw), delay);
-    return () => window.clearTimeout(id);
-  }, [showOverlayRaw]);
-
-  useEffect(() => {
-    if (!fallbackUrl) {
-      setUsingSnapshot(false);
-      return;
-    }
-    setUsingSnapshot(status !== "playing" && Boolean(stillOk));
-  }, [fallbackUrl, status, stillOk]);
-
-  return (
-    <div className="mse-wrap">
-      {fallbackUrl ? (
-        <img
-          className={className}
-          src={`${fallbackUrl}${fallbackUrl.includes("?") ? "&" : "?"}t=${stillTick}`}
-          style={{ display: usingSnapshot ? "block" : "none" }}
-          alt="latest frame"
-          onLoad={() => setStillOk(true)}
-          onError={() => setStillOk(false)}
-        />
-      ) : null}
-      <video ref={ref} className={className} muted playsInline autoPlay />
-      {overlayOn ? (
-        <div className="mse-overlay">
-          <div className="mse-overlay-inner">
-            <div className="mse-overlay-title">{status === "error" ? "SIGNAL LOST" : "NO KEYFRAME"}</div>
-            <div className="mse-overlay-sub muted">{status === "error" ? "reconnecting…" : "syncing…"}
-            </div>
-            {DEBUG_ON && status === "error" ? (
-              <div className="mse-overlay-debug muted">
-                {errMsg || "media decode error"}{" "}
-                <span className="muted">(try `METABONK_STREAM_CODEC=h264` or check worker CORS)</span>
-              </div>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-      {DEBUG_ON && usingSnapshot ? (
-        <div className="mse-overlay" style={{ pointerEvents: "none", opacity: 0.65 }}>
-          <div className="mse-overlay-inner">
-            <div className="mse-overlay-title">SNAPSHOT</div>
-            <div className="mse-overlay-sub muted">video not playing; using /frame.jpg</div>
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 function CurvedScreen({
   texture,
@@ -519,7 +80,11 @@ function CurvedScreen({
 
   return (
     <mesh geometry={geom}>
-      <meshBasicMaterial map={texture ?? undefined} toneMapped={false} />
+      {texture ? (
+        <meshStandardMaterial map={texture} emissive="#ffffff" emissiveMap={texture} emissiveIntensity={1.25} toneMapped={false} />
+      ) : (
+        <meshStandardMaterial emissive="#220000" emissiveIntensity={0.4} toneMapped={false} />
+      )}
     </mesh>
   );
 }
@@ -566,9 +131,13 @@ function HoloStreamCanvas({
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: true }}
       camera={{ position: [0, 0, 2.2], fov: 45 }}
+      onCreated={({ gl }) => {
+        gl.outputColorSpace = THREE.SRGBColorSpace;
+      }}
     >
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.6} />
+      <pointLight position={[0.5, 0.4, 1.8]} intensity={0.35} color="#7ffff0" />
       <group>
         <CurvedScreen texture={texture} />
         <mesh position={[0, 0, 0.01]}>
@@ -1140,6 +709,7 @@ function StreamTile({
             fallbackUrl={frameUrl || undefined}
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
             onVideoReady={focused ? setVideoEl : undefined}
+            debug={DEBUG_ON}
           />
         ) : null}
         {noFeed ? (
@@ -1615,8 +1185,9 @@ export default function Stream() {
   const [directorId, setDirectorId] = useState<string | null>(null);
   const [directorUntil, setDirectorUntil] = useState(0);
   const directorLastSwitchRef = useRef(0);
+  const loc = useLocation();
   const [layoutMode, setLayoutMode] = useState<"broadcast" | "dense">("broadcast");
-  const qs = useMemo(() => new URLSearchParams(window.location.search), []);
+  const qs = useMemo(() => new URLSearchParams(loc.search), [loc.search]);
   const debugParamOn = useMemo(() => qs.get("debug") === "1", [qs]);
   const safeOn = useMemo(() => {
     const safe = qs.get("safe") === "1";
@@ -1646,7 +1217,6 @@ export default function Stream() {
       setLowVision(false);
     }
   }, [qs]);
-
   const setQueryParams = useCallback((patch: Record<string, string | null>) => {
     const next = new URLSearchParams(window.location.search);
     for (const [k, v] of Object.entries(patch)) {
@@ -2061,6 +1631,8 @@ export default function Stream() {
         TOME: { label: "TOME+", icon: "tome_mastery", priority: 50 },
         EUREKA: { label: "TOME+", icon: "tome_mastery", priority: 50 },
         CLUTCH: { label: "CLUTCH", icon: "moment", priority: 45 },
+        DISASTER: { label: "DISASTER", icon: "warning", priority: 60 },
+        WEIRDBUILD: { label: "WEIRD BUILD", icon: "loot_chest", priority: 45 },
         SKIP: { label: "SKIP", icon: "time", priority: 40 },
       };
       const key = map[upper] ? upper : upper.includes("OVERTAKE") ? "OVERTAKE" : upper.includes("BOSS") ? "BOSS" : "";
@@ -2111,13 +1683,20 @@ export default function Stream() {
     } else if (et === "LootDrop" || et === "BountyClaimed") {
       setInvertUntil(now + 160);
       setPop({ text: "LOOT!", until: now + 900 });
+    } else if (et === "WeirdBuild") {
+      setInvertUntil(now + 220);
+      setPop({ text: "WEIRD BUILD!", until: now + 1100 });
+    } else if (et === "Disaster") {
+      setShakeUntil(now + 520);
+      setLinesUntil(now + 620);
+      setPop({ text: "DISASTER!", until: now + 1200 });
     } else if (et === "EpisodeEnd") {
       setShakeUntil(now + 360);
     }
 
     // Director: chase interesting moments (without stealing manual focus).
     if (!focusId && directorOn && iid) {
-      const chase = new Set(["Overcrit", "NewMaxHit", "LootDrop", "BountyClaimed", "Eureka", "OverrunStart", "ChatSpike", "Heal"]);
+      const chase = new Set(["Overcrit", "NewMaxHit", "LootDrop", "BountyClaimed", "Eureka", "OverrunStart", "ChatSpike", "Heal", "Disaster", "WeirdBuild", "Clutch"]);
       if (chase.has(et)) {
         applyDirectorCut(iid, 8000);
       }
@@ -2125,7 +1704,7 @@ export default function Stream() {
 
     // Moment card: short “what just happened” broadcast cue.
     if (iid && et && et !== "Telemetry") {
-      const show = new Set(["Overcrit", "NewMaxHit", "LootDrop", "BountyClaimed", "Eureka", "OverrunStart"]);
+      const show = new Set(["Overcrit", "NewMaxHit", "LootDrop", "BountyClaimed", "Eureka", "OverrunStart", "Disaster", "WeirdBuild", "Clutch"]);
       if (show.has(et)) {
         const cur = workersByIdRef.current[iid];
         const name = (cur?.display_name ?? iid) as string;
@@ -2362,7 +1941,7 @@ export default function Stream() {
           ) : null}
           <div className={`stream-root layout-${layoutMode} ${lowVision ? "vision-on" : ""}`}>
             <div className="stream-layout">
-              <div className="stream-top">
+                <div className="stream-top">
                 <div>
                   <div className="stream-title">MetaBonk • Spectator Cam</div>
                   <div className="muted" style={{ marginTop: 2 }}>

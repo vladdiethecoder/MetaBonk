@@ -178,6 +178,10 @@ export type OverviewHealth = {
     stale: number;
     missing: number;
     p95_frame_age_s?: number | null;
+    no_keyframe?: number | null;
+    pipewire_missing?: number | null;
+    session_missing?: number | null;
+    p95_keyframe_age_s?: number | null;
   };
 };
 

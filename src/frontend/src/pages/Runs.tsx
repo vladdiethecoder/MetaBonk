@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState, useRef, useEffect } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
-import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
 import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
@@ -10,21 +10,26 @@ import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
 import { useLocation, useNavigate } from "react-router-dom";
 
 function RunsCoreViz() {
-  const ref = useRef<THREE.Mesh | null>(null);
-  useFrame((state) => {
-    if (!ref.current) return;
-    const t = state.clock.getElapsedTime();
-    ref.current.rotation.x = t * 0.25;
-    ref.current.rotation.y = t * 0.35;
-  });
-  return (
-    <Canvas className="runs-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
-      <color attach="background" args={["#020405"]} />
-      <ambientLight intensity={0.8} />
+  const CoreMesh = () => {
+    const ref = useRef<THREE.Mesh | null>(null);
+    useFrame((state) => {
+      if (!ref.current) return;
+      const t = state.clock.getElapsedTime();
+      ref.current.rotation.x = t * 0.25;
+      ref.current.rotation.y = t * 0.35;
+    });
+    return (
       <mesh ref={ref}>
         <dodecahedronGeometry args={[1, 0]} />
         <meshBasicMaterial wireframe color="#7bffe6" transparent opacity={0.45} />
       </mesh>
+    );
+  };
+  return (
+    <Canvas className="runs-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.8} />
+      <CoreMesh />
     </Canvas>
   );
 }
@@ -291,9 +296,9 @@ export default function Runs() {
           {filtered.length ? (
             <AutoSizer>
               {({ height, width }) => (
-                <List height={height} width={width} itemCount={filtered.length} itemSize={42}>
+                <VirtualList height={height} width={width} itemCount={filtered.length} itemSize={42}>
                   {RunRow}
-                </List>
+                </VirtualList>
               )}
             </AutoSizer>
           ) : (

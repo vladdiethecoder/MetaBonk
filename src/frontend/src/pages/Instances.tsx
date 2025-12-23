@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
-import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
 import AutoSizer from "react-virtualized-auto-sizer";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
@@ -14,21 +14,26 @@ import { clamp01, copyToClipboard, fmtFixed, fmtNum, fmtPct01, timeAgo } from ".
 import { HEARTBEAT_SCHEMA_VERSION, schemaMismatchLabel } from "../lib/schema";
 
 function InstanceLatticeViz() {
-  const ref = useRef<THREE.Mesh | null>(null);
-  useFrame((state) => {
-    if (!ref.current) return;
-    const t = state.clock.getElapsedTime();
-    ref.current.rotation.y = t * 0.3;
-    ref.current.rotation.z = t * 0.2;
-  });
-  return (
-    <Canvas className="instances-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
-      <color attach="background" args={["#020405"]} />
-      <ambientLight intensity={0.8} />
+  const LatticeMesh = () => {
+    const ref = useRef<THREE.Mesh | null>(null);
+    useFrame((state) => {
+      if (!ref.current) return;
+      const t = state.clock.getElapsedTime();
+      ref.current.rotation.y = t * 0.3;
+      ref.current.rotation.z = t * 0.2;
+    });
+    return (
       <mesh ref={ref}>
         <icosahedronGeometry args={[1, 1]} />
         <meshBasicMaterial wireframe color="#7bffe6" transparent opacity={0.45} />
       </mesh>
+    );
+  };
+  return (
+    <Canvas className="instances-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
+      <color attach="background" args={["#020405"]} />
+      <ambientLight intensity={0.8} />
+      <LatticeMesh />
     </Canvas>
   );
 }
@@ -356,9 +361,9 @@ export default function Instances() {
           {rows.length ? (
             <AutoSizer>
               {({ height, width }) => (
-                <List height={height} width={width} itemCount={rows.length} itemSize={72}>
+                <VirtualList height={height} width={width} itemCount={rows.length} itemSize={72}>
                   {InstanceRow}
-                </List>
+                </VirtualList>
               )}
             </AutoSizer>
           ) : (

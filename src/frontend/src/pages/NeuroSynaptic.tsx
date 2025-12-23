@@ -171,7 +171,6 @@ function LatentField({ className, drift = 0.2 }: { className?: string; drift?: n
 }
 
 function NeuroNebula() {
-  const ref = useRef<THREE.Points | null>(null);
   const geo = useMemo(() => {
     const count = 800;
     const arr = new Float32Array(count * 3);
@@ -184,17 +183,24 @@ function NeuroNebula() {
     g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
     return g;
   }, []);
-  useFrame((state) => {
-    if (!ref.current) return;
-    ref.current.rotation.y = state.clock.getElapsedTime() * 0.06;
-  });
+
+  const NebulaPoints = ({ geometry }: { geometry: THREE.BufferGeometry }) => {
+    const ref = useRef<THREE.Points | null>(null);
+    useFrame((state) => {
+      if (!ref.current) return;
+      ref.current.rotation.y = state.clock.getElapsedTime() * 0.06;
+    });
+    return (
+      <points ref={ref} geometry={geometry}>
+        <pointsMaterial color="#6fffe6" size={0.02} sizeAttenuation />
+      </points>
+    );
+  };
   return (
     <Canvas className="syn-r3f" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 60 }}>
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.6} />
-      <points ref={ref} geometry={geo}>
-        <pointsMaterial color="#6fffe6" size={0.02} sizeAttenuation />
-      </points>
+      <NebulaPoints geometry={geo} />
     </Canvas>
   );
 }

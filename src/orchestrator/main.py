@@ -2712,7 +2712,11 @@ if app:
         ok = 0
         stale = 0
         missing = 0
+        no_keyframe = 0
+        pipewire_missing = 0
+        session_missing = 0
         frame_ages: list[float] = []
+        keyframe_ages: list[float] = []
         for hb in workers.values():
             if not getattr(hb, "stream_url", None):
                 missing += 1
@@ -2720,17 +2724,33 @@ if app:
                 ok += 1
             else:
                 stale += 1
+            if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False:
+                pipewire_missing += 1
+            if bool(getattr(hb, "pipewire_session_ok", True)) is False:
+                session_missing += 1
             ts = getattr(hb, "stream_last_frame_ts", None)
             if ts:
                 try:
                     frame_ages.append(max(0.0, now - float(ts)))
                 except Exception:
                     pass
+            kts = getattr(hb, "stream_keyframe_ts", None)
+            if kts:
+                try:
+                    keyframe_ages.append(max(0.0, now - float(kts)))
+                except Exception:
+                    pass
+            elif bool(getattr(hb, "stream_ok", False)):
+                no_keyframe += 1
         stream_stats = {
             "ok": ok,
             "stale": stale,
             "missing": missing,
             "p95_frame_age_s": _percentile(frame_ages, 95.0) if frame_ages else None,
+            "no_keyframe": no_keyframe,
+            "pipewire_missing": pipewire_missing,
+            "session_missing": session_missing,
+            "p95_keyframe_age_s": _percentile(keyframe_ages, 95.0) if keyframe_ages else None,
         }
 
         return {"window_s": window, "api": api_stats, "heartbeat": heartbeat_stats, "stream": stream_stats}

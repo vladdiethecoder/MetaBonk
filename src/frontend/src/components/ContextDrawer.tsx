@@ -145,6 +145,9 @@ export default function ContextDrawer() {
             {payload?.ts ? <div className="muted">{timeAgo(payload.ts)}</div> : null}
             {payload?.instanceId ? <div className="muted mono">instance {payload.instanceId}</div> : null}
             {payload?.runId ? <div className="muted mono">run {payload.runId}</div> : null}
+            {(payload?.details as any)?.step != null ? (
+              <div className="muted mono">step {(payload?.details as any)?.step}</div>
+            ) : null}
           </div>
 
           {detailEntries.length ? (
@@ -176,6 +179,12 @@ export default function ContextDrawer() {
                 <div className="v">{instance.heartbeat?.steam_score ?? instance.heartbeat?.reward ?? "—"}</div>
                 <div className="k">stream</div>
                 <div className="v">{schemaMismatch ? schemaMismatchLabel(instance?.heartbeat?.schema_version) : instance.heartbeat?.stream_ok ? "ok" : "stale"}</div>
+                <div className="k">bonk conf</div>
+                <div className="v">{instance.heartbeat?.bonk_confidence == null ? "—" : `${Math.round(Number(instance.heartbeat?.bonk_confidence) * 100)}%`}</div>
+                <div className="k">menu doom</div>
+                <div className="v">{instance.heartbeat?.menu_doom_spiral == null ? "—" : Math.round(Number(instance.heartbeat?.menu_doom_spiral))}</div>
+                <div className="k">chat influence</div>
+                <div className="v">{instance.heartbeat?.chat_influence == null ? "—" : `${Math.round(Number(instance.heartbeat?.chat_influence) * 100)}%`}</div>
               </div>
             </div>
           ) : null}
