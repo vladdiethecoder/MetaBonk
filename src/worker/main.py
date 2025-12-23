@@ -233,6 +233,7 @@ class WorkerService:
         self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "1") in ("1", "true", "True")
         self._menu_bootstrap_step = 0
         self._menu_bootstrap_next_ts = 0.0
+        self._menu_bootstrap_last_menu: Optional[str] = None
         self._init_input_backend()
         # Optional BonkLink bridge (BepInEx 6 IL2CPP).
         self._use_bonklink = os.environ.get("METABONK_USE_BONKLINK", "0") in ("1", "true", "True")
@@ -1221,19 +1222,30 @@ class WorkerService:
         cm = (current_menu or "").strip().lower()
         if cm in ("loadingscreen", "loading"):
             return
+        if cm and cm != (self._menu_bootstrap_last_menu or ""):
+            self._menu_bootstrap_step = 0
+            self._menu_bootstrap_last_menu = cm
+            try:
+                pause = float(os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_MENU_PAUSE", "1.0"))
+            except Exception:
+                pause = 1.0
+            self._menu_bootstrap_next_ts = now + max(0.1, pause)
+            return
         if cm in ("generatedmap",):
             steps = [
+                ("click_center", None),
+                ("click_at", (0.5, 0.85)),
+                ("click_at", (0.8, 0.85)),
                 ("key_tap", "ENTER"),
                 ("key_tap", "SPACE"),
-                ("key_tap", "W"),
             ]
         else:
             steps = [
                 ("key_tap", "SPACE"),
                 ("key_tap", "ENTER"),
-                ("mouse_click", "left"),
+                ("click_center", None),
+                ("click_at", (0.5, 0.85)),
                 ("key_tap", "ENTER"),
-                ("mouse_click", "left"),
             ]
         kind, payload = steps[self._menu_bootstrap_step % len(steps)]
         try:
@@ -1251,6 +1263,21 @@ class WorkerService:
             elif kind == "mouse_click":
                 self._input_backend.mouse_button(str(payload), True)
                 self._input_backend.mouse_button(str(payload), False)
+            elif kind == "click_center":
+                try:
+                    clicker = getattr(self._input_backend, "click_center", None)
+                    if callable(clicker):
+                        clicker()
+                except Exception:
+                    pass
+            elif kind == "click_at":
+                try:
+                    clicker = getattr(self._input_backend, "click_at", None)
+                    if callable(clicker):
+                        x_frac, y_frac = payload
+                        clicker(float(x_frac), float(y_frac))
+                except Exception:
+                    pass
         except Exception:
             pass
         self._menu_bootstrap_step += 1
@@ -1258,6 +1285,13 @@ class WorkerService:
             interval = float(os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_INTERVAL", "0.35"))
         except Exception:
             interval = 0.35
+        if cm in ("generatedmap",):
+            try:
+                interval = float(
+                    os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_INTERVAL_MAP", str(interval))
+                )
+            except Exception:
+                pass
         self._menu_bootstrap_next_ts = now + max(0.1, interval)
 
     def _input_send_menu_action(self, action: "MenuAction", frame_size: Optional[tuple[int, int]]) -> bool:

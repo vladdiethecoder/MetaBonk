@@ -209,6 +209,9 @@ class XDoToolBackend:
             self._run(args)
 
     def click_center(self) -> None:
+        self.click_at(0.5, 0.5)
+
+    def click_at(self, x_frac: float, y_frac: float) -> None:
         wid = self._resolve_window_id()
         if not wid:
             return
@@ -231,8 +234,15 @@ class XDoToolBackend:
                     height = None
         if not width or not height:
             return
-        x = int(width // 2)
-        y = int(height // 2)
+        try:
+            xf = float(x_frac)
+            yf = float(y_frac)
+        except Exception:
+            return
+        xf = min(max(xf, 0.0), 1.0)
+        yf = min(max(yf, 0.0), 1.0)
+        x = int(width * xf)
+        y = int(height * yf)
         self._run(["xdotool", "mousemove", "--window", wid, str(x), str(y)])
         self._run(["xdotool", "click", "1"])
 
