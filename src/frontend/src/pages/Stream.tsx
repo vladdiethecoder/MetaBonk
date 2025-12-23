@@ -25,11 +25,12 @@ import { PROGRESS_GOALS, type GoalTier, type ProgressGoal } from "../lib/megabon
 import { UI_TOKENS } from "../lib/ui_tokens";
 import { timeAgo } from "../lib/format";
 import MseMp4Video from "../components/MseMp4Video";
-import Go2rtcEmbed from "../components/Go2rtcEmbed";
+import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
 const DEBUG_ON = import.meta.env.DEV && new URLSearchParams(window.location.search).get("debug") === "1";
+const DEBUG_HUD = new URLSearchParams(window.location.search).get("debugHud") === "1";
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 const computeUiScale = (w: number, h: number) => {
   const scale = Math.min(w / HUD_W, h / HUD_H);
@@ -587,13 +588,7 @@ function StreamTile({
   const frameUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/frame.jpg` : "";
   const go2rtcBase = String((w as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
-  const go2rtcUrl = useMemo(() => {
-    if (!go2rtcBase || !go2rtcName) return "";
-    const base = go2rtcBase.replace(/\/+$/, "");
-    const qs = new URLSearchParams({ src: go2rtcName, mode: "webrtc" });
-    return `${base}/stream.html?${qs.toString()}`;
-  }, [go2rtcBase, go2rtcName]);
-  const useGo2rtc = Boolean(go2rtcUrl);
+  const useGo2rtc = Boolean(go2rtcBase && go2rtcName);
   const featuredRole = String((w as any)?.featured_role ?? "").toLowerCase();
 
   const danger = Math.max(0, Math.min(1, Number(w?.danger_level ?? (w?.survival_prob != null ? 1 - Number(w.survival_prob) : 0)) || 0));
@@ -709,11 +704,12 @@ function StreamTile({
           ))}
         </div>
         {useGo2rtc ? (
-          <Go2rtcEmbed
-            url={go2rtcUrl}
+          <Go2rtcWebRTC
+            baseUrl={go2rtcBase}
+            streamName={go2rtcName}
             className={`stream-img ${focused ? "holo-fallback" : ""}`}
-            title={`go2rtc ${name}`}
-            onReady={focused ? (ready) => (ready ? setVideoEl(null) : null) : undefined}
+            onVideoReady={focused ? setVideoEl : undefined}
+            debugHud={DEBUG_HUD}
           />
         ) : streamUrl && isVideo ? (
           <MseMp4Video
@@ -723,8 +719,10 @@ function StreamTile({
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
             onVideoReady={focused ? setVideoEl : undefined}
             debug={DEBUG_ON}
+            debugHud={DEBUG_HUD}
           />
         ) : null}
+
         {noFeed && !useGo2rtc ? (
           <div className="mse-overlay" aria-label="no feed">
             <div className="mse-overlay-inner">

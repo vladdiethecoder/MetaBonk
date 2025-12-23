@@ -2,6 +2,16 @@ import { useEffect, useRef, useState } from "react";
 
 type Mp4Box = { type: string; data: Uint8Array };
 
+type HudSample = {
+  t: number;
+  fps?: number | null;
+  p95?: number | null;
+  p99?: number | null;
+  stalls100?: number | null;
+  dropped?: number | null;
+  total?: number | null;
+};
+
 function findAvc1Codec(init: Uint8Array): string | null {
   const needle = [0x61, 0x76, 0x63, 0x43]; // "avcC"
   for (let i = 0; i < init.length - 16; i++) {
@@ -67,6 +77,7 @@ export default function MseMp4Video({
   exclusiveKey,
   onVideoReady,
   debug = false,
+  debugHud = false,
 }: {
   url: string;
   className?: string;
@@ -74,6 +85,7 @@ export default function MseMp4Video({
   exclusiveKey?: string;
   onVideoReady?: (el: HTMLVideoElement | null) => void;
   debug?: boolean;
+  debugHud?: boolean;
 }) {
   const ref = useRef<HTMLVideoElement | null>(null);
   const [status, setStatus] = useState<"loading" | "playing" | "error">("loading");
@@ -83,6 +95,22 @@ export default function MseMp4Video({
   const [usingSnapshot, setUsingSnapshot] = useState(false);
   const [overlayOn, setOverlayOn] = useState(true);
   const [retryTick, setRetryTick] = useState(0);
+  const [hud, setHud] = useState<{
+    fps: number | null;
+    p50: number | null;
+    p95: number | null;
+    p99: number | null;
+    stalls100: number | null;
+    dropped: number | null;
+    total: number | null;
+  } | null>(null);
+
+  const gapRef = useRef<number[]>([]);
+  const lastFrameTsRef = useRef<number | null>(null);
+  const hudTimerRef = useRef<number | null>(null);
+  const hudActiveRef = useRef(false);
+  const rvfcIdRef = useRef<number | null>(null);
+  const samplesRef = useRef<HudSample[]>([]);
 
   useEffect(() => {
     if (!onVideoReady) return;
@@ -352,6 +380,145 @@ export default function MseMp4Video({
     };
   }, []);
 
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !debugHud) {
+      setHud(null);
+      gapRef.current = [];
+      lastFrameTsRef.current = null;
+      hudActiveRef.current = false;
+      samplesRef.current = [];
+      if (rvfcIdRef.current != null) {
+        try {
+          (el as any).cancelVideoFrameCallback?.(rvfcIdRef.current);
+        } catch {}
+        rvfcIdRef.current = null;
+      }
+      if (hudTimerRef.current) {
+        window.clearInterval(hudTimerRef.current);
+        hudTimerRef.current = null;
+      }
+      return;
+    }
+
+    const hasRvfc = typeof (el as any).requestVideoFrameCallback === "function";
+    if (!hasRvfc) {
+      setHud({
+        fps: null,
+        p50: null,
+        p95: null,
+        p99: null,
+        stalls100: null,
+        dropped: null,
+        total: null,
+      });
+      return;
+    }
+
+    hudActiveRef.current = true;
+    gapRef.current = [];
+    lastFrameTsRef.current = null;
+
+    const onFrame = (now: number) => {
+      if (!hudActiveRef.current) return;
+      const last = lastFrameTsRef.current;
+      if (last != null) {
+        const gap = now - last;
+        if (Number.isFinite(gap) && gap > 0) {
+          const gaps = gapRef.current;
+          gaps.push(gap);
+          if (gaps.length > 360) gaps.splice(0, gaps.length - 360);
+        }
+      }
+      lastFrameTsRef.current = now;
+      rvfcIdRef.current = (el as any).requestVideoFrameCallback(onFrame);
+    };
+
+    rvfcIdRef.current = (el as any).requestVideoFrameCallback(onFrame);
+
+    const computeHud = () => {
+      if (!hudActiveRef.current) return;
+      const gaps = gapRef.current.slice().sort((a, b) => a - b);
+      const toPct = (p: number) => {
+        if (!gaps.length) return null;
+        const k = (p / 100) * (gaps.length - 1);
+        const lo = Math.floor(k);
+        const hi = Math.ceil(k);
+        if (lo === hi) return gaps[lo];
+        const frac = k - lo;
+        return gaps[lo] * (1 - frac) + gaps[hi] * frac;
+      };
+      const avg = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
+      const fps = avg > 0 ? 1000 / avg : null;
+      const p50 = toPct(50);
+      const p95 = toPct(95);
+      const p99 = toPct(99);
+      const stalls100 = gaps.length ? gaps.filter((g) => g > 100).length : null;
+      let dropped: number | null = null;
+      let total: number | null = null;
+      try {
+        const q = (el as any).getVideoPlaybackQuality?.();
+        if (q) {
+          dropped = Number.isFinite(q.droppedVideoFrames) ? q.droppedVideoFrames : null;
+          total = Number.isFinite(q.totalVideoFrames) ? q.totalVideoFrames : null;
+        }
+      } catch {
+        dropped = null;
+        total = null;
+      }
+      setHud({
+        fps,
+        p50,
+        p95,
+        p99,
+        stalls100,
+        dropped,
+        total,
+      });
+      const samples = samplesRef.current;
+      samples.push({
+        t: Date.now(),
+        fps,
+        p95,
+        p99,
+        stalls100,
+        dropped,
+        total,
+      });
+      if (samples.length > 1800) samples.splice(0, samples.length - 1800);
+    };
+
+    hudTimerRef.current = window.setInterval(computeHud, 1000);
+    return () => {
+      hudActiveRef.current = false;
+      if (rvfcIdRef.current != null) {
+        try {
+          (el as any).cancelVideoFrameCallback?.(rvfcIdRef.current);
+        } catch {}
+        rvfcIdRef.current = null;
+      }
+      if (hudTimerRef.current) {
+        window.clearInterval(hudTimerRef.current);
+        hudTimerRef.current = null;
+      }
+    };
+  }, [debugHud]);
+
+  const exportJson = () => {
+    const payload = {
+      source: "mse",
+      collectedAt: new Date().toISOString(),
+      samples: samplesRef.current,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `stream_jank_mse_${Date.now()}.json`;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 3000);
+  };
+
   const showOverlayRaw = status !== "playing" && !(fallbackUrl && stillOk);
 
   useEffect(() => {
@@ -400,6 +567,22 @@ export default function MseMp4Video({
             <div className="mse-overlay-title">SNAPSHOT</div>
             <div className="mse-overlay-sub muted">video not playing; using /frame.jpg</div>
           </div>
+        </div>
+      ) : null}
+      {debugHud ? (
+        <div className="mse-hud">
+          <div className="mse-hud-title">JANK HUD</div>
+          {hud?.fps != null ? <div className="mse-hud-row">fps: {hud.fps.toFixed(1)}</div> : <div className="mse-hud-row">fps: n/a</div>}
+          <div className="mse-hud-row">
+            p95/p99: {hud?.p95 != null ? hud.p95.toFixed(1) : "n/a"} / {hud?.p99 != null ? hud.p99.toFixed(1) : "n/a"} ms
+          </div>
+          <div className="mse-hud-row">stalls>100ms: {hud?.stalls100 ?? "n/a"}</div>
+          <div className="mse-hud-row">
+            dropped: {hud?.dropped ?? "n/a"} / {hud?.total ?? "n/a"}
+          </div>
+          <button className="mse-hud-btn" onClick={(e) => { e.preventDefault(); e.stopPropagation(); exportJson(); }}>
+            Export JSON
+          </button>
         </div>
       ) : null}
     </div>
