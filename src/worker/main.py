@@ -171,6 +171,12 @@ class AdaptiveTeacher:
         self._menu_elapsed_s = 0.0
         self._intervention_count += 1
 
+    def pick_action_index(self, indices: List[int], cycle_k: int) -> Optional[int]:
+        if not indices:
+            return None
+        k = max(1, min(len(indices), int(cycle_k)))
+        return indices[self._intervention_count % k]
+
     def should_log_intervention(self) -> bool:
         return self._intervention_count % self.log_every == 0
 
@@ -367,6 +373,10 @@ class WorkerService:
             self._menu_teacher_window_s = float(os.environ.get("METABONK_MENU_TEACHER_WINDOW_S", "2.0"))
         except Exception:
             self._menu_teacher_window_s = 2.0
+        try:
+            self._menu_teacher_cycle_k = int(os.environ.get("METABONK_MENU_TEACHER_CYCLE_K", "2"))
+        except Exception:
+            self._menu_teacher_cycle_k = 2
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -2739,13 +2749,15 @@ class WorkerService:
             ):
                 menu_key = cur_menu or str(game_state.get("currentMenu") or "")
                 if self._menu_teacher.step(now, in_menu=in_menu, menu_key=menu_key):
-                    teacher_action_idx = self._menu_bias_indices[0]
-                    if teacher_action_idx < len(a_disc):
+                    teacher_action_idx = self._menu_teacher.pick_action_index(
+                        self._menu_bias_indices, self._menu_teacher_cycle_k
+                    )
+                    if teacher_action_idx is not None and teacher_action_idx < len(a_disc):
                         a_disc[teacher_action_idx] = 1
                         self._menu_teacher.record_intervention(now)
                         if self._menu_teacher.should_log_intervention():
                             print(
-                                f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting confirm",
+                                f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting idx={teacher_action_idx}",
                                 flush=True,
                             )
             if (
