@@ -207,6 +207,25 @@ class WorkerService:
             "METABONK_REWARD_HIT_FRAME_PATH", str(Path("temp") / "reward_hits")
         )
         self._reward_hit_once = os.environ.get("METABONK_REWARD_HIT_ONCE", "1") in ("1", "true", "True")
+        self._frame_ring_enabled = os.environ.get("METABONK_FRAME_RING", "1") in ("1", "true", "True")
+        try:
+            ring_size = int(os.environ.get("METABONK_FRAME_RING_SIZE", "120"))
+        except Exception:
+            ring_size = 120
+        self._frame_ring: Deque[dict] = deque(maxlen=max(1, ring_size))
+        try:
+            self._frame_black_mean = float(os.environ.get("METABONK_FRAME_BLACK_MEAN", "8.0"))
+        except Exception:
+            self._frame_black_mean = 8.0
+        try:
+            self._frame_black_p99 = float(os.environ.get("METABONK_FRAME_BLACK_P99", "20.0"))
+        except Exception:
+            self._frame_black_p99 = 20.0
+        try:
+            self._frame_black_sat = float(os.environ.get("METABONK_FRAME_BLACK_SAT", "5.0"))
+        except Exception:
+            self._frame_black_sat = 5.0
+        self._last_valid_frame: Optional[dict] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
         self._action_source = self._normalize_action_source(
@@ -1178,6 +1197,71 @@ class WorkerService:
                 parsed.append({"kind": "key", "name": key})
         return parsed
 
+    def _frame_stats_from_array(self, arr: "Any") -> Optional[tuple[float, float, float]]:
+        try:
+            import numpy as np
+
+            if arr is None:
+                return None
+            if isinstance(arr, np.ndarray):
+                data = arr
+            else:
+                data = np.asarray(arr)
+            if data.ndim != 3 or data.shape[2] < 3:
+                return None
+            data = data[:, :, :3].astype("float32")
+            luma = 0.2126 * data[:, :, 0] + 0.7152 * data[:, :, 1] + 0.0722 * data[:, :, 2]
+            maxc = data.max(axis=2)
+            minc = data.min(axis=2)
+            delta = maxc - minc
+            sat = np.zeros_like(maxc)
+            mask = maxc > 1e-6
+            sat[mask] = (delta[mask] / maxc[mask]) * 255.0
+            mean = float(luma.mean())
+            p99 = float(np.percentile(luma, 99))
+            mean_s = float(sat.mean())
+            return mean, p99, mean_s
+        except Exception:
+            return None
+
+    def _frame_stats_from_bytes(self, payload: bytes) -> Optional[tuple[float, float, float]]:
+        if not payload:
+            return None
+        try:
+            import io
+            import numpy as np
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(payload)).convert("RGB")
+            arr = np.asarray(img)
+            return self._frame_stats_from_array(arr)
+        except Exception:
+            return None
+
+    def _frame_is_black(self, stats: Optional[tuple[float, float, float]]) -> bool:
+        if not stats:
+            return True
+        mean = float(stats[0])
+        p99 = float(stats[1])
+        mean_s = float(stats[2]) if len(stats) > 2 else 255.0
+        dark = (mean < float(self._frame_black_mean)) and (p99 < float(self._frame_black_p99))
+        desat = mean_s < float(self._frame_black_sat)
+        return dark or desat
+
+    def _push_frame_ring(self, payload: Optional[bytes], *, source: str, ts: float) -> None:
+        if not self._frame_ring_enabled or not payload:
+            return
+        stats = self._frame_stats_from_bytes(payload)
+        entry = {
+            "ts": float(ts),
+            "bytes": payload,
+            "source": source,
+            "stats": stats,
+        }
+        self._frame_ring.append(entry)
+        if stats and (not self._frame_is_black(stats)):
+            self._last_valid_frame = entry
+
     def _resolve_menu_bias_indices(self) -> List[int]:
         if not self._input_buttons:
             return []
@@ -1959,6 +2043,7 @@ class WorkerService:
             done_from_game: bool = False
             used_pixels: bool = False
             latest_image_bytes: Optional[bytes] = None
+            latest_image_source: Optional[str] = None
             reward_frame_hwc = None
             forced_ui_click: Optional[tuple[int, int]] = None
             suppress_policy_clicks: bool = False
@@ -2001,6 +2086,7 @@ class WorkerService:
                             buf = io.BytesIO()
                             img.save(buf, format="JPEG", quality=80)
                             latest_image_bytes = buf.getvalue()
+                            latest_image_source = "research_shm"
                             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                             vr = requests.post(
                                 f"{self.vision_url}/predict",
@@ -2056,16 +2142,19 @@ class WorkerService:
                                     buf = io.BytesIO()
                                     img.save(buf, format="JPEG", quality=80)
                                     latest_image_bytes = buf.getvalue()
+                                    latest_image_source = "bonklink"
                                 else:
                                     latest_image_bytes = jpeg_bytes
                                     img = Image.open(io.BytesIO(jpeg_bytes))
                                     frame_size = img.size
                                     reward_frame_hwc = None
+                                    latest_image_source = "bonklink"
                             else:
                                 latest_image_bytes = jpeg_bytes
                                 img = Image.open(io.BytesIO(jpeg_bytes))
                                 frame_size = img.size
                                 reward_frame_hwc = None
+                                latest_image_source = "bonklink"
 
                             self._set_latest_jpeg(latest_image_bytes)
                             used_pixels = True
@@ -2133,6 +2222,7 @@ class WorkerService:
                             buf = io.BytesIO()
                             img.save(buf, format="JPEG", quality=80)
                             latest_image_bytes = buf.getvalue()
+                            latest_image_source = "unity_bridge"
                             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                             vr = requests.post(
                                 f"{self.vision_url}/predict",
@@ -2183,6 +2273,7 @@ class WorkerService:
                             buf = io.BytesIO()
                             img.save(buf, format="JPEG", quality=80)
                             latest_image_bytes = buf.getvalue()
+                            latest_image_source = "pipewire"
                             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                             vr = requests.post(
                                 f"{self.vision_url}/predict",
@@ -2214,7 +2305,36 @@ class WorkerService:
                     snap = None
                 if snap:
                     latest_image_bytes = snap
+                    latest_image_source = "streamer_snapshot"
                     self._set_latest_jpeg(snap)
+            elif (
+                latest_image_bytes is None
+                and reward_frame_hwc is not None
+                and self._frame_ring_enabled
+            ):
+                try:
+                    import io
+                    from PIL import Image
+                    import numpy as np
+
+                    arr = np.asarray(reward_frame_hwc)
+                    img = Image.fromarray(arr.astype("uint8"))
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=75)
+                    latest_image_bytes = buf.getvalue()
+                    latest_image_source = latest_image_source or "frame_rgb"
+                    self._set_latest_jpeg(latest_image_bytes)
+                except Exception:
+                    pass
+
+            if latest_image_bytes is not None:
+                if not latest_image_source:
+                    latest_image_source = "unknown"
+                try:
+                    ts = self._latest_frame_ts or now
+                    self._push_frame_ring(latest_image_bytes, source=latest_image_source, ts=ts)
+                except Exception:
+                    pass
 
             menu_hint: Optional[bool] = None
             if isinstance(vision_metrics, dict):
@@ -2861,7 +2981,8 @@ class WorkerService:
                         )
                         print(
                             f"[CURRICULUM] instance={self.instance_id} success={self._menu_bias_successes} "
-                            f"menu_bias_prob={prev_prob:.3f}->{self._menu_bias_prob:.3f}"
+                            f"menu_bias_prob={prev_prob:.3f}->{self._menu_bias_prob:.3f}",
+                            flush=True,
                         )
                 self._last_menu_name = cur_menu
             # Optional reward logging (useful for menu shaping/debug).
@@ -2875,7 +2996,8 @@ class WorkerService:
                     menu_reason = f"{prev_menu or ''}->{cur_menu or ''}"
                 print(
                     f"[REWARD] instance={self.instance_id} reward={float(reward):.4f} "
-                    f"menu={menu_reason} playing={playing_flag}"
+                    f"menu={menu_reason} playing={playing_flag}",
+                    flush=True,
                 )
             # Dump a frame on reward hit (for manual verification).
             if bonus_fired and (not self._reward_hit_once or not self._reward_hit_saved):
@@ -2886,22 +3008,97 @@ class WorkerService:
                     else:
                         base.mkdir(parents=True, exist_ok=True)
                         out_path = base / f"{self.instance_id}_reward_hit.jpg"
-                    if latest_image_bytes:
-                        out_path.write_bytes(latest_image_bytes)
+                    strip_path = None
+                    if out_path.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                        strip_path = out_path.with_name(f"{out_path.stem}_strip.jpg")
+                    elif base:
+                        strip_path = base / f"{self.instance_id}_reward_hit_strip.jpg"
+                    chosen = None
+                    chosen_stats = None
+                    chosen_source = None
+                    chosen_idx = None
+                    if self._frame_ring_enabled and self._frame_ring:
+                        for offset, entry in enumerate(reversed(self._frame_ring)):
+                            stats = entry.get("stats")
+                            if not self._frame_is_black(stats):
+                                chosen = entry
+                                chosen_stats = stats
+                                chosen_source = str(entry.get("source") or "ring")
+                                chosen_idx = -(offset + 1)
+                                break
+                    if chosen is None and self._last_valid_frame is not None:
+                        chosen = self._last_valid_frame
+                        chosen_stats = chosen.get("stats")
+                        chosen_source = str(chosen.get("source") or "last_valid")
+                    if chosen is None and latest_image_bytes:
+                        stats = self._frame_stats_from_bytes(latest_image_bytes)
+                        if not self._frame_is_black(stats):
+                            chosen = {
+                                "bytes": latest_image_bytes,
+                                "stats": stats,
+                                "source": latest_image_source or "current",
+                            }
+                            chosen_stats = stats
+                            chosen_source = str(latest_image_source or "current")
+                    if chosen is None and self.streamer is not None and hasattr(self.streamer, "capture_jpeg"):
+                        try:
+                            snap = self.streamer.capture_jpeg(
+                                timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5"))
+                            )
+                        except Exception:
+                            snap = None
+                        if snap:
+                            stats = self._frame_stats_from_bytes(snap)
+                            if not self._frame_is_black(stats):
+                                chosen = {"bytes": snap, "stats": stats, "source": "streamer_snapshot"}
+                                chosen_stats = stats
+                                chosen_source = "streamer_snapshot"
+                    if chosen and chosen.get("bytes"):
+                        out_path.write_bytes(chosen["bytes"])
                         self._reward_hit_saved = True
-                    elif reward_frame_hwc is not None:
+                        stat_msg = ""
+                        if chosen_stats:
+                            mean = float(chosen_stats[0])
+                            p99 = float(chosen_stats[1])
+                            mean_s = float(chosen_stats[2]) if len(chosen_stats) > 2 else 0.0
+                            stat_msg = f" mean={mean:.1f} p99={p99:.1f} sat={mean_s:.1f}"
+                        idx_msg = f" idx={chosen_idx}" if chosen_idx is not None else ""
+                        src_msg = f" source={chosen_source}" if chosen_source else ""
+                        print(f"[REWARD_HIT] saved={out_path}{src_msg}{idx_msg}{stat_msg}", flush=True)
+                    elif not self._reward_hit_saved:
+                        print("[REWARD_HIT] WARN: no non-black frame available", flush=True)
+                    if strip_path and self._frame_ring:
                         try:
                             from PIL import Image
-                            import numpy as np
+                            import io
+                            import math
 
-                            arr = np.asarray(reward_frame_hwc)
-                            img = Image.fromarray(arr.astype("uint8"))
-                            img.save(out_path, format="JPEG", quality=90)
-                            self._reward_hit_saved = True
+                            frames = list(self._frame_ring)[-16:]
+                            images = []
+                            for entry in frames:
+                                payload = entry.get("bytes")
+                                if not payload:
+                                    continue
+                                try:
+                                    img = Image.open(io.BytesIO(payload)).convert("RGB")
+                                    images.append(img)
+                                except Exception:
+                                    continue
+                            if images:
+                                cols = 4
+                                rows = int(math.ceil(len(images) / float(cols)))
+                                tile_w, tile_h = images[0].size
+                                sheet = Image.new("RGB", (tile_w * cols, tile_h * rows), color=(0, 0, 0))
+                                for idx, img in enumerate(images):
+                                    r = idx // cols
+                                    c = idx % cols
+                                    if img.size != (tile_w, tile_h):
+                                        img = img.resize((tile_w, tile_h))
+                                    sheet.paste(img, (c * tile_w, r * tile_h))
+                                sheet.save(strip_path, format="JPEG", quality=85)
+                                print(f"[REWARD_HIT] strip={strip_path} frames={len(images)}", flush=True)
                         except Exception:
                             pass
-                    if self._reward_hit_saved:
-                        print(f"[REWARD_HIT] saved={out_path}")
                 except Exception:
                     pass
             # Episode done: when METABONK_VISUAL_ONLY=1, never use SHM/memory flags.
