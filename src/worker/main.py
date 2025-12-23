@@ -202,6 +202,11 @@ class WorkerService:
             self._menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
         except Exception:
             self._menu_start_bonus = 0.0
+        self._reward_hit_saved = False
+        self._reward_hit_frame_path = os.environ.get(
+            "METABONK_REWARD_HIT_FRAME_PATH", str(Path("temp") / "reward_hits")
+        )
+        self._reward_hit_once = os.environ.get("METABONK_REWARD_HIT_ONCE", "1") in ("1", "true", "True")
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
         self._action_source = self._normalize_action_source(
@@ -229,6 +234,12 @@ class WorkerService:
         self._input_backend_name = str(os.environ.get("METABONK_INPUT_BACKEND", "") or "").strip().lower()
         self._input_backend = None
         self._input_buttons: List[dict] = []
+        self._menu_bias_enabled = os.environ.get("METABONK_MENU_ACTION_BIAS", "0") in ("1", "true", "True")
+        try:
+            self._menu_bias_prob = float(os.environ.get("METABONK_MENU_ACTION_BIAS_P", "0.6"))
+        except Exception:
+            self._menu_bias_prob = 0.6
+        self._menu_bias_indices: List[int] = []
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -1158,11 +1169,34 @@ class WorkerService:
                 parsed.append({"kind": "key", "name": key})
         return parsed
 
+    def _resolve_menu_bias_indices(self) -> List[int]:
+        if not self._input_buttons:
+            return []
+        raw = os.environ.get("METABONK_MENU_ACTION_BIAS_KEYS", "SPACE,ENTER,RETURN,MOUSE_LEFT,LEFT")
+        bias_items = [s.strip().upper() for s in str(raw).split(",") if s.strip()]
+        bias_keys = set(bias_items)
+        idxs: List[int] = []
+        for i, spec in enumerate(self._input_buttons):
+            kind = str(spec.get("kind") or "").lower()
+            if kind == "mouse":
+                btn = str(spec.get("button") or "").upper()
+                if btn in bias_keys:
+                    idxs.append(i)
+                continue
+            name = str(spec.get("name") or "").strip()
+            up = name.upper()
+            if up.startswith("KEY_"):
+                up = up[4:]
+            if up in bias_keys:
+                idxs.append(i)
+        return idxs
+
     def _init_input_backend(self) -> None:
         name = self._input_backend_name
         if name not in ("uinput", "xdotool", "xdo"):
             return
         self._input_buttons = self._parse_input_buttons()
+        self._menu_bias_indices = self._resolve_menu_bias_indices()
         if not self._input_buttons:
             print(f"[worker:{self.instance_id}] input backend enabled but no METABONK_INPUT_BUTTONS set")
         if name == "uinput":
@@ -2453,6 +2487,23 @@ class WorkerService:
                         forced_ui_click = None
 
             input_bootstrap = False
+            if self._input_backend and self._menu_bias_enabled and self._menu_bias_indices:
+                try:
+                    cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
+                except Exception:
+                    cur_menu = ""
+                try:
+                    playing_flag = bool(game_state.get("isPlaying"))
+                except Exception:
+                    playing_flag = False
+                in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
+                if in_menu:
+                    prob = max(0.0, min(1.0, float(self._menu_bias_prob)))
+                    for idx in self._menu_bias_indices:
+                        if idx >= len(a_disc):
+                            continue
+                        if random.random() < prob:
+                            a_disc[idx] = 1
             if (
                 self._input_backend
                 and (not menu_override_active)
@@ -2775,6 +2826,7 @@ class WorkerService:
             except Exception:
                 cur_menu = ""
             prev_menu = self._last_menu_name
+            bonus_fired = False
             if cur_menu:
                 if cur_menu == "mainmenu":
                     self._menu_seen_main = True
@@ -2786,6 +2838,7 @@ class WorkerService:
                 if menu_start_bonus and cur_menu == "generatedmap" and self._menu_seen_main:
                     reward += menu_start_bonus
                     self._menu_seen_main = False
+                    bonus_fired = True
                     if self._menu_log:
                         print(
                             f"[MENU] instance={self.instance_id} start_bonus_fired={menu_start_bonus:.2f} "
@@ -2805,6 +2858,33 @@ class WorkerService:
                     f"[REWARD] instance={self.instance_id} reward={float(reward):.4f} "
                     f"menu={menu_reason} playing={playing_flag}"
                 )
+            # Dump a frame on reward hit (for manual verification).
+            if bonus_fired and (not self._reward_hit_once or not self._reward_hit_saved):
+                try:
+                    base = Path(self._reward_hit_frame_path)
+                    if base.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                        out_path = base
+                    else:
+                        base.mkdir(parents=True, exist_ok=True)
+                        out_path = base / f"{self.instance_id}_reward_hit.jpg"
+                    if latest_image_bytes:
+                        out_path.write_bytes(latest_image_bytes)
+                        self._reward_hit_saved = True
+                    elif reward_frame_hwc is not None:
+                        try:
+                            from PIL import Image
+                            import numpy as np
+
+                            arr = np.asarray(reward_frame_hwc)
+                            img = Image.fromarray(arr.astype("uint8"))
+                            img.save(out_path, format="JPEG", quality=90)
+                            self._reward_hit_saved = True
+                        except Exception:
+                            pass
+                    if self._reward_hit_saved:
+                        print(f"[REWARD_HIT] saved={out_path}")
+                except Exception:
+                    pass
             # Episode done: when METABONK_VISUAL_ONLY=1, never use SHM/memory flags.
             # If the vision model exports a boolean done signal, consume it here.
             if self._visual_only and isinstance(vision_metrics, dict):
