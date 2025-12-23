@@ -354,7 +354,7 @@ class WorkerService:
         try:
             self._menu_bias_min = float(os.environ.get("METABONK_MENU_ACTION_BIAS_MIN", "0.05"))
         except Exception:
-        self._menu_bias_min = 0.05
+            self._menu_bias_min = 0.05
         self._menu_bias_successes = 0
         self._menu_bias_indices: List[int] = []
         menu_teacher_env = str(os.environ.get("METABONK_MENU_TEACHER", "") or "").strip().lower()
