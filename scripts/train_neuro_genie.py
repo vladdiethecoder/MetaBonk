@@ -328,6 +328,11 @@ def train_dream_rl(args):
     optimize_5090 = bool(getattr(args, "optimize_5090", False)) or str(
         os.environ.get("METABONK_OPTIMIZE_5090", "0") or "0"
     ).strip().lower() in ("1", "true", "yes", "on")
+    compile_mode = str(getattr(args, "compile_mode", "max-autotune") or "max-autotune")
+    if bool(getattr(args, "cuda_graph", False)) and bool(getattr(args, "compile", False)):
+        if compile_mode == "max-autotune":
+            compile_mode = "max-autotune-no-cudagraphs"
+            print("[offline_replay] compile_mode=max-autotune-no-cudagraphs (cuda_graph enabled)")
     if optimize_5090 and device.type == "cuda":
         cfg = BlackwellOptimConfig(
             enable_tf32=True,
@@ -336,7 +341,7 @@ def train_dream_rl(args):
             alloc_conf=str(getattr(args, "alloc_conf", "") or "expandable_segments:True"),
             memory_fraction=float(getattr(args, "memory_fraction", 0.0) or 0.0),
             compile=bool(getattr(args, "compile", False)),
-            compile_mode=str(getattr(args, "compile_mode", "max-autotune") or "max-autotune"),
+            compile_mode=compile_mode,
         )
         applied = apply_blackwell_defaults(cfg)
         if applied:
@@ -360,7 +365,7 @@ def train_dream_rl(args):
     policy = maybe_compile(
         policy,
         enabled=bool(getattr(args, "compile", False)) and device.type == "cuda",
-        mode=str(getattr(args, "compile_mode", "max-autotune") or "max-autotune"),
+        mode=compile_mode,
     )
 
     opt = torch.optim.Adam(policy.parameters(), lr=float(args.lr))
