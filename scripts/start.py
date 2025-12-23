@@ -41,6 +41,8 @@ def _spawn(
     cwd: Optional[Path] = None,
     env: Optional[Dict[str, str]] = None,
     job_pgid: Optional[int] = None,
+    stdout_path: Optional[Path] = None,
+    stderr_path: Optional[Path] = None,
 ) -> subprocess.Popen:
     print(f"[start] starting {name}: {' '.join(cmd)}")
     preexec_fn = None
@@ -55,12 +57,26 @@ def _spawn(
 
         preexec_fn = _bind_to_job_pgid
         start_new_session = False
+    stdout_target = None
+    stderr_target = None
+    if stdout_path:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        stdout_target = open(stdout_path, "ab", buffering=0)
+    if stderr_path:
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        stderr_target = open(stderr_path, "ab", buffering=0)
+    if stdout_target and not stderr_target:
+        stderr_target = stdout_target
+    if stderr_target and not stdout_target:
+        stdout_target = stderr_target
     return subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
         env=env,
         start_new_session=start_new_session,
         preexec_fn=preexec_fn,
+        stdout=stdout_target,
+        stderr=stderr_target,
     )
 
 
@@ -158,6 +174,19 @@ def _write_job_state(repo_root: Path, *, pgid: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="MetaBonk one-command launcher (Omega + UI)")
 
+    parser.add_argument(
+        "--doctor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run streaming preflight (check_gpu_streaming + stream_diagnostics) before launching.",
+    )
+    parser.add_argument(
+        "--doctor-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run preflight and exit (implies --doctor).",
+    )
+
     # Omega (start_omega.py)
     parser.add_argument(
         "--mode",
@@ -238,6 +267,30 @@ def main() -> int:
     )
     parser.add_argument("--instance-prefix", default=os.environ.get("METABONK_INSTANCE_PREFIX", "omega"))
     parser.add_argument("--go2rtc-url", default=os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984"))
+    parser.add_argument(
+        "--merge-sidecar",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("METABONK_MERGE_SIDECAR", "0") or "").strip().lower() in ("1", "true", "yes", "on"),
+        help="Start federated merge sidecar that periodically merges role policies into a target.",
+    )
+    parser.add_argument(
+        "--merge-sources",
+        nargs="+",
+        default=(os.environ.get("METABONK_MERGE_SOURCES", "Scout Speedrunner Killer Tank")).split(),
+        help="Source policy names (default: Scout Speedrunner Killer Tank).",
+    )
+    parser.add_argument("--merge-target", default=os.environ.get("METABONK_MERGE_TARGET", "God"))
+    parser.add_argument("--merge-base", default=os.environ.get("METABONK_MERGE_BASE", ""))
+    parser.add_argument("--merge-method", choices=["ties", "weighted"], default=os.environ.get("METABONK_MERGE_METHOD", "ties"))
+    parser.add_argument("--merge-topk", type=float, default=float(os.environ.get("METABONK_MERGE_TOPK", "0.2")))
+    parser.add_argument("--merge-interval-s", type=float, default=float(os.environ.get("METABONK_MERGE_INTERVAL_S", "30")))
+    parser.add_argument("--merge-weights", default=os.environ.get("METABONK_MERGE_WEIGHTS", ""))
+    parser.add_argument(
+        "--loading-restart-s",
+        type=float,
+        default=float(os.environ.get("METABONK_PHASE_DATASET_LOADING_RESTART_S", "0") or "0"),
+        help="If >0, worker auto-restarts when stuck in loading this many seconds.",
+    )
 
     args = parser.parse_args()
 
@@ -253,6 +306,12 @@ def main() -> int:
     env["ORCHESTRATOR_URL"] = f"http://127.0.0.1:{args.orch_port}"
     env["METABONK_EXPERIMENT_ID"] = args.experiment
     env.setdefault("METABONK_RUN_ID", f"run-omega-{int(time.time())}")
+    run_id = str(env.get("METABONK_RUN_ID") or f"run-omega-{int(time.time())}")
+    run_dir = repo_root / "runs" / run_id
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("METABONK_RUN_DIR", str(run_dir))
+    env.setdefault("MEGABONK_LOG_DIR", str(run_dir))
     # Watch mode should not starve the user's actual game of VRAM. Default to CPU-only
     # services (vision/learner) unless explicitly overridden.
     if args.mode == "watch" and not bool(args.watch_use_gpu):
@@ -310,6 +369,8 @@ def main() -> int:
     # Default menu classifier path (best-effort; ignored if file missing).
     env.setdefault("METABONK_MENU_WEIGHTS", str(repo_root / "checkpoints" / "menu_classifier.pt"))
     env.setdefault("METABONK_MENU_THRESH", "0.5")
+    if float(args.loading_restart_s or 0.0) > 0.0:
+        env["METABONK_PHASE_DATASET_LOADING_RESTART_S"] = str(float(args.loading_restart_s))
     # Default posture: PipeWire -> NVENC -> fragmented MP4, and keep instances non-intrusive.
     # gamescope `--backend headless` is used by default in `scripts/start_omega.py` when
     # no explicit stream backend is selected, so windows do not appear on your desktop.
@@ -357,6 +418,28 @@ def main() -> int:
             return 1
 
     try:
+        if args.doctor_only:
+            args.doctor = True
+        if args.doctor:
+            doctor_log = logs_dir / "doctor.log"
+            print(f"[start] doctor -> {doctor_log}")
+            with open(doctor_log, "ab", buffering=0) as f:
+                f.write(b"[doctor] MetaBonk preflight\n")
+            with open(doctor_log, "ab", buffering=0) as f:
+                rc = subprocess.call(
+                    ["bash", str(repo_root / "scripts" / "check_gpu_streaming.sh")],
+                    cwd=str(repo_root),
+                    env=env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                )
+            if rc != 0:
+                print(f"[start] doctor FAILED (rc={int(rc)}) - see {doctor_log}")
+                return int(rc)
+            print("[start] doctor OK")
+            if args.doctor_only:
+                return 0
+
         if args.go2rtc and args.mode in ("train", "play"):
             go2rtc_mode = str(args.go2rtc_mode or "fifo").strip().lower()
             if go2rtc_mode == "fifo":
@@ -466,6 +549,42 @@ def main() -> int:
                 pass
 
         job_pgid = int(omega.pid) if omega and os.name == "posix" else None
+
+        # Optional federated merge sidecar (periodically calls learner /merge_policies).
+        merge: Optional[subprocess.Popen] = None
+        if args.merge_sidecar:
+            merge_log = logs_dir / "federated_merge.log"
+            merge_cmd = [
+                py,
+                "-u",
+                str(repo_root / "scripts" / "federated_merge.py"),
+                "--learner-url",
+                f"http://127.0.0.1:{int(args.learner_port)}",
+                "--sources",
+                *[str(s) for s in (args.merge_sources or [])],
+                "--target",
+                str(args.merge_target),
+                "--method",
+                str(args.merge_method),
+                "--topk",
+                str(float(args.merge_topk)),
+                "--interval-s",
+                str(float(args.merge_interval_s)),
+            ]
+            if str(args.merge_base or "").strip():
+                merge_cmd += ["--base", str(args.merge_base).strip()]
+            if str(args.merge_weights or "").strip():
+                merge_cmd += ["--weights", str(args.merge_weights).strip()]
+            merge = _spawn(
+                "merge-sidecar",
+                merge_cmd,
+                cwd=repo_root,
+                env=env,
+                job_pgid=job_pgid,
+                stdout_path=merge_log,
+            )
+            procs.append(merge)
+            print(f"[start] merge-sidecar -> {merge_log}")
 
         # UI (Vite) - join the omega job group so a single killpg() cleans up everything.
         if args.ui:

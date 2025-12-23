@@ -52,9 +52,12 @@ class DreamBridgeConfig:
 
 _DISABLED_MSG = (
     "DreamBridgeEnv (pixel-level gym wrapper) is intentionally disabled.\n"
-    "Use offline dreaming from real `.pt` rollouts instead:\n"
-    "  - `python scripts/video_pretrain.py --phase dream`\n"
-    "  - or `POST /offline/dream/train` on the learner service.\n"
+    "Use offline pipelines grounded in real `.pt` rollouts instead.\n"
+    "\n"
+    "Recommended options:\n"
+    "  - Replay environment (actions ignored): `src/neuro_genie/offline_replay_env.py`\n"
+    "    Example: `python scripts/train_neuro_genie.py --mode dream_rl --pt-dir rollouts/`\n"
+    "  - Offline pretraining/export: `python scripts/video_pretrain.py --phase export_pt world_model dream`\n"
     "This avoids synthetic initialization and placeholder rewards."
 )
 
@@ -106,4 +109,3 @@ def make_batched_dream_env(
     """Create a batched dream environment (disabled)."""
 
     return BatchedDreamEnv(num_envs=num_envs, cfg=cfg, world_model=world_model)
-

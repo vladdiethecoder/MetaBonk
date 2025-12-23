@@ -37,6 +37,7 @@ __all__ = [
     "LatentActionModel", "LAMConfig",
     "ActionAdapter", "ActionAdapterConfig",
     "DreamBridgeEnv", "DreamBridgeConfig",
+    "OfflineReplayEnv", "OfflineReplayConfig", "Trajectory",
     "GenerativeWorldModel", "GWMConfig",
     "LiquidStabilizer", "StabilizerConfig",
     
@@ -81,6 +82,12 @@ def __getattr__(name: str):
     if name in ("DreamBridgeEnv", "DreamBridgeConfig", "BatchedDreamEnv"):
         from src.neuro_genie.dream_bridge import (
             DreamBridgeEnv, DreamBridgeConfig, BatchedDreamEnv,
+        )
+        return locals()[name]
+
+    if name in ("OfflineReplayEnv", "OfflineReplayConfig", "Trajectory", "load_pt_trajectory"):
+        from src.neuro_genie.offline_replay_env import (
+            OfflineReplayEnv, OfflineReplayConfig, Trajectory, load_pt_trajectory,
         )
         return locals()[name]
     
@@ -179,4 +186,3 @@ def __getattr__(name: str):
         return locals()[name]
     
     raise AttributeError(f"module 'neuro_genie' has no attribute {name!r}")
-

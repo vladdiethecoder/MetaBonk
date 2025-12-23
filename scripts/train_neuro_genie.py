@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from dataclasses import asdict
@@ -46,9 +47,7 @@ from src.neuro_genie.action_adapter import (
 from src.neuro_genie.generative_world_model import (
     GWMConfig, GenerativeWorldModel, GWMTrainer, VideoTokenizer,
 )
-from src.neuro_genie.dream_bridge import (
-    DreamBridgeConfig, DreamBridgeEnv, BatchedDreamEnv,
-)
+from src.neuro_genie.offline_replay_env import OfflineReplayEnv
 from src.neuro_genie.federated_dreaming import (
     FederatedDreamingConfig, FederatedDreamCoordinator,
     AgentRole, NICHE_REGISTRY,
@@ -279,43 +278,99 @@ def train_world_model(args):
 
 
 def train_dream_rl(args):
-    """Train policy using dream-based RL (PPO in dreams)."""
+    """Train a policy from offline `.pt` rollouts (honest replay, no interactivity).
+
+    This is intentionally **not** "interactive dreaming": actions do not affect
+    the next state in replay. The objective here is to produce a strong
+    initialization via behavior cloning over the recorded dataset.
+    """
     print("\n" + "="*60)
-    print("  DREAM-BASED REINFORCEMENT LEARNING")
+    print("  OFFLINE REPLAY POLICY TRAINING (BEHAVIOR CLONING)")
     print("="*60)
     
     print("""
 ┌─────────────────────────────────────────────────────────────┐
-│ Phase 3: Lucid Dreaming                                     │
+│ Offline Replay (Honest)                                     │
 │                                                             │
-│ Training the agent inside the world model's "dreams":       │
-│ • 10-100x faster than real game (no physics simulation)     │
-│ • Controllable difficulty via Dungeon Master prompts        │
-│ • Dense rewards from learned reward head                    │
+│ Training from recorded `.pt` rollouts (actions ignored):    │
+│ • No live game connection required                          │
+│ • No synthetic initialization / placeholder rewards         │
+│ • Produces a strong initialization for later online RL      │
 │                                                             │
-│ The agent learns in imagination, then deploys to reality.   │
+│ Later: fine-tune online or in a learned world model.        │
 └─────────────────────────────────────────────────────────────┘
     """)
-    
-    # Load world model
-    print(f"Loading world model from: {args.world_model}")
-    
-    # Create dream environment
-    dream_cfg = DreamBridgeConfig(
-        world_model_checkpoint=args.world_model,
-        max_episode_steps=args.episode_length,
+
+    pt_dir = Path(getattr(args, "pt_dir", "") or os.environ.get("METABONK_VIDEO_ROLLOUTS_PT_DIR", "") or args.data).expanduser()
+    print(f"[offline_replay] rollouts: {pt_dir}")
+    env = OfflineReplayEnv(rollout_dir=pt_dir, sampling_mode="random")
+
+    # Infer dims from one reset.
+    obs0, info0 = env.reset()
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() and not getattr(args, "device", "cuda").lower().startswith("cpu") else "cpu")
+    obs0_t = torch.as_tensor(obs0, dtype=torch.float32, device=device)
+
+    # Determine action dim from the first trajectory.
+    traj_path = Path(str(info0.get("path") or ""))
+    tr = torch.load(traj_path, map_location="cpu", weights_only=False)
+    act_dim = int(tr["actions"].shape[-1])
+    obs_dim = int(obs0_t.numel())
+
+    # Simple MLP policy: obs -> action (continuous).
+    policy = torch.nn.Sequential(
+        torch.nn.Linear(obs_dim, 512),
+        torch.nn.ReLU(),
+        torch.nn.Linear(512, 512),
+        torch.nn.ReLU(),
+        torch.nn.Linear(512, act_dim),
+    ).to(device)
+
+    opt = torch.optim.Adam(policy.parameters(), lr=float(args.lr))
+    loss_fn = torch.nn.MSELoss()
+
+    max_steps = int(args.max_steps)
+    batch_size = int(args.batch_size)
+    print(f"[offline_replay] device={device} obs_dim={obs_dim} act_dim={act_dim} steps={max_steps} batch={batch_size}")
+
+    # Batch sampling by repeatedly resetting to random trajectories and sampling random indices.
+    # This stays honest: targets are the recorded actions.
+    for step in range(max_steps):
+        # Sample a random trajectory file via env.reset().
+        obs, info = env.reset()
+        traj_path = Path(str(info.get("path") or ""))
+        data = torch.load(traj_path, map_location="cpu", weights_only=False)
+        obs_all = data["observations"]
+        acts_all = data["actions"]
+        T = int(obs_all.shape[0])
+        if T < 2:
+            continue
+        idx = torch.randint(0, T, (min(batch_size, T),), device="cpu")
+        x = obs_all[idx].to(device=device, dtype=torch.float32)
+        y = acts_all[idx].to(device=device, dtype=torch.float32)
+
+        pred = policy(x)
+        loss = loss_fn(pred, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        if (step + 1) % max(1, int(args.log_interval)) == 0:
+            print(f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}")
+
+    out_dir = Path(args.checkpoint_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "offline_replay_policy.pt"
+    torch.save(
+        {
+            "policy_state_dict": policy.state_dict(),
+            "obs_dim": obs_dim,
+            "action_dim": act_dim,
+            "pt_dir": str(pt_dir),
+        },
+        out_path,
     )
-    
-    if args.num_envs > 1:
-        env = BatchedDreamEnv(args.num_envs, dream_cfg)
-    else:
-        env = DreamBridgeEnv(dream_cfg)
-    
-    # PPO training loop
-    print("\nStarting PPO training in dreams...")
-    # ... PPO training implementation ...
-    
-    print("\nDream-based RL training complete!")
+    print(f"[offline_replay] Saved policy to: {out_path}")
 
 
 def train_federated(args):
@@ -396,8 +451,8 @@ Examples:
   # Train Generative World Model
   python train_neuro_genie.py --mode world_model --data ./rollouts/
   
-  # Train policy in dreams
-  python train_neuro_genie.py --mode dream_rl --world_model ./checkpoints/gwm.pt
+  # Train policy from offline replay rollouts (behavior cloning)
+  python train_neuro_genie.py --mode dream_rl --pt-dir ./rollouts/
   
   # Run federated dreaming
   python train_neuro_genie.py --mode federated --iterations 3
@@ -418,6 +473,8 @@ Examples:
                        help="Path to training data")
     parser.add_argument("--world_model", type=str, default="./checkpoints/gwm.pt",
                        help="Path to world model checkpoint")
+    parser.add_argument("--pt-dir", type=str, default=os.environ.get("METABONK_VIDEO_ROLLOUTS_PT_DIR", "rollouts"),
+                       help="Directory of .pt rollouts for offline replay training")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/neuro_genie/",
                        help="Directory for saving checkpoints")
     
