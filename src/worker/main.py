@@ -377,6 +377,28 @@ class WorkerService:
             self._menu_teacher_cycle_k = int(os.environ.get("METABONK_MENU_TEACHER_CYCLE_K", "2"))
         except Exception:
             self._menu_teacher_cycle_k = 2
+        self._menu_teacher_confirm_template = str(
+            os.environ.get("METABONK_MENU_TEACHER_CONFIRM_TEMPLATE", "") or ""
+        ).strip()
+        if not self._menu_teacher_confirm_template:
+            default_tpl = Path("assets") / "ui_templates" / "confirm_button.png"
+            if default_tpl.exists():
+                self._menu_teacher_confirm_template = str(default_tpl)
+        try:
+            self._menu_teacher_confirm_thresh = float(
+                os.environ.get("METABONK_MENU_TEACHER_CONFIRM_THRESH", "0.75")
+            )
+        except Exception:
+            self._menu_teacher_confirm_thresh = 0.75
+        try:
+            self._menu_teacher_confirm_scale = float(
+                os.environ.get("METABONK_MENU_TEACHER_CONFIRM_SCALE", "1.0")
+            )
+        except Exception:
+            self._menu_teacher_confirm_scale = 1.0
+        self._menu_teacher_confirm_enabled = bool(self._menu_teacher_confirm_template)
+        self._menu_teacher_confirm_gray = None
+        self._menu_teacher_confirm_warned = False
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -600,7 +622,15 @@ class WorkerService:
             fifo_dir = str(os.environ.get("METABONK_STREAM_FIFO_DIR", "temp/streams") or "temp/streams").strip()
             if not fifo_dir:
                 fifo_dir = "temp/streams"
-            self._fifo_stream_path = os.path.join(fifo_dir, f"{self.instance_id}.h264")
+            fifo_container = str(os.environ.get("METABONK_FIFO_CONTAINER", "mpegts") or "mpegts").strip().lower()
+            if fifo_container in ("ts", "mpegts"):
+                fifo_container = "mpegts"
+                fifo_ext = "ts"
+            else:
+                fifo_container = "h264"
+                fifo_ext = "h264"
+            self._fifo_stream_container = fifo_container
+            self._fifo_stream_path = os.path.join(fifo_dir, f"{self.instance_id}.{fifo_ext}")
 
     def _ensure_pipewire_node(self) -> Optional[str]:
         """Ensure PIPEWIRE_NODE is set (best-effort) for GPU capture/streaming."""
@@ -772,7 +802,11 @@ class WorkerService:
                 except Exception:
                     pipe_bytes = 0
                 self._fifo_publisher = FifoH264Publisher(
-                    cfg=FifoPublishConfig(fifo_path=self._fifo_stream_path, pipe_size_bytes=pipe_bytes),
+                    cfg=FifoPublishConfig(
+                        fifo_path=self._fifo_stream_path,
+                        pipe_size_bytes=pipe_bytes,
+                        container=str(getattr(self, "_fifo_stream_container", "h264") or "h264"),
+                    ),
                     streamer=self.streamer,
                 )
             self._stream_error = None
@@ -1356,6 +1390,63 @@ class WorkerService:
         dark = (mean < float(self._frame_black_mean)) and (p99 < float(self._frame_black_p99))
         desat = mean_s < float(self._frame_black_sat)
         return dark or desat
+
+    def _load_confirm_template(self) -> Optional["Any"]:
+        if self._menu_teacher_confirm_gray is not None:
+            return self._menu_teacher_confirm_gray
+        if not self._menu_teacher_confirm_enabled:
+            return None
+        path = self._menu_teacher_confirm_template
+        if not path:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            data = Path(path).read_bytes()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                raise RuntimeError("template decode failed")
+            self._menu_teacher_confirm_gray = img
+            return self._menu_teacher_confirm_gray
+        except Exception as e:
+            if not self._menu_teacher_confirm_warned:
+                print(f"[TEACHER] WARN: confirm template unavailable ({e})", flush=True)
+                self._menu_teacher_confirm_warned = True
+            self._menu_teacher_confirm_gray = None
+            return None
+
+    def _match_confirm_template(self, payload: bytes) -> Optional[tuple[float, float, float]]:
+        if not payload:
+            return None
+        tmpl = self._load_confirm_template()
+        if tmpl is None:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                return None
+            scale = float(self._menu_teacher_confirm_scale or 1.0)
+            if scale and scale != 1.0:
+                img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            th, tw = int(tmpl.shape[0]), int(tmpl.shape[1])
+            if img.shape[0] < th or img.shape[1] < tw:
+                return None
+            res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            if max_val < float(self._menu_teacher_confirm_thresh):
+                return None
+            cx = float(max_loc[0] + tw * 0.5)
+            cy = float(max_loc[1] + th * 0.5)
+            if scale and scale != 1.0:
+                cx /= scale
+                cy /= scale
+            return float(max_val), cx, cy
+        except Exception:
+            return None
 
     def _push_frame_ring(self, payload: Optional[bytes], *, source: str, ts: float) -> None:
         if not self._frame_ring_enabled or not payload:
@@ -2726,6 +2817,7 @@ class WorkerService:
 
             input_bootstrap = False
             teacher_action_idx = None
+            teacher_action_kind = None
             cur_menu = ""
             playing_flag = False
             in_menu = False
@@ -2749,17 +2841,48 @@ class WorkerService:
             ):
                 menu_key = cur_menu or str(game_state.get("currentMenu") or "")
                 if self._menu_teacher.step(now, in_menu=in_menu, menu_key=menu_key):
-                    teacher_action_idx = self._menu_teacher.pick_action_index(
-                        self._menu_bias_indices, self._menu_teacher_cycle_k
-                    )
-                    if teacher_action_idx is not None and teacher_action_idx < len(a_disc):
-                        a_disc[teacher_action_idx] = 1
-                        self._menu_teacher.record_intervention(now)
-                        if self._menu_teacher.should_log_intervention():
-                            print(
-                                f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting idx={teacher_action_idx}",
-                                flush=True,
-                            )
+                    clicked = False
+                    if (
+                        self._menu_teacher_confirm_enabled
+                        and latest_image_bytes is not None
+                        and frame_size is not None
+                        and hasattr(self._input_backend, "click_at")
+                    ):
+                        match = self._match_confirm_template(latest_image_bytes)
+                        if match:
+                            score, cx, cy = match
+                            try:
+                                fx = float(cx) / float(frame_size[0])
+                                fy = float(cy) / float(frame_size[1])
+                            except Exception:
+                                fx = fy = None
+                            if fx is not None and fy is not None:
+                                try:
+                                    self._input_backend.click_at(fx, fy)
+                                    clicked = True
+                                    teacher_action_kind = "click_confirm"
+                                    self._menu_teacher.record_intervention(now)
+                                    if self._menu_teacher.should_log_intervention():
+                                        print(
+                                            f"[TEACHER] Stalled in {menu_key or 'menu'}; "
+                                            f"click_confirm score={score:.3f} x={fx:.3f} y={fy:.3f}",
+                                            flush=True,
+                                        )
+                                except Exception:
+                                    clicked = False
+                    if not clicked:
+                        teacher_action_idx = self._menu_teacher.pick_action_index(
+                            self._menu_bias_indices, self._menu_teacher_cycle_k
+                        )
+                        if teacher_action_idx is not None and teacher_action_idx < len(a_disc):
+                            a_disc[teacher_action_idx] = 1
+                            teacher_action_kind = f"key:{teacher_action_idx}"
+                            self._menu_teacher.record_intervention(now)
+                            if self._menu_teacher.should_log_intervention():
+                                print(
+                                    f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting idx={teacher_action_idx}",
+                                    flush=True,
+                                )
             if (
                 self._input_backend
                 and self._menu_bias_enabled
@@ -2802,8 +2925,8 @@ class WorkerService:
                     action_label = "click_xy"
                 elif input_bootstrap:
                     action_label = "bootstrap"
-                elif teacher_action_idx is not None:
-                    action_label = f"teacher:{int(teacher_action_idx)}"
+                elif teacher_action_kind is not None:
+                    action_label = f"teacher:{teacher_action_kind}"
                 elif a_disc:
                     action_label = f"disc:{int(a_disc[0])}"
                 elif a_cont:
