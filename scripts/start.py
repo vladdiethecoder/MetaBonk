@@ -643,23 +643,22 @@ def main() -> int:
                 def _record_proof() -> None:
                     time.sleep(max(0, int(args.video_proof_warmup_s)))
                     instance_id = f"{args.instance_prefix}-{int(args.video_proof_worker)}"
+                    port = int(args.worker_base_port) + int(args.video_proof_worker)
+                    urls = [f"http://127.0.0.1:{port}/stream.mp4"]
                     if args.go2rtc and go2rtc_started:
-                        url = (
+                        urls.append(
                             f"{args.go2rtc_url.rstrip('/')}/api/stream.mp4?"
                             f"src={instance_id}&duration={int(args.video_proof_duration)}"
                         )
-                    else:
-                        port = int(args.worker_base_port) + int(args.video_proof_worker)
-                        url = f"http://127.0.0.1:{port}/stream.mp4"
                     out_path = videos_dir / "gameplay_proof.mp4"
                     with open(proof_log, "a", encoding="utf-8") as f:
-                        f.write(f"[proof] recording {url} -> {out_path}\n")
+                        f.write(f"[proof] recording {', '.join(urls)} -> {out_path}\n")
                     try:
                         if str(repo_root) not in sys.path:
                             sys.path.insert(0, str(repo_root))
                         from src.utils.live_stream_recorder import record_live_stream
 
-                        rc = record_live_stream(url=url, output_path=str(out_path), duration_s=int(args.video_proof_duration))
+                        rc = record_live_stream(urls=urls, output_path=str(out_path), duration_s=int(args.video_proof_duration))
                     except Exception as e:
                         rc = 1
                         with open(proof_log, "a", encoding="utf-8") as f:
