@@ -131,6 +131,12 @@ class BonkLinkClient:
         self.pipe_name = pipe_name
         self._sock: Optional[socket.socket] = None
         self._pipe = None
+        self._rx_buf = bytearray()
+        self._drain_latest = os.environ.get("METABONK_BONKLINK_DRAIN", "0") in ("1", "true", "True")
+        self._log = os.environ.get("METABONK_BONKLINK_LOG", "0") in ("1", "true", "True")
+        self._log_every_s = float(os.environ.get("METABONK_BONKLINK_LOG_EVERY_S", "1.0") or 1.0)
+        self._last_log_ts = 0.0
+        self._pkt_count = 0
 
     def connect(self, timeout_s: float = 5.0) -> bool:
         if self.use_named_pipe:
@@ -250,6 +256,8 @@ class BonkLinkClient:
         self, timeout_ms: int = 16
     ) -> Optional[Tuple[BonkLinkState, Optional[bytes]]]:
         """Read one tick packet (state + optional JPEG frame)."""
+        if self._sock:
+            return self._read_state_frame_socket(timeout_ms, drain_latest=self._drain_latest)
         header = self._read_exact(4, timeout_ms)
         if not header:
             return None
@@ -274,7 +282,111 @@ class BonkLinkClient:
             state = _parse_state(state_bytes)
         except Exception:
             return None
+        self._log_state(state)
         return state, frame_bytes
+
+    def _read_state_frame_socket(
+        self, timeout_ms: int, *, drain_latest: bool
+    ) -> Optional[Tuple[BonkLinkState, Optional[bytes]]]:
+        latest: Optional[Tuple[BonkLinkState, Optional[bytes]]] = None
+        # Pull at least once with the provided timeout.
+        self._recv_into_buffer(timeout_ms)
+        latest = self._pop_latest_packet(latest, drain=drain_latest)
+        if latest is None:
+            return None
+        return latest
+
+    def _recv_into_buffer(self, timeout_ms: int) -> bool:
+        if not self._sock:
+            return False
+        try:
+            self._sock.settimeout(timeout_ms / 1000.0)
+            chunk = self._sock.recv(65536)
+        except Exception:
+            return False
+        finally:
+            try:
+                self._sock.settimeout(None)
+            except Exception:
+                pass
+        if not chunk:
+            return False
+        self._rx_buf.extend(chunk)
+        return True
+
+    def _pop_latest_packet(
+        self, latest: Optional[Tuple[BonkLinkState, Optional[bytes]]], *, drain: bool
+    ) -> Optional[Tuple[BonkLinkState, Optional[bytes]]]:
+        while True:
+            pkt = self._pop_packet_from_buffer()
+            if pkt is None:
+                break
+            latest = pkt
+            if not drain:
+                return latest
+        if drain:
+            while self._recv_into_buffer(0):
+                while True:
+                    pkt = self._pop_packet_from_buffer()
+                    if pkt is None:
+                        break
+                    latest = pkt
+        return latest
+
+    def _pop_packet_from_buffer(self) -> Optional[Tuple[BonkLinkState, Optional[bytes]]]:
+        if len(self._rx_buf) < 4:
+            return None
+        state_size = struct.unpack_from("<i", self._rx_buf, 0)[0]
+        if state_size <= 0 or state_size > MAX_STATE_BYTES:
+            # Corrupt buffer; reset to resync.
+            self._rx_buf.clear()
+            return None
+        if len(self._rx_buf) < 4 + state_size + 4:
+            return None
+        frame_size = struct.unpack_from("<i", self._rx_buf, 4 + state_size)[0]
+        if frame_size < 0 or frame_size > MAX_FRAME_BYTES:
+            self._rx_buf.clear()
+            return None
+        total = 4 + state_size + 4 + max(0, frame_size)
+        if len(self._rx_buf) < total:
+            return None
+        state_bytes = bytes(self._rx_buf[4 : 4 + state_size])
+        frame_bytes: Optional[bytes] = None
+        if frame_size > 0:
+            start = 4 + state_size + 4
+            frame_bytes = bytes(self._rx_buf[start : start + frame_size])
+        del self._rx_buf[:total]
+        try:
+            state = _parse_state(state_bytes)
+        except Exception:
+            return None
+        self._log_state(state)
+        return state, frame_bytes
+
+    def _log_state(self, state: BonkLinkState) -> None:
+        if not self._log:
+            return
+        now = time.time()
+        if (now - self._last_log_ts) < max(0.0, float(self._log_every_s)):
+            return
+        self._pkt_count += 1
+        self._last_log_ts = now
+        try:
+            menu = state.current_menu
+        except Exception:
+            menu = ""
+        try:
+            game_time = float(state.game_time)
+        except Exception:
+            game_time = 0.0
+        try:
+            playing = bool(state.is_playing)
+        except Exception:
+            playing = False
+        print(
+            f"[BL-RX] pkt={self._pkt_count} menu='{menu}' "
+            f"playing={playing} game_time={game_time:.2f}"
+        )
 
     def send_action(self, action: BonkLinkAction) -> bool:
         payload = action.to_bytes()

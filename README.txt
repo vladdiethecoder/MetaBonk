@@ -107,5 +107,8 @@ Environment Variables
 - METABONK_MENU_START_BONUS: Reward bonus for menu transitions (e.g., MainMenu->GeneratedMap)
 - METABONK_REWARD_LOG: Emit [REWARD] lines for non-zero rewards (default 0)
 - METABONK_MENU_LOG: Emit [MENU] lines on menu changes (default 0)
+- METABONK_BONKLINK_LOG: Emit [BL-RX] lines for BonkLink packets (default 0)
+- METABONK_BONKLINK_LOG_EVERY_S: Seconds between BonkLink packet logs (default 1.0)
+- METABONK_BONKLINK_DRAIN: Drain socket to latest BonkLink packet (default 0)
 - METABONK_PPO_CONTINUOUS_DIM: Override PPO continuous action dim (e.g., 3 for scroll)
 - METABONK_PPO_DISCRETE_BRANCHES: Override PPO discrete branches (e.g., "2,2,2,2,2")
