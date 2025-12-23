@@ -198,7 +198,9 @@ class XDoToolBackend:
             return False
         now = time.time()
         if (now - self._last_focus_ts) >= self.focus_cooldown_s:
+            # gamescope/Xwayland sometimes doesn't support _NET_ACTIVE_WINDOW; windowfocus still works.
             self._run(["xdotool", "windowactivate", "--sync", wid])
+            self._run(["xdotool", "windowfocus", "--sync", wid])
             self._last_focus_ts = now
         return True
 
