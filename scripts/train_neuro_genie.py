@@ -379,6 +379,18 @@ def train_dream_rl(args):
     use_cuda_graph = bool(getattr(args, "cuda_graph", False)) and device.type == "cuda"
     graph = None
     fixed_x = fixed_y = None
+    shape_guard_disabled = False
+    def _disable_cuda_graph(reason: str) -> None:
+        nonlocal use_cuda_graph, graph, fixed_x, fixed_y, shape_guard_disabled
+        if use_cuda_graph:
+            print(f"[offline_replay] cuda_graph=disabled reason=\"{reason}\"")
+        use_cuda_graph = False
+        graph = None
+        fixed_x = fixed_y = None
+        shape_guard_disabled = True
+
+    if use_cuda_graph and (batch_size <= 0 or obs_dim <= 0 or act_dim <= 0):
+        _disable_cuda_graph("invalid_static_shape")
     if use_cuda_graph:
         fixed_x = torch.zeros((batch_size, obs_dim), device=device, dtype=torch.float32)
         fixed_y = torch.zeros((batch_size, act_dim), device=device, dtype=torch.float32)
@@ -414,6 +426,21 @@ def train_dream_rl(args):
         idx = torch.randint(0, T, (min(batch_size, T),), device="cpu")
         x = obs_all[idx].to(device=device, dtype=torch.float32)
         y = acts_all[idx].to(device=device, dtype=torch.float32)
+
+        if x.ndim != 2 or x.shape[1] != obs_dim or y.ndim != 2 or y.shape[1] != act_dim:
+            if use_cuda_graph and not shape_guard_disabled:
+                _disable_cuda_graph("dynamic_shape")
+            # Fall back to eager path on incompatible shapes.
+            pred = policy(x.reshape(x.shape[0], -1))
+            loss = loss_fn(pred, y.reshape(y.shape[0], -1))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            if (step + 1) % max(1, int(args.log_interval)) == 0:
+                print(
+                    f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}"
+                )
+            continue
 
         if use_cuda_graph and fixed_x is not None and fixed_y is not None and graph is not None:
             if x.shape[0] != batch_size:
