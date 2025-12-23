@@ -30,6 +30,7 @@ import numpy as np
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     from torch.utils.data import DataLoader, Dataset
     TORCH_AVAILABLE = True
 except ImportError:
@@ -731,6 +732,217 @@ def train_federated(args):
     print(f"God Agent saved to: {results['final_god_agent_path']}")
 
 
+def train_strip_lam(args):
+    """Train strip-based latent action model from `.pt` rollouts."""
+    print("\n" + "=" * 60)
+    print("  STRIP-BASED LATENT ACTION MODEL")
+    print("=" * 60)
+
+    pt_dir = Path(
+        getattr(args, "pt_dir", "")
+        or os.environ.get("METABONK_VIDEO_ROLLOUTS_PT_DIR", "")
+        or args.data
+    ).expanduser()
+    print(f"[strip_lam] rollouts: {pt_dir}")
+
+    if bool(getattr(args, "enable_potential_shaping", False)):
+        print("[strip_lam] potential_shaping requested but ignored (BC mode)")
+
+    import torch
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        and not getattr(args, "device", "cuda").lower().startswith("cpu")
+        else "cpu"
+    )
+    optimize_5090 = bool(getattr(args, "optimize_5090", False)) or str(
+        os.environ.get("METABONK_OPTIMIZE_5090", "0") or "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    amp_mode = str(getattr(args, "amp", "auto") or "auto").strip().lower()
+    if amp_mode == "auto":
+        amp_mode = "bf16" if optimize_5090 and device.type == "cuda" else "off"
+    if amp_mode not in ("off", "bf16", "fp16"):
+        raise ValueError(f"--amp must be off|bf16|fp16 (got {amp_mode!r})")
+    amp_enabled = amp_mode in ("bf16", "fp16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_mode == "fp16" and device.type == "cuda")
+
+    def _autocast():
+        if amp_enabled:
+            return torch.autocast(device_type="cuda", dtype=amp_dtype)
+        return contextlib.nullcontext()
+
+    compile_mode = str(getattr(args, "compile_mode", "max-autotune") or "max-autotune")
+    if bool(getattr(args, "cuda_graph", False)) and bool(getattr(args, "compile", False)):
+        if compile_mode == "max-autotune":
+            compile_mode = "max-autotune-no-cudagraphs"
+            print("[strip_lam] compile_mode=max-autotune-no-cudagraphs (cuda_graph enabled)")
+    if optimize_5090 and device.type == "cuda":
+        cfg = BlackwellOptimConfig(
+            enable_tf32=True,
+            cudnn_benchmark=True,
+            matmul_precision=str(getattr(args, "matmul_precision", "high") or "high"),
+            alloc_conf=str(getattr(args, "alloc_conf", "") or "expandable_segments:True"),
+            memory_fraction=float(getattr(args, "memory_fraction", 0.0) or 0.0),
+            compile=bool(getattr(args, "compile", False)),
+            compile_mode=compile_mode,
+        )
+        applied = apply_blackwell_defaults(cfg)
+        if applied:
+            print(f"[strip_lam] blackwell={applied}")
+
+    from src.training.lazy_strip_dataset import LazyStripDataset
+    from src.training.smoothed_strip_curriculum import SmoothedStripCurriculum
+    from src.neuro_genie.masked_strip_model import MaskedStripActionModel
+    from src.training.masked_video_loss import MaskedVideoLoss
+
+    strip_length = int(args.strip_length)
+    curriculum = None
+    if bool(getattr(args, "strip_curriculum", False)):
+        curriculum = SmoothedStripCurriculum(
+            min_strip_length=int(args.min_strip_length),
+            max_strip_length=int(args.max_strip_length),
+            ema_alpha=float(args.ema_alpha),
+            stability_window=int(args.stability_window),
+        )
+        strip_length = curriculum.get_strip_length()
+
+    dataset = LazyStripDataset(
+        pt_dir=str(pt_dir),
+        strip_length=strip_length,
+        max_strip_length=int(args.max_strip_length),
+        overlap=int(args.strip_overlap),
+        cache_size=int(args.strip_cache_size if args.lazy_loading else 0),
+    )
+
+    loader_kwargs = {
+        "batch_size": int(args.batch_size),
+        "shuffle": True,
+        "num_workers": int(getattr(args, "num_workers", 0) or 0),
+        "pin_memory": device.type == "cuda",
+        "drop_last": bool(getattr(args, "cuda_graph", False)),
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2) or 2)
+    loader = DataLoader(dataset, **loader_kwargs)
+    loader_iter = iter(loader)
+
+    sample = next(iter(loader))
+    obs = sample["observations"]
+    actions = sample["actions"]
+    if obs.ndim != 5:
+        raise ValueError(f"strip_lam expects observations [B,T,C,H,W], got {obs.shape}")
+    action_dim = int(actions.shape[-1]) if actions.ndim >= 3 else 1
+
+    model = MaskedStripActionModel(
+        in_channels=int(obs.shape[2]),
+        latent_dim=int(args.strip_latent_dim),
+        action_dim=action_dim,
+        num_heads=int(args.strip_heads),
+        num_layers=int(args.strip_layers),
+        max_strip_length=int(args.max_strip_length),
+    ).to(device)
+    model = maybe_compile(
+        model,
+        enabled=bool(getattr(args, "compile", False)) and device.type == "cuda",
+        mode=compile_mode,
+    )
+
+    masked_loss = None
+    if bool(getattr(args, "masked_video_loss", False)):
+        masked_loss = MaskedVideoLoss(mask_ratio=float(args.mask_ratio)).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=float(args.lr))
+    max_steps = int(args.max_steps)
+    log_interval = max(1, int(args.log_interval))
+
+    print(
+        f"[strip_lam] device={device} strip_len={strip_length} action_dim={action_dim} "
+        f"steps={max_steps} batch={loader_kwargs['batch_size']} amp={amp_mode}"
+    )
+
+    for step in range(max_steps):
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            batch = next(loader_iter)
+
+        obs = batch["observations"].to(device=device, dtype=torch.float32, non_blocking=True)
+        next_obs = batch["next_observations"].to(device=device, dtype=torch.float32, non_blocking=True)
+        actions = batch["actions"].to(device=device, dtype=torch.float32, non_blocking=True)
+        valid_mask = batch.get("valid_mask")
+        if valid_mask is not None:
+            valid_mask = valid_mask.to(device=device, non_blocking=True).bool()
+
+        with _autocast():
+            pred_actions, features = model(obs, next_obs, valid_mask=valid_mask)
+            if actions.ndim == 2:
+                actions = actions.unsqueeze(-1)
+            mask = valid_mask.unsqueeze(-1) if valid_mask is not None else None
+            if mask is not None:
+                diff = (pred_actions - actions) * mask
+                denom = mask.sum().clamp(min=1.0) * float(actions.shape[-1])
+                action_loss = (diff.pow(2).sum() / denom)
+            else:
+                action_loss = F.mse_loss(pred_actions, actions)
+            total_loss = action_loss
+            aux_info = {}
+            if masked_loss is not None:
+                aux, aux_info = masked_loss(obs, model.encoder)
+                total_loss = total_loss + 0.5 * aux
+
+        opt.zero_grad(set_to_none=True)
+        if scaler.is_enabled():
+            scaler.scale(total_loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            total_loss.backward()
+            opt.step()
+
+        if curriculum and (step + 1) % 100 == 0:
+            with torch.no_grad():
+                mse = float(action_loss.detach().item())
+                prediction_accuracy = 1.0 / (1.0 + mse)
+                episode_success = bool(batch["rewards"].sum().item() > 0)
+            curriculum.record_episode(success=episode_success, prediction_accuracy=prediction_accuracy)
+            new_len = curriculum.get_strip_length()
+            if new_len != dataset.strip_length:
+                dataset.set_strip_length(new_len)
+                loader = DataLoader(dataset, **loader_kwargs)
+                loader_iter = iter(loader)
+            metrics = curriculum.get_metrics()
+            print(
+                f"[strip_lam] curriculum strip={metrics['strip_length']} "
+                f"ema_success={metrics['ema_success_rate']:.2%} "
+                f"ema_acc={metrics['ema_prediction_accuracy']:.2%}"
+            )
+
+        if (step + 1) % log_interval == 0:
+            msg = f"[strip_lam] step {step+1}/{max_steps} loss={float(total_loss.detach().item()):.6f}"
+            if masked_loss is not None and aux_info:
+                msg += f" recon={aux_info.get('reconstruction_loss', 0):.6f}"
+            print(msg)
+
+    out_dir = Path(args.checkpoint_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "strip_lam_policy.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "strip_length": dataset.strip_length,
+            "action_dim": action_dim,
+            "latent_dim": int(args.strip_latent_dim),
+            "pt_dir": str(pt_dir),
+        },
+        out_path,
+    )
+    print(f"[strip_lam] Saved model to: {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Neuro-Genie Training Pipeline",
@@ -756,7 +968,7 @@ Examples:
         "--mode",
         type=str,
         required=True,
-        choices=["lam", "adapter", "world_model", "dream_rl", "federated"],
+        choices=["lam", "adapter", "world_model", "dream_rl", "federated", "strip_lam"],
         help="Training mode",
     )
     
@@ -850,6 +1062,38 @@ Examples:
                        help="Stop profiling after N steps (0 = keep running).")
     parser.add_argument("--profile-with-stack", action="store_true",
                        help="Collect stack traces in profiler output.")
+
+    # Strip LAM settings
+    parser.add_argument("--strip-curriculum", action="store_true",
+                       help="Enable strip-length curriculum for strip_lam mode.")
+    parser.add_argument("--lazy-loading", action="store_true",
+                       help="Use lazy strip dataset with LRU cache.")
+    parser.add_argument("--strip-cache-size", type=int, default=32,
+                       help="LRU cache size for lazy strip dataset.")
+    parser.add_argument("--min-strip-length", type=int, default=1,
+                       help="Minimum strip length for curriculum.")
+    parser.add_argument("--max-strip-length", type=int, default=16,
+                       help="Maximum strip length for curriculum.")
+    parser.add_argument("--strip-length", type=int, default=4,
+                       help="Fixed strip length when curriculum disabled.")
+    parser.add_argument("--strip-overlap", type=int, default=0,
+                       help="Frame overlap between consecutive strips.")
+    parser.add_argument("--strip-latent-dim", type=int, default=256,
+                       help="Latent dimension for strip model.")
+    parser.add_argument("--strip-heads", type=int, default=8,
+                       help="Attention heads for strip model.")
+    parser.add_argument("--strip-layers", type=int, default=4,
+                       help="Transformer layers for strip model.")
+    parser.add_argument("--masked-video-loss", action="store_true",
+                       help="Enable masked video auxiliary loss (VideoMAE-style).")
+    parser.add_argument("--mask-ratio", type=float, default=0.75,
+                       help="Masking ratio for masked video loss.")
+    parser.add_argument("--ema-alpha", type=float, default=0.1,
+                       help="EMA alpha for strip curriculum.")
+    parser.add_argument("--stability-window", type=int, default=50,
+                       help="Stability window for strip curriculum.")
+    parser.add_argument("--enable-potential-shaping", action="store_true",
+                       help="Enable potential-based shaping (RL modes only; ignored for BC).")
     
     # Federated settings
     parser.add_argument("--iterations", type=int, default=3,
@@ -884,6 +1128,8 @@ Examples:
         train_dream_rl(args)
     elif args.mode == "federated":
         train_federated(args)
+    elif args.mode == "strip_lam":
+        train_strip_lam(args)
 
 
 if __name__ == "__main__":
