@@ -15,12 +15,14 @@ import asyncio
 import base64
 import os
 import random
+import re
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, List, Optional, TYPE_CHECKING
+from typing import Deque, Dict, List, Optional, TYPE_CHECKING
 
 try:
     import requests
@@ -289,6 +291,7 @@ class WorkerService:
         self._last_menu_name: Optional[str] = None
         self._last_menu_raw: Optional[str] = None
         self._last_menu_log_ts: float = 0.0
+        self._menu_state_since_ts: float = 0.0
         self._last_state_ts: float = 0.0
         self._menu_seen_main: bool = False
         self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
@@ -381,6 +384,91 @@ class WorkerService:
         except Exception:
             self._hud_pulse_log_s = 0.0
         self._hud_pulse_last_ts = 0.0
+        self._phase_model_path = str(os.environ.get("METABONK_PHASE_MODEL_PATH", "") or "").strip()
+        self._phase_model_enabled = bool(self._phase_model_path)
+        try:
+            self._phase_conf_thresh = float(os.environ.get("METABONK_PHASE_CONF_THRESH", "0.6"))
+        except Exception:
+            self._phase_conf_thresh = 0.6
+        try:
+            self._phase_infer_every_s = float(os.environ.get("METABONK_PHASE_INFER_EVERY_S", "0.5"))
+        except Exception:
+            self._phase_infer_every_s = 0.5
+        try:
+            self._phase_clip_frames = int(os.environ.get("METABONK_PHASE_CLIP_FRAMES", "12"))
+        except Exception:
+            self._phase_clip_frames = 12
+        try:
+            self._phase_input_size = int(os.environ.get("METABONK_PHASE_INPUT_SIZE", "224"))
+        except Exception:
+            self._phase_input_size = 224
+        self._phase_labels = [
+            s.strip()
+            for s in str(os.environ.get("METABONK_PHASE_LABELS", "main_menu,char_select,map_select,loading,gameplay")).split(",")
+            if s.strip()
+        ]
+        self._phase_menu_labels = {
+            s.strip()
+            for s in str(
+                os.environ.get("METABONK_PHASE_MENU_LABELS", "main_menu,char_select,map_select,menu")
+            ).split(",")
+            if s.strip()
+        }
+        self._phase_block_labels = {
+            s.strip()
+            for s in str(os.environ.get("METABONK_PHASE_BLOCK_LABELS", "loading")).split(",")
+            if s.strip()
+        }
+        self._phase_model = None
+        self._phase_model_device = str(os.environ.get("METABONK_PHASE_MODEL_DEVICE", "cpu") or "cpu").strip()
+        self._phase_model_warned = False
+        self._phase_label: Optional[str] = None
+        self._phase_conf: float = 0.0
+        self._phase_source: Optional[str] = None
+        self._phase_effective_label: Optional[str] = None
+        self._phase_effective_source: Optional[str] = None
+        self._phase_last_infer_ts: float = 0.0
+        self._phase_gameplay = False
+        self._gameplay_phase_active = False
+        self._phase_dataset_enabled = os.environ.get("METABONK_PHASE_DATASET", "0") in ("1", "true", "True")
+        self._phase_dataset_dir = str(os.environ.get("METABONK_PHASE_DATASET_DIR", "temp/phase_dataset") or "")
+        try:
+            self._phase_dataset_every_s = float(os.environ.get("METABONK_PHASE_DATASET_EVERY_S", "2.0"))
+        except Exception:
+            self._phase_dataset_every_s = 2.0
+        try:
+            self._phase_dataset_clip_frames = int(os.environ.get("METABONK_PHASE_DATASET_CLIP_FRAMES", "12"))
+        except Exception:
+            self._phase_dataset_clip_frames = 12
+        self._phase_dataset_allow_unknown = os.environ.get("METABONK_PHASE_DATASET_ALLOW_UNKNOWN", "0") in (
+            "1",
+            "true",
+            "True",
+        )
+        try:
+            self._phase_dataset_max_per_label = int(
+                os.environ.get("METABONK_PHASE_DATASET_MAX_PER_LABEL", "0")
+            )
+        except Exception:
+            self._phase_dataset_max_per_label = 0
+        self._phase_dataset_counts: Dict[str, int] = {}
+        self._phase_dataset_last_ts = 0.0
+        self._phase_dataset_forced_label: Optional[str] = None
+        self._phase_dataset_forced_until_ts: float = 0.0
+        self._phase_dataset_loading_active = False
+        self._phase_dataset_loading_deadline = 0.0
+        try:
+            self._phase_dataset_post_play_s = float(
+                os.environ.get("METABONK_PHASE_DATASET_POST_PLAY_S", "4.0")
+            )
+        except Exception:
+            self._phase_dataset_post_play_s = 4.0
+        try:
+            self._phase_dataset_loading_timeout_s = float(
+                os.environ.get("METABONK_PHASE_DATASET_LOADING_TIMEOUT_S", "12.0")
+            )
+        except Exception:
+            self._phase_dataset_loading_timeout_s = 12.0
         self._last_valid_frame: Optional[dict] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
@@ -438,6 +526,12 @@ class WorkerService:
             self._menu_teacher_cycle_k = int(os.environ.get("METABONK_MENU_TEACHER_CYCLE_K", "2"))
         except Exception:
             self._menu_teacher_cycle_k = 2
+        try:
+            self._menu_teacher_lobby_linger_s = float(
+                os.environ.get("METABONK_MENU_TEACHER_LOBBY_LINGER_S", "6.0")
+            )
+        except Exception:
+            self._menu_teacher_lobby_linger_s = 6.0
         self._menu_teacher_confirm_template = str(
             os.environ.get("METABONK_MENU_TEACHER_CONFIRM_TEMPLATE", "") or ""
         ).strip()
@@ -460,6 +554,50 @@ class WorkerService:
         self._menu_teacher_confirm_enabled = bool(self._menu_teacher_confirm_template)
         self._menu_teacher_confirm_gray = None
         self._menu_teacher_confirm_warned = False
+        self._menu_teacher_confirm_wait_until_ts: float = 0.0
+        self._menu_teacher_confirm_pending: bool = False
+        self._menu_teacher_play_template = str(
+            os.environ.get("METABONK_MENU_TEACHER_PLAY_TEMPLATE", "") or ""
+        ).strip()
+        if not self._menu_teacher_play_template:
+            default_tpl = Path("assets") / "ui_templates" / "play_button.png"
+            if default_tpl.exists():
+                self._menu_teacher_play_template = str(default_tpl)
+        try:
+            self._menu_teacher_play_thresh = float(
+                os.environ.get("METABONK_MENU_TEACHER_PLAY_THRESH", "0.75")
+            )
+        except Exception:
+            self._menu_teacher_play_thresh = 0.75
+        try:
+            self._menu_teacher_play_scale = float(
+                os.environ.get("METABONK_MENU_TEACHER_PLAY_SCALE", "1.0")
+            )
+        except Exception:
+            self._menu_teacher_play_scale = 1.0
+        self._menu_teacher_play_enabled = bool(self._menu_teacher_play_template)
+        self._menu_teacher_play_gray = None
+        self._menu_teacher_play_warned = False
+        self._menu_teacher_play_rect_warned = False
+        self._menu_teacher_play_fallback: List[tuple[float, float]] = []
+        fallback_env = str(os.environ.get("METABONK_MENU_TEACHER_PLAY_FALLBACK", "") or "").strip()
+        if not fallback_env:
+            fallback_env = "0.18,0.35;0.18,0.45;0.18,0.55;0.18,0.65"
+        for chunk in fallback_env.split(";"):
+            if not chunk.strip():
+                continue
+            try:
+                xs, ys = chunk.split(",")
+                fx = max(0.0, min(1.0, float(xs.strip())))
+                fy = max(0.0, min(1.0, float(ys.strip())))
+                self._menu_teacher_play_fallback.append((fx, fy))
+            except Exception:
+                continue
+        self._teacher_debug_enabled = os.environ.get("METABONK_TEACHER_DEBUG", "0") in ("1", "true", "True")
+        self._teacher_debug_dir = str(
+            os.environ.get("METABONK_TEACHER_DEBUG_DIR", str(Path("temp") / "teacher_debug"))
+            or str(Path("temp") / "teacher_debug")
+        )
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -1189,10 +1327,11 @@ class WorkerService:
         game_state: dict,
         *,
         hud_present: bool = False,
+        phase_gameplay: bool = False,
     ) -> None:
         if self._gameplay_started:
             return
-        if hud_present:
+        if phase_gameplay or hud_present:
             self._gameplay_started = True
             self._gameplay_start_ts = time.time()
             return
@@ -1527,6 +1666,296 @@ class WorkerService:
             self._hud_on_count = 0
             self._hud_off_count = 0
 
+    def _sample_frame_ring_bytes(self, n: int) -> List[bytes]:
+        if not self._frame_ring or n <= 0:
+            return []
+        entries = list(self._frame_ring)[-n:]
+        payloads: List[bytes] = []
+        for entry in entries:
+            payload = entry.get("bytes")
+            if payload:
+                payloads.append(payload)
+        return payloads
+
+    def _decode_jpeg_to_array(self, payload: bytes) -> Optional["Any"]:
+        if not payload:
+            return None
+        try:
+            import io
+            import numpy as np
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(payload)).convert("RGB")
+            return np.asarray(img)
+        except Exception:
+            return None
+
+    def _weak_phase_label(self, menu_hint: Optional[bool], game_state: dict) -> str:
+        try:
+            if game_state.get("isPlaying") is True:
+                return "gameplay"
+        except Exception:
+            pass
+        if self._hud_present:
+            return "gameplay"
+        try:
+            menu_raw = str(game_state.get("currentMenu") or "").strip().lower()
+        except Exception:
+            menu_raw = ""
+        if menu_raw in ("mainmenu", "bootscene"):
+            return "main_menu"
+        if menu_raw in ("characterselect", "characterselection", "characters", "selectcharacter"):
+            return "char_select"
+        if menu_raw in ("generatedmap", "mapselect", "mapselection"):
+            return "map_select"
+        if menu_raw in ("loadingscreen", "loading"):
+            return "loading"
+        if menu_hint:
+            return "menu"
+        return "unknown"
+
+    def _phase_dataset_label_count(self, label: str) -> int:
+        if label in self._phase_dataset_counts:
+            return self._phase_dataset_counts[label]
+        try:
+            out_dir = Path(self._phase_dataset_dir) / label
+            if not out_dir.exists():
+                self._phase_dataset_counts[label] = 0
+                return 0
+            count = 0
+            for entry in out_dir.iterdir():
+                if entry.is_file():
+                    count += 1
+            self._phase_dataset_counts[label] = count
+            return count
+        except Exception:
+            return 0
+
+    def _phase_dataset_can_write(self, label: str) -> bool:
+        if self._phase_dataset_max_per_label <= 0:
+            return True
+        return self._phase_dataset_label_count(label) < int(self._phase_dataset_max_per_label)
+
+    def _set_phase_dataset_forced_label(self, label: Optional[str], *, now: float, duration_s: float) -> None:
+        if not label:
+            self._phase_dataset_forced_label = None
+            self._phase_dataset_forced_until_ts = 0.0
+            return
+        self._phase_dataset_forced_label = label
+        self._phase_dataset_forced_until_ts = float(now + max(0.0, duration_s))
+
+    def _arm_loading_window(self, *, now: float) -> None:
+        self._phase_dataset_loading_active = True
+        self._phase_dataset_loading_deadline = float(now + max(0.0, self._phase_dataset_loading_timeout_s))
+
+    def _phase_dataset_label_override(
+        self,
+        *,
+        now: float,
+        base_label: str,
+        menu_hint: Optional[bool],
+        game_state: dict,
+        gameplay_now: bool,
+    ) -> str:
+        label = base_label
+        if self._phase_dataset_forced_label and now <= float(self._phase_dataset_forced_until_ts):
+            label = self._phase_dataset_forced_label
+        if self._phase_dataset_loading_active:
+            if gameplay_now or self._hud_present or (game_state.get("isPlaying") is True):
+                self._phase_dataset_loading_active = False
+            elif now > float(self._phase_dataset_loading_deadline):
+                self._phase_dataset_loading_active = False
+            else:
+                label = "loading"
+        return label
+
+    def _teacher_debug_dump(
+        self,
+        *,
+        now: float,
+        payload: Optional[bytes],
+        mode: str,
+        roi: Optional[tuple[int, int, int, int]] = None,
+        candidates: Optional[List[tuple[int, int, int, int, float]]] = None,
+        chosen: Optional[tuple[float, float]] = None,
+    ) -> None:
+        if not self._teacher_debug_enabled:
+            return
+        if not payload:
+            return
+        arr = self._decode_jpeg_to_array(payload)
+        if arr is None:
+            return
+        try:
+            from PIL import Image, ImageDraw
+
+            out_dir = Path(self._teacher_debug_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(now * 1000)
+            base = out_dir / f"main_menu_{ts_ms}"
+            img = Image.fromarray(arr)
+            img.save(base.with_suffix(".jpg"))
+            draw = ImageDraw.Draw(img)
+            if roi:
+                draw.rectangle(roi, outline="cyan", width=2)
+            if candidates:
+                for (x, y, w, h, _) in candidates:
+                    draw.rectangle((x, y, x + w, y + h), outline="yellow", width=2)
+            if chosen:
+                cx, cy = chosen
+                draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), outline="red", width=2)
+            draw.text((8, 8), f"{mode}", fill="white")
+            img.save(base.with_name(base.name + "_overlay.jpg"))
+        except Exception:
+            return
+
+    def _maybe_dump_phase_sample(
+        self,
+        *,
+        now: float,
+        label: str,
+        menu_hint: Optional[bool],
+        game_state: dict,
+        force: bool = False,
+    ) -> None:
+        if not self._phase_dataset_enabled:
+            return
+        if not self._phase_dataset_dir:
+            return
+        if (not force) and (now - self._phase_dataset_last_ts) < float(self._phase_dataset_every_s):
+            return
+        if (label == "unknown") and (not self._phase_dataset_allow_unknown):
+            return
+        if not self._phase_dataset_can_write(label):
+            return
+        payloads = self._sample_frame_ring_bytes(int(self._phase_dataset_clip_frames))
+        if not payloads:
+            return
+        try:
+            import json
+            import numpy as np
+            from pathlib import Path
+
+            frames = []
+            base_size = None
+            for payload in payloads:
+                arr = self._decode_jpeg_to_array(payload)
+                if arr is None:
+                    continue
+                if base_size is None:
+                    base_size = (arr.shape[1], arr.shape[0])
+                else:
+                    if arr.shape[1] != base_size[0] or arr.shape[0] != base_size[1]:
+                        from PIL import Image
+
+                        img = Image.fromarray(arr.astype("uint8"))
+                        img = img.resize(base_size)
+                        arr = np.asarray(img)
+                frames.append(arr)
+            if not frames:
+                return
+            out_dir = Path(self._phase_dataset_dir) / label
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts_ms = int(now * 1000)
+            out_path = out_dir / f"{self.instance_id}_{ts_ms}.npz"
+            meta = {
+                "instance": self.instance_id,
+                "menu": str(game_state.get("currentMenu") or ""),
+                "menu_hint": bool(menu_hint) if menu_hint is not None else None,
+                "hud_present": bool(self._hud_present),
+                "isPlaying": bool(game_state.get("isPlaying")),
+                "phase_label": self._phase_label,
+                "phase_conf": self._phase_conf,
+                "phase_source": self._phase_source,
+            }
+            np.savez_compressed(out_path, frames=np.stack(frames), label=label, meta=json.dumps(meta))
+            self._phase_dataset_counts[label] = self._phase_dataset_counts.get(label, 0) + 1
+            self._phase_dataset_last_ts = now
+        except Exception:
+            self._phase_dataset_last_ts = now
+
+    def _load_phase_model(self):
+        if not self._phase_model_enabled:
+            return None
+        if self._phase_model is not None:
+            return self._phase_model
+        if not self._phase_model_path:
+            return None
+        try:
+            import torch
+
+            model = torch.jit.load(self._phase_model_path, map_location="cpu")
+            model.eval()
+            device = self._phase_model_device.lower()
+            if device and device != "cpu":
+                try:
+                    model.to(device)
+                except Exception:
+                    device = "cpu"
+            self._phase_model_device = device
+            self._phase_model = model
+            return model
+        except Exception as exc:
+            if not self._phase_model_warned:
+                print(f"[phase] WARN: failed to load model {self._phase_model_path}: {exc}", flush=True)
+                self._phase_model_warned = True
+            self._phase_model_enabled = False
+            return None
+
+    def _infer_phase_model(self, payloads: List[bytes]) -> Optional[tuple[str, float]]:
+        if not self._phase_model_enabled:
+            return None
+        model = self._load_phase_model()
+        if model is None:
+            return None
+        if not payloads:
+            return None
+        try:
+            import io
+            import numpy as np
+            import torch
+            from PIL import Image
+
+            size = int(self._phase_input_size or 224)
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+            frames = []
+            for payload in payloads:
+                img = Image.open(io.BytesIO(payload)).convert("RGB")
+                if size > 0:
+                    img = img.resize((size, size))
+                arr = np.asarray(img).astype("float32") / 255.0
+                t = torch.from_numpy(arr).permute(2, 0, 1)
+                t = (t - mean) / std
+                frames.append(t)
+            if not frames:
+                return None
+            clip = torch.stack(frames, dim=0).unsqueeze(0)
+            device = self._phase_model_device.lower() if self._phase_model_device else "cpu"
+            if device and device != "cpu":
+                clip = clip.to(device)
+            with torch.no_grad():
+                out = model(clip)
+            if isinstance(out, dict):
+                if "phase_logits" in out:
+                    out = out["phase_logits"]
+                elif "logits" in out:
+                    out = out["logits"]
+            logits = out.squeeze(0)
+            if logits.ndim > 1:
+                logits = logits[0]
+            probs = torch.softmax(logits, dim=0)
+            conf, idx = torch.max(probs, dim=0)
+            idx_int = int(idx.item())
+            label = (
+                self._phase_labels[idx_int]
+                if self._phase_labels and idx_int < len(self._phase_labels)
+                else f"class_{idx_int}"
+            )
+            return label, float(conf.item())
+        except Exception:
+            return None
+
     def _frame_is_black(self, stats: Optional[tuple[float, float, float]]) -> bool:
         if not stats:
             return True
@@ -1584,6 +2013,112 @@ class WorkerService:
             res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
             if max_val < float(self._menu_teacher_confirm_thresh):
+                return None
+            cx = float(max_loc[0] + tw * 0.5)
+            cy = float(max_loc[1] + th * 0.5)
+            if scale and scale != 1.0:
+                cx /= scale
+                cy /= scale
+            return float(max_val), cx, cy
+        except Exception:
+            return None
+
+    def _find_play_button_rect(
+        self, payload: bytes
+    ) -> Optional[tuple[float, float, float, List[tuple[int, int, int, int, float]], tuple[int, int, int, int]]]:
+        if not payload:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                return None
+            h, w = img.shape[:2]
+            rx0 = int(w * 0.05)
+            rx1 = int(w * 0.45)
+            ry0 = int(h * 0.20)
+            ry1 = int(h * 0.85)
+            rx1 = max(rx1, rx0 + 1)
+            ry1 = max(ry1, ry0 + 1)
+            roi = img[ry0:ry1, rx0:rx1]
+            roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
+            edges = cv2.Canny(roi, 50, 150)
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            candidates: List[tuple[int, int, int, int, float]] = []
+            for cnt in contours:
+                x, y, cw, ch = cv2.boundingRect(cnt)
+                area = float(cw * ch)
+                if area < 0.005 * roi_area:
+                    continue
+                if ch <= 0:
+                    continue
+                aspect = float(cw) / float(ch)
+                if aspect < 2.0:
+                    continue
+                ax = rx0 + x
+                ay = ry0 + y
+                candidates.append((ax, ay, cw, ch, area / roi_area))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda r: (r[1], -r[4]))
+            cx = float(candidates[0][0] + candidates[0][2] * 0.5)
+            cy = float(candidates[0][1] + candidates[0][3] * 0.5)
+            return candidates[0][4], cx, cy, candidates, (rx0, ry0, rx1, ry1)
+        except Exception as exc:
+            if not self._menu_teacher_play_rect_warned:
+                print(f"[TEACHER] WARN: play rect detector unavailable ({exc})", flush=True)
+                self._menu_teacher_play_rect_warned = True
+            return None
+
+    def _load_play_template(self) -> Optional["Any"]:
+        if self._menu_teacher_play_gray is not None:
+            return self._menu_teacher_play_gray
+        if not self._menu_teacher_play_enabled:
+            return None
+        path = self._menu_teacher_play_template
+        if not path:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            data = Path(path).read_bytes()
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                raise RuntimeError("template decode failed")
+            self._menu_teacher_play_gray = img
+            return self._menu_teacher_play_gray
+        except Exception as e:
+            if not self._menu_teacher_play_warned:
+                print(f"[TEACHER] WARN: play template unavailable ({e})", flush=True)
+                self._menu_teacher_play_warned = True
+            self._menu_teacher_play_gray = None
+            return None
+
+    def _match_play_template(self, payload: bytes) -> Optional[tuple[float, float, float]]:
+        if not payload:
+            return None
+        tmpl = self._load_play_template()
+        if tmpl is None:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                return None
+            scale = float(self._menu_teacher_play_scale or 1.0)
+            if scale and scale != 1.0:
+                img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            th, tw = int(tmpl.shape[0]), int(tmpl.shape[1])
+            if img.shape[0] < th or img.shape[1] < tw:
+                return None
+            res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+            if max_val < float(self._menu_teacher_play_thresh):
                 return None
             cx = float(max_loc[0] + tw * 0.5)
             cy = float(max_loc[1] + th * 0.5)
@@ -2700,6 +3235,43 @@ class WorkerService:
                     )
                     self._hud_last_phase = phase
 
+            phase_confident = False
+            phase_label = self._phase_label
+            phase_conf = float(self._phase_conf or 0.0)
+            phase_menu = False
+            phase_block = False
+            if self._phase_model_enabled and (now - self._phase_last_infer_ts) >= float(self._phase_infer_every_s):
+                payloads = self._sample_frame_ring_bytes(int(self._phase_clip_frames))
+                result = self._infer_phase_model(payloads)
+                if result:
+                    label, conf = result
+                    self._phase_label = label
+                    self._phase_conf = float(conf)
+                    self._phase_source = "model"
+                self._phase_last_infer_ts = now
+            phase_label = self._phase_label
+            phase_conf = float(self._phase_conf or 0.0)
+            if phase_label is not None and phase_conf >= float(self._phase_conf_thresh):
+                phase_confident = True
+                phase_menu = phase_label in self._phase_menu_labels
+                phase_block = phase_label in self._phase_block_labels
+                self._phase_gameplay = phase_label == "gameplay"
+            else:
+                self._phase_gameplay = False
+
+            if phase_confident:
+                gameplay_now = bool(self._phase_gameplay)
+                phase_effective_label = phase_label
+                phase_effective_source = "model"
+            else:
+                gameplay_now = bool(self._hud_present)
+                phase_effective_label = "gameplay" if gameplay_now else None
+                phase_effective_source = "hud" if gameplay_now else None
+            gameplay_rise = (not self._gameplay_phase_active) and gameplay_now
+            self._gameplay_phase_active = gameplay_now
+            self._phase_effective_label = phase_effective_label
+            self._phase_effective_source = phase_effective_source
+
             menu_hint: Optional[bool] = None
             if isinstance(vision_metrics, dict):
                 try:
@@ -2724,7 +3296,16 @@ class WorkerService:
                 menu_hint = True
             if self._hud_present:
                 menu_hint = False
-            if self._hud_present and self._hud_pulse_log_s > 0.0:
+            if phase_confident:
+                if phase_label == "gameplay":
+                    menu_hint = False
+                elif phase_menu:
+                    menu_hint = True
+                elif phase_block:
+                    menu_hint = False
+            elif gameplay_now:
+                menu_hint = False
+            if gameplay_now and self._hud_pulse_log_s > 0.0:
                 if (now - self._hud_pulse_last_ts) >= float(self._hud_pulse_log_s):
                     try:
                         pv = game_state.get("playerVelocity") or (0.0, 0.0, 0.0)
@@ -2752,6 +3333,16 @@ class WorkerService:
                     except Exception:
                         pass
                     self._hud_pulse_last_ts = now
+
+            weak_label = self._weak_phase_label(menu_hint, game_state)
+            dataset_label = self._phase_dataset_label_override(
+                now=now,
+                base_label=weak_label,
+                menu_hint=menu_hint,
+                game_state=game_state,
+                gameplay_now=gameplay_now,
+            )
+            self._maybe_dump_phase_sample(now=now, label=dataset_label, menu_hint=menu_hint, game_state=game_state)
 
             # Explicit menu-change logging for debug.
             if self._menu_log:
@@ -2783,7 +3374,12 @@ class WorkerService:
                     self._last_menu_log_ts = now
                 self._last_menu_raw = raw_menu
 
-            self._update_gameplay_state(menu_hint, game_state, hud_present=self._hud_present)
+            self._update_gameplay_state(
+                menu_hint,
+                game_state,
+                hud_present=self._hud_present,
+                phase_gameplay=gameplay_now,
+            )
             self._update_menu_doom(menu_hint)
 
             if menu_hint is not None and menu_hint != self._last_menu_mode_log:
@@ -3024,11 +3620,17 @@ class WorkerService:
                     playing_flag = bool(game_state.get("isPlaying"))
                 except Exception:
                     playing_flag = False
-                if self._hud_present:
-                    playing_flag = True
+                if gameplay_now or phase_block:
+                    if gameplay_now:
+                        playing_flag = True
                     in_menu = False
                 else:
                     in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
+                if cur_menu and cur_menu != (self._last_menu_name or ""):
+                    self._menu_state_since_ts = now
+                    self._last_menu_name = cur_menu
+                elif cur_menu and self._menu_state_since_ts <= 0.0:
+                    self._menu_state_since_ts = now
             if (
                 self._input_backend
                 and (not menu_override_active)
@@ -3038,36 +3640,146 @@ class WorkerService:
                 and in_menu
             ):
                 menu_key = cur_menu or str(game_state.get("currentMenu") or "")
+                menu_elapsed = 0.0
+                if menu_key:
+                    menu_elapsed = max(0.0, float(now - float(self._menu_state_since_ts or now)))
                 if self._menu_teacher.step(now, in_menu=in_menu, menu_key=menu_key):
                     clicked = False
+                    in_lobby = menu_key in ("generatedmap", "mapselect", "mapselection")
+                    in_main_menu = (not in_lobby) and (not gameplay_now) and (not phase_block) and (
+                        menu_key in ("mainmenu", "bootscene", "") or (menu_hint and not playing_flag)
+                    )
                     if (
-                        self._menu_teacher_confirm_enabled
+                        in_main_menu
+                        and self._input_backend
+                        and latest_image_bytes is not None
+                        and frame_size is not None
+                        and hasattr(self._input_backend, "click_at")
+                    ):
+                        candidates: Optional[List[tuple[int, int, int, int, float]]] = None
+                        roi_box: Optional[tuple[int, int, int, int]] = None
+                        chosen: Optional[tuple[float, float]] = None
+                        play_mode = "template"
+                        score = 0.0
+                        match = self._match_play_template(latest_image_bytes)
+                        if match:
+                            score, cx, cy = match
+                            chosen = (cx, cy)
+                        else:
+                            play_mode = "rect"
+                            rect_match = self._find_play_button_rect(latest_image_bytes)
+                            if rect_match:
+                                score, cx, cy, candidates, roi_box = rect_match
+                                chosen = (cx, cy)
+                            else:
+                                play_mode = "fallback"
+                                if self._menu_teacher_play_fallback:
+                                    idx = self._menu_teacher.pick_action_index(
+                                        list(range(len(self._menu_teacher_play_fallback))),
+                                        self._menu_teacher_cycle_k,
+                                    )
+                                    if idx is not None:
+                                        fx, fy = self._menu_teacher_play_fallback[idx]
+                                        chosen = (fx * frame_size[0], fy * frame_size[1])
+                        self._teacher_debug_dump(
+                            now=now,
+                            payload=latest_image_bytes,
+                            mode=f"click_play:{play_mode} score={score:.3f}",
+                            roi=roi_box,
+                            candidates=candidates,
+                            chosen=chosen,
+                        )
+                        if chosen is not None:
+                            try:
+                                fx = float(chosen[0]) / float(frame_size[0])
+                                fy = float(chosen[1]) / float(frame_size[1])
+                            except Exception:
+                                fx = fy = None
+                            if fx is not None and fy is not None:
+                                try:
+                                    self._maybe_dump_phase_sample(
+                                        now=now,
+                                        label="main_menu",
+                                        menu_hint=menu_hint,
+                                        game_state=game_state,
+                                        force=True,
+                                    )
+                                    self._input_backend.click_at(fx, fy)
+                                    clicked = True
+                                    teacher_action_kind = f"click_play:{play_mode}"
+                                    # Post-play is often an immediate load; label as loading until gameplay.
+                                    self._arm_loading_window(now=now)
+                                    self._menu_teacher.record_intervention(now)
+                                    if self._menu_teacher.should_log_intervention():
+                                        print(
+                                            f"[TEACHER] Stalled in {menu_key or 'menu'}; "
+                                            f"click_play mode={play_mode} score={score:.3f} x={fx:.3f} y={fy:.3f}",
+                                            flush=True,
+                                        )
+                                except Exception:
+                                    clicked = False
+                    if (
+                        (not clicked)
+                        and self._menu_teacher_confirm_enabled
                         and latest_image_bytes is not None
                         and frame_size is not None
                         and hasattr(self._input_backend, "click_at")
                     ):
                         match = self._match_confirm_template(latest_image_bytes)
-                        if match:
+                        if not match:
+                            self._menu_teacher_confirm_pending = False
+                            self._menu_teacher_confirm_wait_until_ts = 0.0
+                        else:
                             score, cx, cy = match
-                            try:
-                                fx = float(cx) / float(frame_size[0])
-                                fy = float(cy) / float(frame_size[1])
-                            except Exception:
-                                fx = fy = None
-                            if fx is not None and fy is not None:
+                            # First time we see a confirm affordance: label the linger window as map_select.
+                            if not self._menu_teacher_confirm_pending:
+                                self._menu_teacher_confirm_pending = True
+                                self._menu_teacher_confirm_wait_until_ts = float(
+                                    now + float(self._menu_teacher_lobby_linger_s)
+                                )
+                                self._set_phase_dataset_forced_label(
+                                    "map_select",
+                                    now=now,
+                                    duration_s=float(self._menu_teacher_lobby_linger_s),
+                                )
+                                if self._menu_teacher.should_log_intervention():
+                                    print(
+                                        f"[TEACHER] Confirm visible in {menu_key or 'menu'}; "
+                                        f"linger {self._menu_teacher_lobby_linger_s:.1f}s score={score:.3f}",
+                                        flush=True,
+                                    )
+                            if now < float(self._menu_teacher_confirm_wait_until_ts):
+                                clicked = False
+                            else:
                                 try:
-                                    self._input_backend.click_at(fx, fy)
-                                    clicked = True
-                                    teacher_action_kind = "click_confirm"
-                                    self._menu_teacher.record_intervention(now)
-                                    if self._menu_teacher.should_log_intervention():
-                                        print(
-                                            f"[TEACHER] Stalled in {menu_key or 'menu'}; "
-                                            f"click_confirm score={score:.3f} x={fx:.3f} y={fy:.3f}",
-                                            flush=True,
-                                        )
+                                    fx = float(cx) / float(frame_size[0])
+                                    fy = float(cy) / float(frame_size[1])
                                 except Exception:
-                                    clicked = False
+                                    fx = fy = None
+                                if fx is not None and fy is not None:
+                                    try:
+                                        self._maybe_dump_phase_sample(
+                                            now=now,
+                                            label="map_select",
+                                            menu_hint=menu_hint,
+                                            game_state=game_state,
+                                            force=True,
+                                        )
+                                        self._input_backend.click_at(fx, fy)
+                                        self._arm_loading_window(now=now)
+                                        clicked = True
+                                        teacher_action_kind = "click_confirm"
+                                        self._menu_teacher_confirm_pending = False
+                                        self._menu_teacher_confirm_wait_until_ts = 0.0
+                                        self._menu_teacher.record_intervention(now)
+                                        if self._menu_teacher.should_log_intervention():
+                                            print(
+                                                f"[TEACHER] Stalled in {menu_key or 'menu'}; "
+                                                f"click_confirm score={score:.3f} x={fx:.3f} y={fy:.3f}",
+                                                flush=True,
+                                            )
+                                    except Exception:
+                                        clicked = False
                     if not clicked:
                         teacher_action_idx = self._menu_teacher.pick_action_index(
                             self._menu_bias_indices, self._menu_teacher_cycle_k
@@ -3081,6 +3793,26 @@ class WorkerService:
                                     f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting idx={teacher_action_idx}",
                                     flush=True,
                                 )
+                    # If we still didn't click anything, try a generic confirm in menus (game-agnostic).
+                    if (not clicked) and teacher_action_idx is None and hasattr(self._input_backend, "key_down"):
+                        try:
+                            self._input_backend.key_down("Return")
+                            time.sleep(0.06)
+                            self._input_backend.key_up("Return")
+                            teacher_action_kind = "key:Return"
+                            # Occasionally wiggle selection to avoid focus dead-ends.
+                            if random.random() < 0.2:
+                                self._input_backend.key_down("Right")
+                                time.sleep(0.04)
+                                self._input_backend.key_up("Right")
+                            self._menu_teacher.record_intervention(now)
+                            if self._menu_teacher.should_log_intervention():
+                                print(
+                                    f"[TEACHER] Stalled in {menu_key or 'menu'}; generic_confirm=Return",
+                                    flush=True,
+                                )
+                        except Exception:
+                            pass
             if (
                 self._input_backend
                 and self._menu_bias_enabled
@@ -3570,7 +4302,7 @@ class WorkerService:
                 except Exception:
                     pass
             # Dump a frame on first gameplay (HUD detection).
-            if hud_rise and (not self._gameplay_hit_once or not self._gameplay_hit_saved):
+            if gameplay_rise and (not self._gameplay_hit_once or not self._gameplay_hit_saved):
                 try:
                     base = Path(self._gameplay_hit_frame_path)
                     if base.suffix.lower() in (".jpg", ".jpeg", ".png"):
@@ -4511,6 +5243,12 @@ class WorkerService:
             "gameplay_started": bool(self._gameplay_started),
             "hud_present": bool(self._hud_present),
             "hud_phase": ("gameplay" if self._hud_present else "lobby"),
+            "phase_label": self._phase_label,
+            "phase_conf": float(self._phase_conf or 0.0),
+            "phase_source": self._phase_source,
+            "phase_effective": self._phase_effective_label,
+            "phase_effective_source": self._phase_effective_source,
+            "phase_gameplay": bool(self._gameplay_phase_active),
             "display": self.display,
             "display_name": os.environ.get("MEGABONK_AGENT_NAME"),
             "hparams": self.hparams,
@@ -4862,6 +5600,44 @@ if app:
         return {"ok": True}
 
 
+def resolve_gamescope_serial() -> bool:
+    """Resolve the current PipeWire object.serial for the Gamescope Video/Source node."""
+    if os.environ.get("METABONK_PIPEWIRE_TARGET_OVERRIDE"):
+        return True
+    if os.environ.get("METABONK_PIPEWIRE_RESOLVE_GAMESCOPE", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return False
+    try:
+        output = subprocess.check_output(["pw-cli", "info", "all"], text=True)
+    except Exception as exc:  # pragma: no cover - depends on system PipeWire
+        print(f"[RESOLVER] Failed to query PipeWire: {exc}")
+        return False
+
+    serial = ""
+    for block in output.split("\n\n"):
+        if 'media.class = "Video/Source"' not in block:
+            continue
+        if 'node.name = "gamescope"' not in block and 'media.name = "gamescope"' not in block:
+            continue
+        match = re.search(r'object\\.serial\\s*=\\s*\"?(\\d+)\"?', block)
+        if match:
+            serial = match.group(1)
+            break
+
+    if not serial:
+        print("[RESOLVER] Gamescope Video/Source serial not found.")
+        return False
+
+    os.environ["METABONK_PIPEWIRE_TARGET_MODE"] = "target-object"
+    os.environ["METABONK_PIPEWIRE_TARGET_OVERRIDE"] = serial
+    print(f"[RESOLVER] Found Gamescope serial: {serial}")
+    return True
+
+
 def main() -> int:
     if _import_error:
         raise RuntimeError(
@@ -4880,6 +5656,8 @@ def main() -> int:
     parser.add_argument("--frame-stack", type=int, default=int(os.environ.get("METABONK_FRAME_STACK", "4")))
     parser.add_argument("--display", default=os.environ.get("DISPLAY"))
     args = parser.parse_args()
+
+    resolve_gamescope_serial()
 
     global service
     service = WorkerService(

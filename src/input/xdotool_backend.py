@@ -244,7 +244,10 @@ class XDoToolBackend:
         x = int(width * xf)
         y = int(height * yf)
         self._run(["xdotool", "mousemove", "--window", wid, str(x), str(y)])
-        self._run(["xdotool", "click", "1"])
+        # Use explicit press/release on the target window to reduce flakiness with synthetic events.
+        self._run(["xdotool", "mousedown", "--window", wid, "1"])
+        time.sleep(0.12)
+        self._run(["xdotool", "mouseup", "--window", wid, "1"])
 
     def _run(self, cmd: list[str]) -> None:
         subprocess.run(

@@ -309,6 +309,10 @@ def _stop_stream_recording(handle: Dict[str, Any]) -> None:
 
 
 def _validate_streams(cfg: ProofConfig, workers: Dict[str, Any]) -> None:
+    if _env_truthy(os.environ.get("METABONK_E2E_SKIP_STREAM_VALIDATE", "0")):
+        return
+    if not _env_truthy(os.environ.get("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")):
+        return
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         raise RuntimeError("ffprobe not available (required to validate streams)")
@@ -364,6 +368,8 @@ def _validate_streams(cfg: ProofConfig, workers: Dict[str, Any]) -> None:
 
 
 def _run_stream_diagnostics(cfg: ProofConfig, log_path: Path, env: Dict[str, str]) -> None:
+    if _env_truthy(os.environ.get("METABONK_E2E_SKIP_STREAM_VALIDATE", "0")):
+        return
     proc = subprocess.Popen(
         [sys.executable, str(REPO_ROOT / "scripts" / "stream_diagnostics.py"), "--backend", cfg.stream_backend],
         cwd=str(REPO_ROOT),

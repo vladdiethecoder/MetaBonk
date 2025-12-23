@@ -95,6 +95,11 @@ def _pipewiresrc_selector(target: str) -> str:
     t = str(target or "").strip()
     if not t:
         return ""
+    mode = str(os.environ.get("METABONK_PIPEWIRE_TARGET_MODE", "") or "").strip().lower()
+    if mode in ("target-object", "target_object", "name", "serial", "object.serial"):
+        return f"target-object={t}"
+    if mode in ("path", "object.path"):
+        return f"path={t}"
     # Heuristic: `object.path` values are typically namespaced strings.
     if ":" in t or t.startswith("gamescope"):
         return f"path={t}"
