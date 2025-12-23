@@ -96,6 +96,12 @@ If `false`:
 - Install full codecs (Fedora: RPM Fusion multimedia)
 - Try a browser with H.264 support
 
+### Jank HUD (per-tile)
+Add `?debugHud=1` to the Stream page URL to show per-tile frame pacing stats
+(fps, p95/p99 gap, stalls, dropped frames). For go2rtc iframe tiles, the HUD
+shows WebRTC jitter buffer and freeze counts, plus an **Export JSON** button
+for 1Hz time-series logs (last ~30 minutes).
+
 ## Recommended GPU Streaming Settings (PipeWire + NVENC)
 
 | Environment Variable | Recommended Value | Purpose / Note |
@@ -112,14 +118,15 @@ If `false`:
 | `METABONK_STREAM_WIDTH` / `METABONK_STREAM_HEIGHT` | target resolution | Fixes capture size to avoid renegotiation churn. |
 | `METABONK_GST_CAPTURE` | `0` | Keep CPU snapshot fallback disabled. |
 | `METABONK_PREVIEW_JPEG` | `0` (or `1` for debug) | Optional 2 FPS JPEG preview thread. |
+| `METABONK_FIFO_CONTAINER` | `mpegts` (when go2rtc is on) | FIFO container for go2rtc: `mpegts` or `h264`. |
 
-## go2rtc FIFO Streaming (On-Demand, Raw H.264)
+## go2rtc FIFO Streaming (On-Demand, H.264 or MPEG-TS)
 
 This repo supports an optional distribution layer using go2rtc + named pipes (FIFOs).
 
 How it works:
-- Each worker can publish a raw Annex-B H.264 byte stream to `temp/streams/<instance_id>.h264`.
-- go2rtc is configured with `exec:cat /streams/<instance_id>.h264#video=h264#raw` and only starts reading when a client requests the stream.
+- Each worker can publish raw Annex-B H.264 (`.h264`) or MPEG-TS (`.ts`) to `temp/streams/<instance_id>.<ext>`.
+- go2rtc is configured with `exec:cat /streams/<instance_id>.<ext>` (raw H.264 uses `#video=h264#raw`).
 - Workers only start encoding when the FIFO has a reader (no viewer → no encode cost).
 
 Start with go2rtc:
@@ -145,6 +152,20 @@ Notes:
 If the Stream UI is cropped or doesn’t fit in OBS, see:\n\n- `docs/obs_browser_source_overlay.md`
 
 ## Troubleshooting
+
+### Stream pacing regression gate (30s capture)
+Use the pacing checker to verify CFR + low-delay behavior from FIFO or go2rtc URLs:
+
+```
+# FIFO (default mpegts)
+python scripts/stream_pacing_check.py --input temp/streams/omega-0.ts --duration 30
+
+# go2rtc URL
+python scripts/stream_pacing_check.py --input http://127.0.0.1:1984/api/stream?src=omega-0 --duration 30
+
+# Gate with research-grade thresholds (non-zero exit on failure)
+python scripts/stream_pacing_check.py --input temp/streams/omega-0.ts --duration 30 --gate
+```
 
 ### Symptom: UI shows "STREAM ERROR" (media error code 4)
 - Check browser codec support (`MediaSource.isTypeSupported(...)`)

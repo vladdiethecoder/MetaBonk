@@ -45,8 +45,9 @@ Out of scope (for initial smoke):
 - Non-black frames detected (pixel variance > threshold)
 - Keyboard + mouse input causes observable UI change in-game (menu navigation)
 - Crash recovery: worker/game restart detected and recorded
-- go2rtc config uses raw H.264 passthrough (no unintended CPU transcode)
+- go2rtc config uses raw H.264 passthrough or MPEG-TS (no unintended CPU transcode)
 - go2rtc API responds on configured URL
+- stream pacing check passes for FIFO/go2rtc sample (`scripts/stream_pacing_check.py --gate`)
 - Instance history includes step_age_s and stream_frame_var fields
 
 ## Commands (Baseline)
