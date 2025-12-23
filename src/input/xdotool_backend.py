@@ -150,7 +150,12 @@ class XDoToolBackend:
             return
         if not self._ensure_focus():
             return
-        self._run(["xdotool", "keydown", "--clearmodifiers", k])
+        wid = self._resolve_window_id()
+        cmd = ["xdotool", "keydown", "--clearmodifiers"]
+        if wid:
+            cmd += ["--window", wid]
+        cmd.append(k)
+        self._run(cmd)
 
     def key_up(self, key: str) -> None:
         k = _normalize_key(key)
@@ -158,30 +163,50 @@ class XDoToolBackend:
             return
         if not self._ensure_focus():
             return
-        self._run(["xdotool", "keyup", "--clearmodifiers", k])
+        wid = self._resolve_window_id()
+        cmd = ["xdotool", "keyup", "--clearmodifiers"]
+        if wid:
+            cmd += ["--window", wid]
+        cmd.append(k)
+        self._run(cmd)
 
     def mouse_move(self, dx: int, dy: int) -> None:
         if not dx and not dy:
             return
         if not self._ensure_focus():
             return
-        self._run(["xdotool", "mousemove_relative", "--", str(int(dx)), str(int(dy))])
+        wid = self._resolve_window_id()
+        cmd = ["xdotool", "mousemove_relative"]
+        if wid:
+            cmd += ["--window", wid]
+        cmd += ["--", str(int(dx)), str(int(dy))]
+        self._run(cmd)
 
     def mouse_button(self, button: str | int, pressed: bool) -> None:
         btn = _normalize_button(button)
         if not self._ensure_focus():
             return
         cmd = "mousedown" if pressed else "mouseup"
-        self._run(["xdotool", cmd, str(int(btn))])
+        wid = self._resolve_window_id()
+        args = ["xdotool", cmd]
+        if wid:
+            args += ["--window", wid]
+        args.append(str(int(btn)))
+        self._run(args)
 
     def mouse_scroll(self, steps: int) -> None:
         if not steps:
             return
         if not self._ensure_focus():
             return
+        wid = self._resolve_window_id()
         btn = 4 if steps > 0 else 5
         for _ in range(abs(int(steps))):
-            self._run(["xdotool", "click", str(btn)])
+            args = ["xdotool", "click"]
+            if wid:
+                args += ["--window", wid]
+            args.append(str(btn))
+            self._run(args)
 
     def click_center(self) -> None:
         wid = self._resolve_window_id()
