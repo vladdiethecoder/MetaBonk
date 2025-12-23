@@ -548,6 +548,31 @@ def main() -> int:
                 "on",
             )
             frame_fmt = str(env.get("METABONK_BONKLINK_FRAME_FORMAT", "raw_rgb") or "raw_rgb").strip()
+            rewired_enable_raw = env.get("METABONK_BONKLINK_INPUT_ENABLE_REWIRED_INPUT")
+            if rewired_enable_raw is None:
+                rewired_enable_raw = env.get("METABONK_BONKLINK_ENABLE_REWIRED_INPUT")
+            rewired_debug_raw = env.get("METABONK_BONKLINK_REWIRED_DEBUG")
+            rewired_min_axis_raw = env.get("METABONK_BONKLINK_REWIRED_MIN_AXIS")
+            rewired_min_button_raw = env.get("METABONK_BONKLINK_REWIRED_MIN_BUTTONS")
+            rewired_layout_name = env.get("METABONK_BONKLINK_REWIRED_LAYOUT")
+            rewired_debug = False
+            if rewired_debug_raw is not None:
+                rewired_debug = str(rewired_debug_raw).strip().lower() in ("1", "true", "yes", "on")
+            rewired_enable = None
+            if rewired_enable_raw is not None:
+                rewired_enable = str(rewired_enable_raw).strip().lower() in ("1", "true", "yes", "on")
+            rewired_min_axis = None
+            if rewired_min_axis_raw is not None:
+                try:
+                    rewired_min_axis = int(rewired_min_axis_raw)
+                except Exception:
+                    rewired_min_axis = None
+            rewired_min_button = None
+            if rewired_min_button_raw is not None:
+                try:
+                    rewired_min_button = int(rewired_min_button_raw)
+                except Exception:
+                    rewired_min_button = None
             txt = (
                 "[Network]\n"
                 f"Port = {int(port)}\n"
@@ -564,6 +589,25 @@ def main() -> int:
                 f"EnableInputSnapshot = {'true' if enable_input else 'false'}\n"
                 f"FrameFormat = {frame_fmt}\n"
             )
+            if (
+                rewired_enable is not None
+                or rewired_debug_raw is not None
+                or rewired_min_axis is not None
+                or rewired_min_button is not None
+                or (rewired_layout_name is not None and str(rewired_layout_name).strip() != "")
+            ):
+                if not txt.endswith("\n"):
+                    txt += "\n"
+                txt += "[Input]\n"
+                if rewired_enable is not None:
+                    txt += f"EnableRewiredInput = {'true' if rewired_enable else 'false'}\n"
+                if rewired_layout_name is not None and str(rewired_layout_name).strip() != "":
+                    txt += f"RewiredLayoutName = {str(rewired_layout_name).strip()}\n"
+                txt += f"RewiredDebugDump = {'true' if rewired_debug else 'false'}\n"
+                if rewired_min_axis is not None:
+                    txt += f"RewiredMinAxisCount = {int(rewired_min_axis)}\n"
+                if rewired_min_button is not None:
+                    txt += f"RewiredMinButtonCount = {int(rewired_min_button)}\n"
             try:
                 cfg_path.write_text(txt)
             except Exception:
