@@ -109,6 +109,8 @@ Environment Variables
 - METABONK_MENU_LOG: Emit [MENU] lines on menu changes (default 0)
 - METABONK_MENU_ACTION_BIAS: Enable menu action bias (default 0)
 - METABONK_MENU_ACTION_BIAS_P: Probability to force biased menu actions (default 0.6)
+- METABONK_MENU_ACTION_BIAS_DECAY: Decay factor applied on each menu success (default 0.995)
+- METABONK_MENU_ACTION_BIAS_MIN: Minimum bias probability after decay (default 0.05)
 - METABONK_MENU_ACTION_BIAS_KEYS: Comma list of biased actions (default "SPACE,ENTER,RETURN,MOUSE_LEFT,LEFT")
 - METABONK_REWARD_HIT_FRAME_PATH: Directory or filename for reward-hit frame dumps (default temp/reward_hits)
 - METABONK_REWARD_HIT_ONCE: Save reward-hit frame only once per run (default 1)

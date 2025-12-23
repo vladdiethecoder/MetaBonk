@@ -239,6 +239,15 @@ class WorkerService:
             self._menu_bias_prob = float(os.environ.get("METABONK_MENU_ACTION_BIAS_P", "0.6"))
         except Exception:
             self._menu_bias_prob = 0.6
+        try:
+            self._menu_bias_decay = float(os.environ.get("METABONK_MENU_ACTION_BIAS_DECAY", "0.995"))
+        except Exception:
+            self._menu_bias_decay = 0.995
+        try:
+            self._menu_bias_min = float(os.environ.get("METABONK_MENU_ACTION_BIAS_MIN", "0.05"))
+        except Exception:
+            self._menu_bias_min = 0.05
+        self._menu_bias_successes = 0
         self._menu_bias_indices: List[int] = []
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
@@ -2843,6 +2852,16 @@ class WorkerService:
                         print(
                             f"[MENU] instance={self.instance_id} start_bonus_fired={menu_start_bonus:.2f} "
                             f"prev='{prev_menu or ''}' cur='generatedmap'"
+                        )
+                    if self._menu_bias_enabled:
+                        self._menu_bias_successes += 1
+                        prev_prob = float(self._menu_bias_prob)
+                        self._menu_bias_prob = max(
+                            float(self._menu_bias_min), float(self._menu_bias_prob) * float(self._menu_bias_decay)
+                        )
+                        print(
+                            f"[CURRICULUM] instance={self.instance_id} success={self._menu_bias_successes} "
+                            f"menu_bias_prob={prev_prob:.3f}->{self._menu_bias_prob:.3f}"
                         )
                 self._last_menu_name = cur_menu
             # Optional reward logging (useful for menu shaping/debug).
