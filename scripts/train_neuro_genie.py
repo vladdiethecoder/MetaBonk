@@ -424,6 +424,19 @@ def train_dream_rl(args):
         torch.nn.ReLU(),
         torch.nn.Linear(512, act_dim),
     ).to(device)
+    if bool(getattr(args, "gradient_checkpoint", False)):
+        from src.training.gradient_checkpoint import apply_gradient_checkpointing
+
+        applied = apply_gradient_checkpointing(
+            policy,
+            checkpoint_ratio=float(getattr(args, "checkpoint_ratio", 0.5)),
+            layer_attr=str(getattr(args, "checkpoint_layer_attr", "layers") or "layers"),
+        )
+        if applied:
+            print("[offline_replay] gradient_checkpoint=enabled")
+        else:
+            print("[offline_replay] gradient_checkpoint=skipped (no layers attr)")
+
     policy = maybe_compile(
         policy,
         enabled=bool(getattr(args, "compile", False)) and device.type == "cuda",
@@ -435,6 +448,29 @@ def train_dream_rl(args):
 
     max_steps = int(args.max_steps)
     batch_size = int(args.batch_size)
+    if bool(getattr(args, "auto_batch_size", False)) and device.type == "cuda":
+        from src.training.batch_size_tuner import BatchSizeTuner
+
+        try:
+            min_batch = max(1, int(batch_size // 4))
+        except Exception:
+            min_batch = 1
+        max_batch = max(min_batch, int(batch_size * 8))
+        tuner = BatchSizeTuner(
+            policy,
+            obs0_t.view(1, -1),
+            act0_t.view(1, -1),
+            target_vram_gb=float(getattr(args, "target_vram_gb", 30.0)),
+            min_batch=min_batch,
+            max_batch=max_batch,
+            amp_dtype=amp_dtype if amp_enabled else None,
+        )
+        tuned = tuner.find()
+        batch_size = int(tuned.batch_size)
+        print(
+            f"[offline_replay] auto_batch_size={batch_size} "
+            f"peak_bytes={tuned.max_memory_bytes}"
+        )
     print(
         f"[offline_replay] device={device} obs_dim={obs_dim} act_dim={act_dim} "
         f"steps={max_steps} batch={batch_size} amp={amp_mode}"
@@ -502,6 +538,35 @@ def train_dream_rl(args):
     loader = DataLoader(dataset, **loader_kwargs)
     loader_iter = iter(loader)
 
+    out_dir = Path(args.checkpoint_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    profiler = None
+    profile_steps = int(getattr(args, "profile_steps", 0) or 0)
+    if bool(getattr(args, "profile", False)):
+        from src.training.training_profiler import TrainingProfiler
+
+        profile_dir = str(getattr(args, "profile_dir", "") or "") or os.path.join(
+            str(os.environ.get("METABONK_RUN_DIR", "runs")), "logs", "profiler"
+        )
+        profiler = TrainingProfiler(
+            output_dir=profile_dir,
+            wait=int(getattr(args, "profile_wait", 1) or 1),
+            warmup=int(getattr(args, "profile_warmup", 1) or 1),
+            active=int(getattr(args, "profile_active", 3) or 3),
+            repeat=int(getattr(args, "profile_repeat", 1) or 1),
+            with_stack=bool(getattr(args, "profile_with_stack", False)),
+        )
+        profiler.start()
+
+    checkpointer = None
+    if bool(getattr(args, "async_checkpoint", False)):
+        from src.training.async_checkpoint import AsyncCheckpointer
+
+        checkpointer = AsyncCheckpointer(str(args.checkpoint_dir))
+
+    save_interval = int(getattr(args, "save_interval", 0) or 0)
+
     for step in range(max_steps):
         try:
             x, y = next(loader_iter)
@@ -565,9 +630,28 @@ def train_dream_rl(args):
 
         if (step + 1) % max(1, int(args.log_interval)) == 0:
             print(f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}")
+        if save_interval > 0 and (step + 1) % save_interval == 0:
+            payload = {
+                "policy_state_dict": policy.state_dict(),
+                "obs_dim": obs_dim,
+                "action_dim": act_dim,
+                "pt_dir": str(pt_dir),
+                "step": int(step + 1),
+            }
+            if checkpointer:
+                checkpointer.save_async(payload, f"offline_replay_policy_step_{step+1}.pt")
+            else:
+                torch.save(payload, out_dir / f"offline_replay_policy_step_{step+1}.pt")
+        if profiler:
+            profiler.step()
+            if profile_steps > 0 and (step + 1) >= profile_steps:
+                profiler.stop()
+                profiler = None
 
-    out_dir = Path(args.checkpoint_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if checkpointer:
+        checkpointer.wait_all()
+        checkpointer.stop()
+
     out_path = out_dir / "offline_replay_policy.pt"
     torch.save(
         {
@@ -736,6 +820,36 @@ Examples:
                        help="Mixed precision mode for offline replay (auto=bf16 on CUDA when optimize-5090).")
     parser.add_argument("--prefetch-factor", type=int, default=2,
                        help="DataLoader prefetch_factor (only when num_workers > 0).")
+    parser.add_argument("--auto-batch-size", action="store_true",
+                       help="Auto-tune batch size to maximize VRAM usage.")
+    parser.add_argument("--target-vram-gb", type=float, default=30.0,
+                       help="Target VRAM usage for auto batch tuning.")
+    parser.add_argument("--gradient-checkpoint", action="store_true",
+                       help="Enable gradient checkpointing for compatible models.")
+    parser.add_argument("--checkpoint-ratio", type=float, default=0.5,
+                       help="Fraction of layers to checkpoint when enabled.")
+    parser.add_argument("--checkpoint-layer-attr", default="layers",
+                       help="Attribute name containing layers list for checkpointing.")
+    parser.add_argument("--async-checkpoint", action="store_true",
+                       help="Save checkpoints asynchronously during offline replay training.")
+    parser.add_argument("--save-interval", type=int, default=0,
+                       help="Save interval in steps (0 disables periodic saves).")
+    parser.add_argument("--profile", action="store_true",
+                       help="Enable PyTorch profiler during offline replay training.")
+    parser.add_argument("--profile-dir", default="",
+                       help="Profiler output directory (defaults to runs/<run_id>/logs/profiler).")
+    parser.add_argument("--profile-wait", type=int, default=1,
+                       help="Profiler wait steps before recording.")
+    parser.add_argument("--profile-warmup", type=int, default=1,
+                       help="Profiler warmup steps.")
+    parser.add_argument("--profile-active", type=int, default=3,
+                       help="Profiler active steps.")
+    parser.add_argument("--profile-repeat", type=int, default=1,
+                       help="Profiler repeat count.")
+    parser.add_argument("--profile-steps", type=int, default=0,
+                       help="Stop profiling after N steps (0 = keep running).")
+    parser.add_argument("--profile-with-stack", action="store_true",
+                       help="Collect stack traces in profiler output.")
     
     # Federated settings
     parser.add_argument("--iterations", type=int, default=3,
