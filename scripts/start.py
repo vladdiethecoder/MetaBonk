@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import threading
 import signal
 import subprocess
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -264,6 +266,30 @@ def main() -> int:
         "--go2rtc-exec-wrapper",
         default=os.environ.get("METABONK_GO2RTC_EXEC_WRAPPER", "scripts/go2rtc_exec_mpegts.sh"),
         help="Exec mode only. Wrapper script path (used when --go2rtc-exec-wrap=mpegts).",
+    )
+    parser.add_argument(
+        "--save-video-proof",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Record a short proof clip from a live worker stream (requires go2rtc).",
+    )
+    parser.add_argument(
+        "--video-proof-duration",
+        type=int,
+        default=300,
+        help="Proof clip duration in seconds.",
+    )
+    parser.add_argument(
+        "--video-proof-warmup-s",
+        type=int,
+        default=30,
+        help="Warmup delay before recording proof clip.",
+    )
+    parser.add_argument(
+        "--video-proof-worker",
+        type=int,
+        default=0,
+        help="Worker index to record for proof clip.",
     )
     parser.add_argument("--instance-prefix", default=os.environ.get("METABONK_INSTANCE_PREFIX", "omega"))
     parser.add_argument("--go2rtc-url", default=os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984"))
@@ -605,6 +631,43 @@ def main() -> int:
             ui = _spawn("ui", ui_cmd, cwd=frontend, env=env, job_pgid=job_pgid)
             procs.append(ui)
             print(f"[start] ui -> http://{args.ui_host}:{args.ui_port}")
+
+        if args.save_video_proof:
+            proof_log = logs_dir / "proof.log"
+            videos_dir = run_dir / "videos"
+            videos_dir.mkdir(parents=True, exist_ok=True)
+            if not shutil.which("ffmpeg"):
+                with open(proof_log, "a", encoding="utf-8") as f:
+                    f.write("[proof] ffmpeg not found; cannot record proof clip\n")
+            else:
+                def _record_proof() -> None:
+                    time.sleep(max(0, int(args.video_proof_warmup_s)))
+                    instance_id = f"{args.instance_prefix}-{int(args.video_proof_worker)}"
+                    if args.go2rtc and go2rtc_started:
+                        url = (
+                            f"{args.go2rtc_url.rstrip('/')}/api/stream.mp4?"
+                            f"src={instance_id}&duration={int(args.video_proof_duration)}"
+                        )
+                    else:
+                        port = int(args.worker_base_port) + int(args.video_proof_worker)
+                        url = f"http://127.0.0.1:{port}/stream.mp4"
+                    out_path = videos_dir / "gameplay_proof.mp4"
+                    with open(proof_log, "a", encoding="utf-8") as f:
+                        f.write(f"[proof] recording {url} -> {out_path}\n")
+                    try:
+                        if str(repo_root) not in sys.path:
+                            sys.path.insert(0, str(repo_root))
+                        from src.utils.live_stream_recorder import record_live_stream
+
+                        rc = record_live_stream(url=url, output_path=str(out_path), duration_s=int(args.video_proof_duration))
+                    except Exception as e:
+                        rc = 1
+                        with open(proof_log, "a", encoding="utf-8") as f:
+                            f.write(f"[proof] error: {e}\n")
+                    with open(proof_log, "a", encoding="utf-8") as f:
+                        f.write(f"[proof] done rc={rc}\n")
+
+                threading.Thread(target=_record_proof, daemon=True).start()
 
         # Optional "watch me play" process (connects to a normal Steam session).
         if args.mode == "watch":

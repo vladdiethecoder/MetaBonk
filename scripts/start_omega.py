@@ -212,12 +212,17 @@ def _cuda_preflight_hint(torch_cuda: str) -> Optional[str]:
         return None
     joined = ", ".join(models)
     if any("5090" in m or "blackwell" in m.lower() for m in models):
-        if torch_cuda and _cuda_version_lt(torch_cuda, "13.1"):
+        if not torch_cuda:
+            return f"Detected {joined}; install a CUDA-enabled PyTorch wheel (cu128+ recommended for Blackwell)."
+        if _cuda_version_lt(torch_cuda, "12.8"):
             return (
-                f"Detected {joined} with torch CUDA {torch_cuda}; RTX 5090/Blackwell requires "
-                "a CUDA 13.1+ PyTorch build."
+                f"Detected {joined} with torch CUDA {torch_cuda}; install a cu128+ PyTorch wheel "
+                "for Blackwell support."
             )
-        return f"Detected {joined}; verify your PyTorch build supports Blackwell (CUDA 13.1+)."
+        return (
+            f"Detected {joined}; CUDA {torch_cuda} should work for Blackwell (cu128+). "
+            "NVFP4/FP4 still requires newer toolchains."
+        )
     return f"Detected {joined}; verify CUDA toolkit/driver matches your PyTorch build."
 
 
