@@ -125,6 +125,14 @@ class XDoToolBackend:
                 "true",
                 "True",
             )
+        onlyvisible_env = str(os.environ.get("METABONK_INPUT_XDO_ONLYVISIBLE", "1") or "1").strip().lower()
+        self._search_onlyvisible = onlyvisible_env not in ("0", "false", "no", "off")
+        try:
+            self._search_maxdepth = max(0, int(os.environ.get("METABONK_INPUT_XDO_MAXDEPTH", "2")))
+        except Exception:
+            self._search_maxdepth = 2
+        geom_fallback_env = str(os.environ.get("METABONK_INPUT_XDO_GEOMETRY_FALLBACK", "1") or "1").strip().lower()
+        self._geometry_fallback = geom_fallback_env not in ("0", "false", "no", "off")
         self._window_id: Optional[str] = None
         self._last_focus_ts = 0.0
 
@@ -273,9 +281,14 @@ class XDoToolBackend:
     def _resolve_window_id(self) -> Optional[str]:
         if self._window_id:
             return self._window_id
+        flags = []
+        if self._search_onlyvisible:
+            flags.append("--onlyvisible")
+        if self._search_maxdepth > 0:
+            flags += ["--maxdepth", str(int(self._search_maxdepth))]
         pid = self.window_pid
         if pid:
-            wid = self._search_window(["xdotool", "search", "--onlyvisible", "--pid", str(int(pid))])
+            wid = self._search_window(["xdotool", "search", *flags, "--pid", str(int(pid))])
             if wid:
                 self._window_id = wid
                 return wid
@@ -283,12 +296,12 @@ class XDoToolBackend:
         name = self.window_name or os.environ.get("METABONK_INPUT_XDO_WINDOW", "")
         wclass = self.window_class or os.environ.get("METABONK_INPUT_XDO_CLASS", "")
         if wclass:
-            wid = self._search_window(["xdotool", "search", "--onlyvisible", "--class", wclass])
+            wid = self._search_window(["xdotool", "search", *flags, "--class", wclass])
             if wid:
                 self._window_id = wid
                 return wid
         if name:
-            wid = self._search_window(["xdotool", "search", "--onlyvisible", "--name", name])
+            wid = self._search_window(["xdotool", "search", *flags, "--name", name])
             if wid:
                 self._window_id = wid
                 return wid
@@ -298,12 +311,48 @@ class XDoToolBackend:
             if wid:
                 self._window_id = wid
                 return wid
-        # Final fallback: first visible window.
+        # Final fallback: pick the largest visible window on this DISPLAY (safer than "first").
+        if self.allow_any_fallback and self._geometry_fallback:
+            wid = self._largest_window_id(flags)
+            if wid:
+                self._window_id = wid
+                return wid
+        # Last resort: first matching window.
         if self.allow_any_fallback:
-            wid = self._search_window(["xdotool", "search", "--onlyvisible", "--name", ".*"])
+            wid = self._search_window(["xdotool", "search", *flags, "--name", ".*"])
             if wid:
                 self._window_id = wid
         return self._window_id
+
+    def _largest_window_id(self, flags: list[str]) -> Optional[str]:
+        out = self._capture_output(["xdotool", "search", *flags, "--name", ".*"])
+        if not out:
+            return None
+        best_area = -1
+        best_wid: Optional[str] = None
+        for wid in [w.strip() for w in out.splitlines() if w.strip()]:
+            geom = self._capture_output(["xdotool", "getwindowgeometry", "--shell", wid])
+            if not geom:
+                continue
+            width = height = None
+            for line in geom.splitlines():
+                if line.startswith("WIDTH="):
+                    try:
+                        width = int(line.split("=", 1)[1])
+                    except Exception:
+                        width = None
+                elif line.startswith("HEIGHT="):
+                    try:
+                        height = int(line.split("=", 1)[1])
+                    except Exception:
+                        height = None
+            if not width or not height:
+                continue
+            area = int(width) * int(height)
+            if area > best_area:
+                best_area = area
+                best_wid = wid
+        return best_wid
 
     def _search_window(self, cmd: list[str]) -> Optional[str]:
         out = self._capture_output(cmd)

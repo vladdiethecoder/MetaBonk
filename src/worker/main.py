@@ -457,6 +457,7 @@ class WorkerService:
         self._phase_dataset_forced_until_ts: float = 0.0
         self._phase_dataset_loading_active = False
         self._phase_dataset_loading_deadline = 0.0
+        self._phase_dataset_loading_since = 0.0
         try:
             self._phase_dataset_post_play_s = float(
                 os.environ.get("METABONK_PHASE_DATASET_POST_PLAY_S", "4.0")
@@ -469,6 +470,12 @@ class WorkerService:
             )
         except Exception:
             self._phase_dataset_loading_timeout_s = 12.0
+        try:
+            self._phase_dataset_loading_restart_s = float(
+                os.environ.get("METABONK_PHASE_DATASET_LOADING_RESTART_S", "0.0")
+            )
+        except Exception:
+            self._phase_dataset_loading_restart_s = 0.0
         self._last_valid_frame: Optional[dict] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
@@ -579,6 +586,21 @@ class WorkerService:
         self._menu_teacher_play_gray = None
         self._menu_teacher_play_warned = False
         self._menu_teacher_play_rect_warned = False
+        self._menu_teacher_play_pending = False
+        self._menu_teacher_play_pending_deadline = 0.0
+        self._menu_teacher_play_ref_var: Optional[float] = None
+        try:
+            self._menu_teacher_play_transition_s = float(
+                os.environ.get("METABONK_MENU_TEACHER_PLAY_TRANSITION_S", "2.0")
+            )
+        except Exception:
+            self._menu_teacher_play_transition_s = 2.0
+        try:
+            self._menu_teacher_play_transition_var_delta = float(
+                os.environ.get("METABONK_MENU_TEACHER_PLAY_TRANSITION_VAR_DELTA", "60.0")
+            )
+        except Exception:
+            self._menu_teacher_play_transition_var_delta = 60.0
         self._menu_teacher_play_fallback: List[tuple[float, float]] = []
         fallback_env = str(os.environ.get("METABONK_MENU_TEACHER_PLAY_FALLBACK", "") or "").strip()
         if not fallback_env:
@@ -1702,8 +1724,11 @@ class WorkerService:
             menu_raw = str(game_state.get("currentMenu") or "").strip().lower()
         except Exception:
             menu_raw = ""
-        if menu_raw in ("mainmenu", "bootscene"):
+        if menu_raw in ("mainmenu",):
             return "main_menu"
+        if menu_raw in ("bootscene",):
+            # BootScene is often reused by the game for multiple non-gameplay screens; treat as unknown.
+            return "unknown"
         if menu_raw in ("characterselect", "characterselection", "characters", "selectcharacter"):
             return "char_select"
         if menu_raw in ("generatedmap", "mapselect", "mapselection"):
@@ -1745,7 +1770,21 @@ class WorkerService:
         self._phase_dataset_forced_until_ts = float(now + max(0.0, duration_s))
 
     def _arm_loading_window(self, *, now: float) -> None:
+        # Dump the frames immediately preceding the transition. This is a game-agnostic
+        # "pre-transition" slice that surfaces the otherwise invisible menu/lobby screens.
+        try:
+            self._maybe_dump_phase_sample(
+                now=now,
+                label="pre_loading",
+                menu_hint=None,
+                game_state={},
+                force=True,
+                event="arm_loading",
+            )
+        except Exception:
+            pass
         self._phase_dataset_loading_active = True
+        self._phase_dataset_loading_since = float(now)
         self._phase_dataset_loading_deadline = float(now + max(0.0, self._phase_dataset_loading_timeout_s))
 
     def _phase_dataset_label_override(
@@ -1763,11 +1802,48 @@ class WorkerService:
         if self._phase_dataset_loading_active:
             if gameplay_now or self._hud_present or (game_state.get("isPlaying") is True):
                 self._phase_dataset_loading_active = False
+                self._phase_dataset_loading_since = 0.0
             elif now > float(self._phase_dataset_loading_deadline):
                 self._phase_dataset_loading_active = False
+                self._phase_dataset_loading_since = 0.0
             else:
                 label = "loading"
         return label
+
+    def _terminate_launcher_proc(self, *, reason: str) -> None:
+        proc = getattr(self.launcher, "proc", None)
+        if proc is None:
+            return
+        try:
+            pid = int(getattr(proc, "pid", 0) or 0)
+        except Exception:
+            pid = 0
+        if pid <= 1:
+            return
+        try:
+            alive = getattr(proc, "poll", lambda: 0)() is None
+        except Exception:
+            alive = False
+        if not alive:
+            return
+        print(f"[launcher] terminating game (reason={reason}) pid={pid}", flush=True)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                if getattr(proc, "poll", lambda: 0)() is not None:
+                    break
+            except Exception:
+                break
+            time.sleep(0.05)
+        try:
+            if getattr(proc, "poll", lambda: 0)() is None:
+                proc.kill()
+        except Exception:
+            pass
 
     def _teacher_debug_dump(
         self,
@@ -1817,6 +1893,7 @@ class WorkerService:
         menu_hint: Optional[bool],
         game_state: dict,
         force: bool = False,
+        event: Optional[str] = None,
     ) -> None:
         if not self._phase_dataset_enabled:
             return
@@ -1867,6 +1944,7 @@ class WorkerService:
                 "phase_label": self._phase_label,
                 "phase_conf": self._phase_conf,
                 "phase_source": self._phase_source,
+                "event": str(event) if event else None,
             }
             np.savez_compressed(out_path, frames=np.stack(frames), label=label, meta=json.dumps(meta))
             self._phase_dataset_counts[label] = self._phase_dataset_counts.get(label, 0) + 1
@@ -2036,36 +2114,45 @@ class WorkerService:
             if img is None or img.size == 0:
                 return None
             h, w = img.shape[:2]
-            rx0 = int(w * 0.05)
-            rx1 = int(w * 0.45)
-            ry0 = int(h * 0.20)
-            ry1 = int(h * 0.85)
-            rx1 = max(rx1, rx0 + 1)
-            ry1 = max(ry1, ry0 + 1)
-            roi = img[ry0:ry1, rx0:rx1]
-            roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
-            edges = cv2.Canny(roi, 50, 150)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            candidates: List[tuple[int, int, int, int, float]] = []
-            for cnt in contours:
-                x, y, cw, ch = cv2.boundingRect(cnt)
-                area = float(cw * ch)
-                if area < 0.005 * roi_area:
-                    continue
-                if ch <= 0:
-                    continue
-                aspect = float(cw) / float(ch)
-                if aspect < 2.0:
-                    continue
-                ax = rx0 + x
-                ay = ry0 + y
-                candidates.append((ax, ay, cw, ch, area / roi_area))
-            if not candidates:
-                return None
-            candidates.sort(key=lambda r: (r[1], -r[4]))
-            cx = float(candidates[0][0] + candidates[0][2] * 0.5)
-            cy = float(candidates[0][1] + candidates[0][3] * 0.5)
-            return candidates[0][4], cx, cy, candidates, (rx0, ry0, rx1, ry1)
+
+            def _scan(rx0f: float, rx1f: float, ry0f: float, ry1f: float):
+                rx0 = int(w * rx0f)
+                rx1 = int(w * rx1f)
+                ry0 = int(h * ry0f)
+                ry1 = int(h * ry1f)
+                rx1 = max(rx1, rx0 + 1)
+                ry1 = max(ry1, ry0 + 1)
+                roi = img[ry0:ry1, rx0:rx1]
+                roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
+                edges = cv2.Canny(roi, 50, 150)
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                candidates: List[tuple[int, int, int, int, float]] = []
+                for cnt in contours:
+                    x, y, cw, ch = cv2.boundingRect(cnt)
+                    area = float(cw * ch)
+                    if area < 0.006 * roi_area:
+                        continue
+                    if ch <= 0:
+                        continue
+                    aspect = float(cw) / float(ch)
+                    if aspect < 1.6:
+                        continue
+                    ax = rx0 + x
+                    ay = ry0 + y
+                    candidates.append((ax, ay, cw, ch, area / roi_area))
+                if not candidates:
+                    return None
+                candidates.sort(key=lambda r: (r[1], -r[4]))
+                best = candidates[0]
+                cx = float(best[0] + best[2] * 0.5)
+                cy = float(best[1] + best[3] * 0.5)
+                return best[4], cx, cy, candidates, (rx0, ry0, rx1, ry1)
+
+            # Prefer the centered "stack of buttons" region first; fallback to left column.
+            res = _scan(0.28, 0.78, 0.18, 0.80)
+            if res is None:
+                res = _scan(0.05, 0.45, 0.20, 0.85)
+            return res
         except Exception as exc:
             if not self._menu_teacher_play_rect_warned:
                 print(f"[TEACHER] WARN: play rect detector unavailable ({exc})", flush=True)
@@ -2553,6 +2640,23 @@ class WorkerService:
                             pass
                     except Exception:
                         self._game_restart_failed = True
+            # If we get stuck on a loading screen for too long, terminate the game so the
+            # normal restart loop can relaunch it and we can harvest another transition.
+            try:
+                stall_s = float(self._phase_dataset_loading_restart_s or 0.0)
+            except Exception:
+                stall_s = 0.0
+            if (
+                stall_s > 0.0
+                and launcher_alive
+                and self._phase_dataset_loading_active
+                and float(self._phase_dataset_loading_since or 0.0) > 0.0
+                and (now - float(self._phase_dataset_loading_since)) >= float(stall_s)
+            ):
+                self._phase_dataset_loading_active = False
+                self._phase_dataset_loading_since = 0.0
+                self._phase_dataset_loading_deadline = 0.0
+                self._terminate_launcher_proc(reason="loading_stall")
             # Opportunistically refresh PipeWire selection; gamescope may initially expose only
             # `gamescope:capture_*` then later publish a concrete node id in logs.
             try:
@@ -3344,6 +3448,28 @@ class WorkerService:
             )
             self._maybe_dump_phase_sample(now=now, label=dataset_label, menu_hint=menu_hint, game_state=game_state)
 
+            # If we recently attempted click_play, only arm "loading" once we observe a real transition.
+            if self._menu_teacher_play_pending and latest_image_bytes is not None:
+                var = jpeg_luma_variance(latest_image_bytes)
+                stats = self._frame_stats_from_bytes(latest_image_bytes)
+                transitioned = False
+                if stats and self._frame_is_black(stats):
+                    transitioned = True
+                if (not transitioned) and (var is not None) and (self._menu_teacher_play_ref_var is not None):
+                    if abs(float(var) - float(self._menu_teacher_play_ref_var)) >= float(
+                        self._menu_teacher_play_transition_var_delta
+                    ):
+                        transitioned = True
+                if transitioned:
+                    self._arm_loading_window(now=now)
+                    self._menu_teacher_play_pending = False
+                    self._menu_teacher_play_pending_deadline = 0.0
+                    self._menu_teacher_play_ref_var = None
+                elif now >= float(self._menu_teacher_play_pending_deadline):
+                    self._menu_teacher_play_pending = False
+                    self._menu_teacher_play_pending_deadline = 0.0
+                    self._menu_teacher_play_ref_var = None
+
             # Explicit menu-change logging for debug.
             if self._menu_log:
                 try:
@@ -3707,8 +3833,12 @@ class WorkerService:
                                     self._input_backend.click_at(fx, fy)
                                     clicked = True
                                     teacher_action_kind = f"click_play:{play_mode}"
-                                    # Post-play is often an immediate load; label as loading until gameplay.
-                                    self._arm_loading_window(now=now)
+                                    # Only label as loading once we observe a real transition (prevents poison on missed clicks).
+                                    self._menu_teacher_play_pending = True
+                                    self._menu_teacher_play_pending_deadline = float(
+                                        now + max(0.0, float(self._menu_teacher_play_transition_s))
+                                    )
+                                    self._menu_teacher_play_ref_var = jpeg_luma_variance(latest_image_bytes)
                                     self._menu_teacher.record_intervention(now)
                                     if self._menu_teacher.should_log_intervention():
                                         print(
@@ -5621,7 +5751,8 @@ def resolve_gamescope_serial() -> bool:
     for block in output.split("\n\n"):
         if 'media.class = "Video/Source"' not in block:
             continue
-        if 'node.name = "gamescope"' not in block and 'media.name = "gamescope"' not in block:
+        # node.name can be "gamescope" or a namespaced variant like "gamescope:out_0".
+        if "gamescope" not in block:
             continue
         match = re.search(r'object\\.serial\\s*=\\s*\"?(\\d+)\"?', block)
         if match:
