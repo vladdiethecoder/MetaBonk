@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
+import random
 import time
 from pathlib import Path
 from dataclasses import asdict
@@ -47,7 +49,7 @@ from src.neuro_genie.action_adapter import (
 from src.neuro_genie.generative_world_model import (
     GWMConfig, GenerativeWorldModel, GWMTrainer, VideoTokenizer,
 )
-from src.neuro_genie.offline_replay_env import OfflineReplayEnv
+from src.neuro_genie.offline_replay_env import load_pt_trajectory
 from src.neuro_genie.federated_dreaming import (
     FederatedDreamingConfig, FederatedDreamCoordinator,
     AgentRole, NICHE_REGISTRY,
@@ -116,6 +118,51 @@ class FramePairDataset(Dataset):
         frame_t1 = np.transpose(frame_t1, (2, 0, 1))
         
         return torch.tensor(frame_t), torch.tensor(frame_t1)
+
+
+class ReplaySampleDataset(Dataset):
+    def __init__(
+        self,
+        rollout_paths,
+        *,
+        obs_dim: int,
+        act_dim: int,
+        seed: int = 0,
+        max_samples: int = 1000000,
+    ) -> None:
+        self.rollout_paths = list(rollout_paths)
+        self.obs_dim = int(obs_dim)
+        self.act_dim = int(act_dim)
+        self.seed = int(seed)
+        self.max_samples = int(max_samples)
+
+    def __len__(self) -> int:
+        return self.max_samples
+
+    def __getitem__(self, idx):
+        import torch
+
+        worker_id = 0
+        try:
+            info = torch.utils.data.get_worker_info()
+            if info is not None:
+                worker_id = int(info.id)
+        except Exception:
+            worker_id = 0
+        rng = random.Random(self.seed + int(idx) + (worker_id + 1) * 1000003)
+        for _ in range(3):
+            path = rng.choice(self.rollout_paths)
+            traj = load_pt_trajectory(Path(path))
+            T = int(traj.length)
+            if T <= 0:
+                continue
+            t = rng.randrange(0, T)
+            obs = torch.as_tensor(traj.observations[t])
+            act = torch.as_tensor(traj.actions[t])
+            return obs, act
+        return torch.zeros((self.obs_dim,), dtype=torch.float32), torch.zeros(
+            (self.act_dim,), dtype=torch.float32
+        )
 
 
 def train_lam(args):
@@ -313,10 +360,6 @@ def train_dream_rl(args):
         or args.data
     ).expanduser()
     print(f"[offline_replay] rollouts: {pt_dir}")
-    env = OfflineReplayEnv(rollout_dir=pt_dir, sampling_mode="random")
-
-    # Infer dims from one reset.
-    obs0, info0 = env.reset()
     import torch
 
     device = torch.device(
@@ -328,6 +371,19 @@ def train_dream_rl(args):
     optimize_5090 = bool(getattr(args, "optimize_5090", False)) or str(
         os.environ.get("METABONK_OPTIMIZE_5090", "0") or "0"
     ).strip().lower() in ("1", "true", "yes", "on")
+    amp_mode = str(getattr(args, "amp", "auto") or "auto").strip().lower()
+    if amp_mode == "auto":
+        amp_mode = "bf16" if optimize_5090 and device.type == "cuda" else "off"
+    if amp_mode not in ("off", "bf16", "fp16"):
+        raise ValueError(f"--amp must be off|bf16|fp16 (got {amp_mode!r})")
+    amp_enabled = amp_mode in ("bf16", "fp16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_mode == "fp16" and device.type == "cuda")
+    def _autocast():
+        if amp_enabled:
+            return torch.autocast(device_type="cuda", dtype=amp_dtype)
+        return contextlib.nullcontext()
+
     compile_mode = str(getattr(args, "compile_mode", "max-autotune") or "max-autotune")
     if bool(getattr(args, "cuda_graph", False)) and bool(getattr(args, "compile", False)):
         if compile_mode == "max-autotune":
@@ -346,13 +402,19 @@ def train_dream_rl(args):
         applied = apply_blackwell_defaults(cfg)
         if applied:
             print(f"[offline_replay] blackwell={applied}")
-    obs0_t = torch.as_tensor(obs0, dtype=torch.float32, device=device)
-
-    # Determine action dim from the first trajectory.
-    traj_path = Path(str(info0.get("path") or ""))
-    tr = torch.load(traj_path, map_location="cpu", weights_only=False)
-    act_dim = int(tr["actions"].shape[-1])
+    # Determine action/obs dims from the first trajectory.
+    rollout_paths = sorted(Path(pt_dir).glob("*.pt"))
+    if not rollout_paths:
+        alt = Path(pt_dir) / "video_rollouts"
+        if alt.exists():
+            rollout_paths = sorted(alt.glob("*.pt"))
+    if not rollout_paths:
+        raise FileNotFoundError(f"No .pt rollouts found under {pt_dir}")
+    tr0 = load_pt_trajectory(rollout_paths[0])
+    obs0_t = torch.as_tensor(tr0.observations[0], dtype=torch.float32, device=device)
+    act0_t = torch.as_tensor(tr0.actions[0], dtype=torch.float32, device=device)
     obs_dim = int(obs0_t.numel())
+    act_dim = int(act0_t.numel())
 
     # Simple MLP policy: obs -> action (continuous).
     policy = torch.nn.Sequential(
@@ -373,7 +435,10 @@ def train_dream_rl(args):
 
     max_steps = int(args.max_steps)
     batch_size = int(args.batch_size)
-    print(f"[offline_replay] device={device} obs_dim={obs_dim} act_dim={act_dim} steps={max_steps} batch={batch_size}")
+    print(
+        f"[offline_replay] device={device} obs_dim={obs_dim} act_dim={act_dim} "
+        f"steps={max_steps} batch={batch_size} amp={amp_mode}"
+    )
 
     # Optional CUDA graph capture (static shapes only).
     use_cuda_graph = bool(getattr(args, "cuda_graph", False)) and device.type == "cuda"
@@ -391,13 +456,16 @@ def train_dream_rl(args):
 
     if use_cuda_graph and (batch_size <= 0 or obs_dim <= 0 or act_dim <= 0):
         _disable_cuda_graph("invalid_static_shape")
+    if use_cuda_graph and amp_mode == "fp16":
+        _disable_cuda_graph("fp16_scaler")
     if use_cuda_graph:
         fixed_x = torch.zeros((batch_size, obs_dim), device=device, dtype=torch.float32)
         fixed_y = torch.zeros((batch_size, act_dim), device=device, dtype=torch.float32)
 
         def _step_static():
-            pred = policy(fixed_x)
-            loss = loss_fn(pred, fixed_y)
+            with _autocast():
+                pred = policy(fixed_x)
+                loss = loss_fn(pred, fixed_y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -411,31 +479,55 @@ def train_dream_rl(args):
             use_cuda_graph = False
             graph = None
 
-    # Batch sampling by repeatedly resetting to random trajectories and sampling random indices.
-    # This stays honest: targets are the recorded actions.
+    # Prefetch loader for offline replay samples.
+    replay_seed = int(os.environ.get("METABONK_REPLAY_SEED", "0") or 0)
+    samples_per_epoch = max(1, max_steps * batch_size)
+    dataset = ReplaySampleDataset(
+        rollout_paths,
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        seed=replay_seed,
+        max_samples=samples_per_epoch,
+    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": int(getattr(args, "num_workers", 0) or 0),
+        "pin_memory": device.type == "cuda",
+        "drop_last": bool(use_cuda_graph),
+    }
+    if loader_kwargs["num_workers"] > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2) or 2)
+    loader = DataLoader(dataset, **loader_kwargs)
+    loader_iter = iter(loader)
+
     for step in range(max_steps):
-        # Sample a random trajectory file via env.reset().
-        obs, info = env.reset()
-        traj_path = Path(str(info.get("path") or ""))
-        data = torch.load(traj_path, map_location="cpu", weights_only=False)
-        obs_all = data["observations"]
-        acts_all = data["actions"]
-        T = int(obs_all.shape[0])
-        if T < 2:
-            continue
-        idx = torch.randint(0, T, (min(batch_size, T),), device="cpu")
-        x = obs_all[idx].to(device=device, dtype=torch.float32)
-        y = acts_all[idx].to(device=device, dtype=torch.float32)
+        try:
+            x, y = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            x, y = next(loader_iter)
+        x = x.to(device=device, dtype=torch.float32, non_blocking=True)
+        y = y.to(device=device, dtype=torch.float32, non_blocking=True)
+        x = x.view(x.shape[0], -1)
+        y = y.view(y.shape[0], -1)
 
         if x.ndim != 2 or x.shape[1] != obs_dim or y.ndim != 2 or y.shape[1] != act_dim:
             if use_cuda_graph and not shape_guard_disabled:
                 _disable_cuda_graph("dynamic_shape")
             # Fall back to eager path on incompatible shapes.
-            pred = policy(x.reshape(x.shape[0], -1))
-            loss = loss_fn(pred, y.reshape(y.shape[0], -1))
+            with _autocast():
+                pred = policy(x.reshape(x.shape[0], -1))
+                loss = loss_fn(pred, y.reshape(y.shape[0], -1))
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             if (step + 1) % max(1, int(args.log_interval)) == 0:
                 print(
                     f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}"
@@ -456,13 +548,20 @@ def train_dream_rl(args):
             fixed_y.copy_(y)
             graph.replay()
             with torch.no_grad():
-                loss = loss_fn(policy(fixed_x), fixed_y)
+                with _autocast():
+                    loss = loss_fn(policy(fixed_x), fixed_y)
         else:
-            pred = policy(x)
-            loss = loss_fn(pred, y)
+            with _autocast():
+                pred = policy(x)
+                loss = loss_fn(pred, y)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
 
         if (step + 1) % max(1, int(args.log_interval)) == 0:
             print(f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}")
@@ -632,6 +731,11 @@ Examples:
                        help="Override PYTORCH_CUDA_ALLOC_CONF (default: expandable_segments:True).")
     parser.add_argument("--memory-fraction", type=float, default=0.0,
                        help="Optional torch.cuda.set_per_process_memory_fraction (0 = unset).")
+    parser.add_argument("--amp", default="auto",
+                       choices=["auto", "off", "bf16", "fp16"],
+                       help="Mixed precision mode for offline replay (auto=bf16 on CUDA when optimize-5090).")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                       help="DataLoader prefetch_factor (only when num_workers > 0).")
     
     # Federated settings
     parser.add_argument("--iterations", type=int, default=3,
