@@ -102,6 +102,95 @@ def _game_restart_possible() -> bool:
     )
 
 
+class AdaptiveTeacher:
+    def __init__(
+        self,
+        *,
+        patience_s: float = 2.0,
+        max_patience_s: float = 30.0,
+        growth: float = 1.5,
+        cooldown_s: float = 0.5,
+        log_every: int = 60,
+    ) -> None:
+        self.patience_s = float(patience_s)
+        self.max_patience_s = float(max_patience_s)
+        self.growth = float(growth)
+        self.cooldown_s = float(cooldown_s)
+        self.log_every = max(1, int(log_every))
+        self._menu_elapsed_s = 0.0
+        self._last_ts = 0.0
+        self._last_menu_key = ""
+        self._last_intervention_ts = 0.0
+        self._intervention_count = 0
+
+    @classmethod
+    def from_env(cls) -> "AdaptiveTeacher":
+        def _get_float(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, str(default)))
+            except Exception:
+                return float(default)
+
+        def _get_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, str(default)))
+            except Exception:
+                return int(default)
+
+        return cls(
+            patience_s=_get_float("METABONK_MENU_TEACHER_PATIENCE_S", 2.0),
+            max_patience_s=_get_float("METABONK_MENU_TEACHER_MAX_S", 30.0),
+            growth=_get_float("METABONK_MENU_TEACHER_GROWTH", 1.5),
+            cooldown_s=_get_float("METABONK_MENU_TEACHER_COOLDOWN_S", 0.5),
+            log_every=_get_int("METABONK_MENU_TEACHER_LOG_EVERY", 60),
+        )
+
+    def step(self, now: float, *, in_menu: bool, menu_key: str) -> bool:
+        if not in_menu:
+            self._menu_elapsed_s = 0.0
+            self._last_ts = now
+            self._last_menu_key = ""
+            return False
+        if self._last_ts <= 0.0:
+            self._last_ts = now
+        dt = max(0.0, float(now - self._last_ts))
+        self._last_ts = now
+        if menu_key and menu_key != self._last_menu_key:
+            self._menu_elapsed_s = 0.0
+            self._last_menu_key = menu_key
+        else:
+            self._menu_elapsed_s += dt
+        if self._menu_elapsed_s < self.patience_s:
+            return False
+        if self._last_intervention_ts > 0 and (now - self._last_intervention_ts) < self.cooldown_s:
+            return False
+        return True
+
+    def record_intervention(self, now: float) -> None:
+        self._last_intervention_ts = now
+        self._menu_elapsed_s = 0.0
+        self._intervention_count += 1
+
+    def should_log_intervention(self) -> bool:
+        return self._intervention_count % self.log_every == 0
+
+    def recent_intervention(self, now: float, window_s: float) -> bool:
+        if self._last_intervention_ts <= 0:
+            return False
+        return (now - self._last_intervention_ts) <= float(window_s)
+
+    def on_student_success(self) -> None:
+        prev = float(self.patience_s)
+        self.patience_s = min(self.max_patience_s, float(self.patience_s) * float(self.growth))
+        print(
+            f"[TEACHER] Student acted independently; patience {prev:.1f}s -> {self.patience_s:.1f}s",
+            flush=True,
+        )
+
+    def on_teacher_success(self) -> None:
+        print("[TEACHER] Intervention triggered reward", flush=True)
+
+
 class WorkerService:
     def __init__(
         self,
@@ -265,9 +354,19 @@ class WorkerService:
         try:
             self._menu_bias_min = float(os.environ.get("METABONK_MENU_ACTION_BIAS_MIN", "0.05"))
         except Exception:
-            self._menu_bias_min = 0.05
+        self._menu_bias_min = 0.05
         self._menu_bias_successes = 0
         self._menu_bias_indices: List[int] = []
+        menu_teacher_env = str(os.environ.get("METABONK_MENU_TEACHER", "") or "").strip().lower()
+        if not menu_teacher_env:
+            self._menu_teacher_enabled = bool(self._menu_bias_enabled)
+        else:
+            self._menu_teacher_enabled = menu_teacher_env in ("1", "true", "yes", "on")
+        self._menu_teacher = AdaptiveTeacher.from_env() if self._menu_teacher_enabled else None
+        try:
+            self._menu_teacher_window_s = float(os.environ.get("METABONK_MENU_TEACHER_WINDOW_S", "2.0"))
+        except Exception:
+            self._menu_teacher_window_s = 2.0
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -2616,7 +2715,11 @@ class WorkerService:
                         forced_ui_click = None
 
             input_bootstrap = False
-            if self._input_backend and self._menu_bias_enabled and self._menu_bias_indices:
+            teacher_action_idx = None
+            cur_menu = ""
+            playing_flag = False
+            in_menu = False
+            if self._input_backend and self._menu_bias_indices:
                 try:
                     cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
                 except Exception:
@@ -2626,13 +2729,38 @@ class WorkerService:
                 except Exception:
                     playing_flag = False
                 in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
-                if in_menu:
-                    prob = max(0.0, min(1.0, float(self._menu_bias_prob)))
-                    for idx in self._menu_bias_indices:
-                        if idx >= len(a_disc):
-                            continue
-                        if random.random() < prob:
-                            a_disc[idx] = 1
+            if (
+                self._input_backend
+                and (not menu_override_active)
+                and self._menu_teacher_enabled
+                and self._menu_teacher is not None
+                and self._menu_bias_indices
+                and in_menu
+            ):
+                menu_key = cur_menu or str(game_state.get("currentMenu") or "")
+                if self._menu_teacher.step(now, in_menu=in_menu, menu_key=menu_key):
+                    teacher_action_idx = self._menu_bias_indices[0]
+                    if teacher_action_idx < len(a_disc):
+                        a_disc[teacher_action_idx] = 1
+                        self._menu_teacher.record_intervention(now)
+                        if self._menu_teacher.should_log_intervention():
+                            print(
+                                f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting confirm",
+                                flush=True,
+                            )
+            if (
+                self._input_backend
+                and self._menu_bias_enabled
+                and (not self._menu_teacher_enabled)
+                and self._menu_bias_indices
+                and in_menu
+            ):
+                prob = max(0.0, min(1.0, float(self._menu_bias_prob)))
+                for idx in self._menu_bias_indices:
+                    if idx >= len(a_disc):
+                        continue
+                    if random.random() < prob:
+                        a_disc[idx] = 1
             if (
                 self._input_backend
                 and (not menu_override_active)
@@ -2662,6 +2790,8 @@ class WorkerService:
                     action_label = "click_xy"
                 elif input_bootstrap:
                     action_label = "bootstrap"
+                elif teacher_action_idx is not None:
+                    action_label = f"teacher:{int(teacher_action_idx)}"
                 elif a_disc:
                     action_label = f"disc:{int(a_disc[0])}"
                 elif a_cont:
@@ -2973,7 +3103,12 @@ class WorkerService:
                             f"[MENU] instance={self.instance_id} start_bonus_fired={menu_start_bonus:.2f} "
                             f"prev='{prev_menu or ''}' cur='generatedmap'"
                         )
-                    if self._menu_bias_enabled:
+                    if self._menu_teacher_enabled and self._menu_teacher is not None:
+                        if self._menu_teacher.recent_intervention(now, self._menu_teacher_window_s):
+                            self._menu_teacher.on_teacher_success()
+                        else:
+                            self._menu_teacher.on_student_success()
+                    elif self._menu_bias_enabled:
                         self._menu_bias_successes += 1
                         prev_prob = float(self._menu_bias_prob)
                         self._menu_bias_prob = max(
