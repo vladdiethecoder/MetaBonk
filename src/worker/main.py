@@ -192,6 +192,7 @@ class WorkerService:
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
         self._last_menu_name: Optional[str] = None
+        self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
         self._action_source = self._normalize_action_source(
@@ -2740,6 +2741,19 @@ class WorkerService:
                     if prev_menu == "mainmenu" and cur_menu == "generatedmap":
                         reward += menu_start_bonus
                 self._last_menu_name = cur_menu
+            # Optional reward logging (useful for menu shaping/debug).
+            if self._reward_log and abs(float(reward)) > 1e-9:
+                try:
+                    playing_flag = bool(game_state.get("isPlaying"))
+                except Exception:
+                    playing_flag = False
+                menu_reason = ""
+                if prev_menu or cur_menu:
+                    menu_reason = f"{prev_menu or ''}->{cur_menu or ''}"
+                print(
+                    f"[REWARD] instance={self.instance_id} reward={float(reward):.4f} "
+                    f"menu={menu_reason} playing={playing_flag}"
+                )
             # Episode done: when METABONK_VISUAL_ONLY=1, never use SHM/memory flags.
             # If the vision model exports a boolean done signal, consume it here.
             if self._visual_only and isinstance(vision_metrics, dict):

@@ -105,5 +105,6 @@ Environment Variables
 - METABONK_INPUT_SCROLL_SCALE: Scroll scale for a_cont[2] (default 3.0)
 - METABONK_INPUT_MENU_BOOTSTRAP: Enable menu bootstrap macro (default 0)
 - METABONK_MENU_START_BONUS: Reward bonus for menu transitions (e.g., MainMenu->GeneratedMap)
+- METABONK_REWARD_LOG: Emit [REWARD] lines for non-zero rewards (default 0)
 - METABONK_PPO_CONTINUOUS_DIM: Override PPO continuous action dim (e.g., 3 for scroll)
 - METABONK_PPO_DISCRETE_BRANCHES: Override PPO discrete branches (e.g., "2,2,2,2,2")
