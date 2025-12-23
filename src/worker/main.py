@@ -1237,6 +1237,11 @@ class WorkerService:
             ]
         kind, payload = steps[self._menu_bootstrap_step % len(steps)]
         try:
+            if os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_DEBUG", "0") in ("1", "true", "True"):
+                print(f"[worker:{self.instance_id}] menu_bootstrap menu='{current_menu}' step={self._menu_bootstrap_step} action={kind} payload={payload}")
+        except Exception:
+            pass
+        try:
             if kind == "key_tap":
                 self._input_backend.key_down(str(payload))
                 self._input_backend.key_up(str(payload))
