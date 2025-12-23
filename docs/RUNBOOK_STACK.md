@@ -72,6 +72,25 @@ PipeWire’s docs describe the node/port/link graph model and pw-cli usage.
 For IL2CPP builds on Linux/Wine, use the IL2CPP-specific BepInEx build and run
 the game once to generate `BepInEx/config/BepInEx.cfg` and logs.
 
+### Golden Config (Proton + BepInEx + BonkLink)
+Known-good stack (2025-12-22) for headless GPU + BonkLink:
+- Proton 9.0 (Beta)
+- BepInEx IL2CPP build 738
+- BonkLink rebuilt against instance interop
+
+Critical env vars:
+```bash
+export METABONK_E2E_GAMESCOPE=1
+export METABONK_DISABLE_BEPINEX=0
+export METABONK_DISABLE_BONKLINK=0
+export METABONK_BEPINEX_UNITY_LOG_LISTENING=0
+```
+
+BonkLink rebuild (compile against interop from a live instance):
+```bash
+bash scripts/build_research_plugin.sh /path/to/megabonk --bonklink
+```
+
 ## Input Sanity
 - uinput:
 ```bash
