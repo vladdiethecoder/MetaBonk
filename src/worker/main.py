@@ -2724,6 +2724,34 @@ class WorkerService:
                 menu_hint = True
             if self._hud_present:
                 menu_hint = False
+            if self._hud_present and self._hud_pulse_log_s > 0.0:
+                if (now - self._hud_pulse_last_ts) >= float(self._hud_pulse_log_s):
+                    try:
+                        pv = game_state.get("playerVelocity") or (0.0, 0.0, 0.0)
+                        pp = game_state.get("playerPosition") or (0.0, 0.0, 0.0)
+                        gt = game_state.get("gameTime")
+                        try:
+                            vx, vy, vz = pv
+                        except Exception:
+                            vx = vy = vz = 0.0
+                        try:
+                            px, py, pz = pp
+                        except Exception:
+                            px = py = pz = 0.0
+                        try:
+                            gt_val = float(gt) if gt is not None else None
+                        except Exception:
+                            gt_val = None
+                        print(
+                            f"[HUD_PULSE] instance={self.instance_id} "
+                            f"pos=({px:.2f},{py:.2f},{pz:.2f}) "
+                            f"vel=({vx:.2f},{vy:.2f},{vz:.2f}) "
+                            f"gameTime={gt_val if gt_val is not None else 'None'}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                    self._hud_pulse_last_ts = now
 
             # Explicit menu-change logging for debug.
             if self._menu_log:
