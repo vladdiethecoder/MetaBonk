@@ -969,6 +969,16 @@ def main() -> int:
                         role="xvfb",
                     )
                 )
+            else:
+                # When using gamescope without Xvfb, inputs must target the gamescope
+                # Xwayland display (commonly :1). Allow overrides via METABONK_INPUT_DISPLAY.
+                if args.gamescope and not wenv.get("METABONK_INPUT_DISPLAY"):
+                    wenv["METABONK_INPUT_DISPLAY"] = str(
+                        wenv.get("METABONK_GAMESCOPE_INPUT_DISPLAY", ":1")
+                    )
+                # Default the xdotool window matcher to the game name if not specified.
+                if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
+                    wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
             procs.append(
                 _spawn(
                     iid,
