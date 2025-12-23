@@ -937,8 +937,17 @@ def main() -> int:
         xvfb_ok = use_xvfb and shutil.which("Xvfb") is not None
         if use_xvfb and not xvfb_ok:
             print("[start_omega] WARN: MEGABONK_USE_XVFB=1 but Xvfb not found; instances may appear on your desktop.")
+        if n_workers > 1 and not xvfb_ok:
+            print(
+                "[start_omega] WARN: multi-worker without Xvfb; input isolation may be incomplete. "
+                "Set MEGABONK_USE_XVFB=1 for per-worker DISPLAYs."
+            )
         xvfb_base = int(env.get("MEGABONK_XVFB_BASE", "90"))
         xvfb_size = env.get("MEGABONK_XVFB_SIZE", "1280x720x24")
+        run_dir = env.get("METABONK_RUN_DIR") or env.get("MEGABONK_LOG_DIR") or ""
+        logs_dir = Path(run_dir) / "logs" if run_dir else None
+        if logs_dir:
+            logs_dir.mkdir(parents=True, exist_ok=True)
         for i in range(max(0, n_workers)):
             iid = f"{args.instance_prefix}-{i}"
             wenv = env.copy()
@@ -979,6 +988,16 @@ def main() -> int:
                 # Default the xdotool window matcher to the game name if not specified.
                 if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                     wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
+            if logs_dir:
+                iso_path = logs_dir / f"worker_{i}_isolation.log"
+                try:
+                    with iso_path.open("w", encoding="utf-8") as f:
+                        f.write(f"INSTANCE_ID={iid}\n")
+                        f.write(f"DISPLAY={wenv.get('DISPLAY','')}\n")
+                        f.write(f"METABONK_INPUT_DISPLAY={wenv.get('METABONK_INPUT_DISPLAY','')}\n")
+                        f.write(f"XVFB_ENABLED={str(bool(xvfb_ok))}\n")
+                except Exception:
+                    pass
             procs.append(
                 _spawn(
                     iid,
