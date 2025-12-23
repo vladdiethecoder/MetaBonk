@@ -22,8 +22,8 @@ If you run compose manually, make sure the config/FIFO paths point at the repo `
 
 ## View
 - go2rtc UI: `http://127.0.0.1:1984/`
-- Built-in viewer (example): `http://127.0.0.1:1984/stream.html?src=omega-0`
-- MetaBonk Dev UI: `http://127.0.0.1:5173/stream` (shows a per-agent “open go2rtc” link when `/stream.mp4` isn’t available)
+- Built-in viewer (example): `http://127.0.0.1:1984/stream.html?src=omega-0&mode=webrtc`
+- MetaBonk Dev UI: `http://127.0.0.1:5173/stream` (uses go2rtc WebRTC when available, otherwise `/stream.mp4`)
 
 ## If browsers don’t play (common with Docker NAT)
 The default compose uses `network_mode: host` for go2rtc to keep WebRTC ICE candidates correct.
@@ -49,7 +49,7 @@ This validates the “renderer→CUDA→NVENC→FIFO→go2rtc” path without Pi
 2) Create the FIFO and run the demo (from repo root):
    - `PYTHONPATH=. python scripts/egl_vpf_demo.py --fifo temp/streams/demo.h264 --frames 0 --width 1280 --height 720`
 3) Open:
-   - `http://127.0.0.1:1984/stream.html?src=demo`
+   - `http://127.0.0.1:1984/stream.html?src=demo&mode=webrtc`
 
 ## Alternative: exec stdout mode (no FIFO)
 You can skip FIFOs and let go2rtc spawn the encoder directly, reading from stdout.

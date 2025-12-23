@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { Heartbeat } from "../api";
 import MseMp4Video from "./MseMp4Video";
+import Go2rtcEmbed from "./Go2rtcEmbed";
 
 export type MonitorEffect = "static" | "bars" | "dvd" | null;
 
@@ -116,11 +117,20 @@ export default function CctvMonitor({ agent, label, isHero, effect }: MonitorPro
   const controlUrl = String((agent as any)?.control_url ?? "");
   const fallbackUrl = controlUrl ? `${controlUrl.replace(/\\/+$/, "")}/frame.jpg` : undefined;
   const instanceId = String((agent as any)?.instance_id ?? "");
+  const go2rtcBase = String((agent as any)?.go2rtc_base_url ?? "").trim();
+  const go2rtcName = String((agent as any)?.go2rtc_stream_name ?? "").trim();
+  const go2rtcUrl =
+    go2rtcBase && go2rtcName
+      ? `${go2rtcBase.replace(/\\/+$/, "")}/stream.html?${new URLSearchParams({ src: go2rtcName, mode: "webrtc" }).toString()}`
+      : "";
+  const useGo2rtc = Boolean(go2rtcUrl);
 
   return (
     <div className={`cctv-monitor ${isHero ? "hero" : ""}`}>
       <div className="cctv-screen">
-        {streamUrl && !effect ? (
+        {useGo2rtc && !effect ? (
+          <Go2rtcEmbed url={go2rtcUrl} className="cctv-video" title={`go2rtc ${instanceId || label}`} />
+        ) : streamUrl && !effect ? (
           <MseMp4Video url={streamUrl} className="cctv-video" fallbackUrl={fallbackUrl} exclusiveKey={instanceId || streamUrl} />
         ) : (
           <div className="cctv-noise-bg" />

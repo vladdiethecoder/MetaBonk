@@ -25,6 +25,7 @@ import { PROGRESS_GOALS, type GoalTier, type ProgressGoal } from "../lib/megabon
 import { UI_TOKENS } from "../lib/ui_tokens";
 import { timeAgo } from "../lib/format";
 import MseMp4Video from "../components/MseMp4Video";
+import Go2rtcEmbed from "../components/Go2rtcEmbed";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
@@ -586,8 +587,13 @@ function StreamTile({
   const frameUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/frame.jpg` : "";
   const go2rtcBase = String((w as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
-  const go2rtcUrl =
-    go2rtcBase && go2rtcName ? `${go2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(go2rtcName)}` : "";
+  const go2rtcUrl = useMemo(() => {
+    if (!go2rtcBase || !go2rtcName) return "";
+    const base = go2rtcBase.replace(/\/+$/, "");
+    const qs = new URLSearchParams({ src: go2rtcName, mode: "webrtc" });
+    return `${base}/stream.html?${qs.toString()}`;
+  }, [go2rtcBase, go2rtcName]);
+  const useGo2rtc = Boolean(go2rtcUrl);
   const featuredRole = String((w as any)?.featured_role ?? "").toLowerCase();
 
   const danger = Math.max(0, Math.min(1, Number(w?.danger_level ?? (w?.survival_prob != null ? 1 - Number(w.survival_prob) : 0)) || 0));
@@ -702,7 +708,14 @@ function StreamTile({
             />
           ))}
         </div>
-        {streamUrl && isVideo ? (
+        {useGo2rtc ? (
+          <Go2rtcEmbed
+            url={go2rtcUrl}
+            className={`stream-img ${focused ? "holo-fallback" : ""}`}
+            title={`go2rtc ${name}`}
+            onReady={focused ? (ready) => (ready ? setVideoEl(null) : null) : undefined}
+          />
+        ) : streamUrl && isVideo ? (
           <MseMp4Video
             className={`stream-img ${focused ? "holo-fallback" : ""}`}
             url={streamUrl}
@@ -712,7 +725,7 @@ function StreamTile({
             debug={DEBUG_ON}
           />
         ) : null}
-        {noFeed ? (
+        {noFeed && !useGo2rtc ? (
           <div className="mse-overlay" aria-label="no feed">
             <div className="mse-overlay-inner">
               <div className="mse-overlay-title">NO FEED</div>

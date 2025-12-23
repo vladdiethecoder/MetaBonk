@@ -134,10 +134,10 @@ Useful paths:
 - go2rtc UI: `http://127.0.0.1:1984/`
 
 View a stream (built-in go2rtc viewer):
-- `http://127.0.0.1:1984/stream.html?src=omega-0`
+- `http://127.0.0.1:1984/stream.html?src=omega-0&mode=webrtc` (preferred for live preview)
 
 Notes:
-- The default MetaBonk Stream UI (`http://127.0.0.1:5173/stream`) still uses per-worker `/stream.mp4`, but shows an “open go2rtc” link when go2rtc fields are present.
+- The default MetaBonk Stream UI (`http://127.0.0.1:5173/stream`) uses go2rtc WebRTC when available, otherwise per-worker `/stream.mp4`.
 - When go2rtc is enabled, workers set `fifo_stream_enabled=true` and expose `fifo_stream_path` in `/workers` for debugging.
 
 ## OBS Browser Source Overlays
