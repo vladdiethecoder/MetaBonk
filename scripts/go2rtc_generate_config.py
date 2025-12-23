@@ -61,6 +61,11 @@ def main() -> int:
         help="Host FIFO directory (created if missing).",
     )
     parser.add_argument(
+        "--fifo-container",
+        default=os.environ.get("METABONK_FIFO_CONTAINER", "mpegts"),
+        help="FIFO container format: h264 (raw Annex-B) or mpegts.",
+    )
+    parser.add_argument(
         "--container-fifo-dir",
         default=os.environ.get("METABONK_GO2RTC_FIFO_DIR", "/streams"),
         help="FIFO directory path inside the go2rtc container (must match docker-compose mount).",
@@ -77,6 +82,13 @@ def main() -> int:
     fifo_dir = Path(args.fifo_dir).expanduser().resolve()
     out_path = Path(args.out).expanduser().resolve()
     container_fifo_dir = str(args.container_fifo_dir or "/streams").rstrip("/") or "/streams"
+    fifo_container = str(args.fifo_container or "mpegts").strip().lower()
+    if fifo_container in ("ts", "mpegts"):
+        fifo_container = "mpegts"
+        fifo_ext = "ts"
+    else:
+        fifo_container = "h264"
+        fifo_ext = "h264"
     mode = str(args.mode or "fifo").strip().lower()
     exec_wrap = str(args.exec_wrap or "raw").strip().lower()
     exec_wrapper = str(args.exec_wrapper or "").strip()
@@ -89,7 +101,7 @@ def main() -> int:
     if mode == "fifo":
         fifo_dir.mkdir(parents=True, exist_ok=True)
         for iid in instance_ids:
-            ensure_fifo(str(fifo_dir / f"{iid}.h264"))
+            ensure_fifo(str(fifo_dir / f"{iid}.{fifo_ext}"))
     else:
         cmd_template = str(args.exec_cmd_template or "").strip()
         if exec_profile:
@@ -128,9 +140,13 @@ def main() -> int:
     lines.append("streams:")
     for iid in instance_ids:
         if mode == "fifo":
-            fifo_inside = f"{container_fifo_dir}/{iid}.h264"
-            # #video=h264 disables probing; #raw tells go2rtc to packetize as-is.
-            lines.append(f"  {iid}: exec:cat {fifo_inside}#video=h264#raw")
+            fifo_inside = f"{container_fifo_dir}/{iid}.{fifo_ext}"
+            if fifo_container == "h264":
+                # #video=h264 disables probing; #raw tells go2rtc to packetize as-is.
+                lines.append(f"  {iid}: exec:cat {fifo_inside}#video=h264#raw")
+            else:
+                # MPEG-TS includes timing info; allow go2rtc to probe.
+                lines.append(f"  {iid}: exec:cat {fifo_inside}")
         else:
             cmd = cmd_template.format(instance_id=iid)
             if exec_wrap == "mpegts":

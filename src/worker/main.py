@@ -302,6 +302,15 @@ class WorkerService:
             "METABONK_REWARD_HIT_FRAME_PATH", str(Path("temp") / "reward_hits")
         )
         self._reward_hit_once = os.environ.get("METABONK_REWARD_HIT_ONCE", "1") in ("1", "true", "True")
+        self._gameplay_hit_saved = False
+        self._gameplay_hit_frame_path = os.environ.get(
+            "METABONK_GAMEPLAY_HIT_FRAME_PATH", str(Path("temp") / "gameplay_hits")
+        )
+        self._gameplay_hit_once = os.environ.get("METABONK_GAMEPLAY_HIT_ONCE", "1") in ("1", "true", "True")
+        try:
+            self._gameplay_strip_n = int(os.environ.get("METABONK_GAMEPLAY_STRIP_N", "16"))
+        except Exception:
+            self._gameplay_strip_n = 16
         self._frame_ring_enabled = os.environ.get("METABONK_FRAME_RING", "1") in ("1", "true", "True")
         try:
             ring_size = int(os.environ.get("METABONK_FRAME_RING_SIZE", "120"))
@@ -320,6 +329,58 @@ class WorkerService:
             self._frame_black_sat = float(os.environ.get("METABONK_FRAME_BLACK_SAT", "5.0"))
         except Exception:
             self._frame_black_sat = 5.0
+        self._hud_enabled = os.environ.get("METABONK_HUD_DETECT", "1") in ("1", "true", "True")
+        try:
+            self._hud_sat_min = float(os.environ.get("METABONK_HUD_SAT_MIN", "8.0"))
+        except Exception:
+            self._hud_sat_min = 8.0
+        try:
+            self._hud_on_frames = int(os.environ.get("METABONK_HUD_ON_FRAMES", "6"))
+        except Exception:
+            self._hud_on_frames = 6
+        try:
+            self._hud_off_frames = int(os.environ.get("METABONK_HUD_OFF_FRAMES", "10"))
+        except Exception:
+            self._hud_off_frames = 10
+        try:
+            self._hud_roi_x0 = float(os.environ.get("METABONK_HUD_MINIMAP_X0", "0.70"))
+            self._hud_roi_x1 = float(os.environ.get("METABONK_HUD_MINIMAP_X1", "0.98"))
+            self._hud_roi_y0 = float(os.environ.get("METABONK_HUD_MINIMAP_Y0", "0.02"))
+            self._hud_roi_y1 = float(os.environ.get("METABONK_HUD_MINIMAP_Y1", "0.35"))
+        except Exception:
+            self._hud_roi_x0 = 0.70
+            self._hud_roi_x1 = 0.98
+            self._hud_roi_y0 = 0.02
+            self._hud_roi_y1 = 0.35
+        try:
+            self._hud_hough_dp = float(os.environ.get("METABONK_HUD_HOUGH_DP", "1.2"))
+        except Exception:
+            self._hud_hough_dp = 1.2
+        try:
+            self._hud_hough_param1 = float(os.environ.get("METABONK_HUD_HOUGH_PARAM1", "100"))
+        except Exception:
+            self._hud_hough_param1 = 100.0
+        try:
+            self._hud_hough_param2 = float(os.environ.get("METABONK_HUD_HOUGH_PARAM2", "30"))
+        except Exception:
+            self._hud_hough_param2 = 30.0
+        try:
+            self._hud_min_radius_frac = float(os.environ.get("METABONK_HUD_MIN_RADIUS_FRAC", "0.08"))
+            self._hud_max_radius_frac = float(os.environ.get("METABONK_HUD_MAX_RADIUS_FRAC", "0.40"))
+            self._hud_min_dist_frac = float(os.environ.get("METABONK_HUD_MIN_DIST_FRAC", "0.40"))
+        except Exception:
+            self._hud_min_radius_frac = 0.08
+            self._hud_max_radius_frac = 0.40
+            self._hud_min_dist_frac = 0.40
+        self._hud_present = False
+        self._hud_on_count = 0
+        self._hud_off_count = 0
+        self._hud_last_phase: Optional[str] = None
+        try:
+            self._hud_pulse_log_s = float(os.environ.get("METABONK_HUD_PULSE_LOG_S", "0") or 0.0)
+        except Exception:
+            self._hud_pulse_log_s = 0.0
+        self._hud_pulse_last_ts = 0.0
         self._last_valid_frame: Optional[dict] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
@@ -1122,8 +1183,18 @@ class WorkerService:
                 disc.append(int(random.randrange(b)))
         return cont, disc
 
-    def _update_gameplay_state(self, menu_hint: Optional[bool], game_state: dict) -> None:
+    def _update_gameplay_state(
+        self,
+        menu_hint: Optional[bool],
+        game_state: dict,
+        *,
+        hud_present: bool = False,
+    ) -> None:
         if self._gameplay_started:
+            return
+        if hud_present:
+            self._gameplay_started = True
+            self._gameplay_start_ts = time.time()
             return
         try:
             from src.proof_harness.guards import should_mark_gameplay_started
@@ -1380,6 +1451,81 @@ class WorkerService:
             return self._frame_stats_from_array(arr)
         except Exception:
             return None
+
+    def _hud_roi_from_frame(self, img: "Any") -> Optional["Any"]:
+        try:
+            import numpy as np
+
+            if isinstance(img, np.ndarray):
+                arr = img
+            else:
+                arr = np.asarray(img)
+            if arr.ndim != 3:
+                return None
+            h, w = arr.shape[:2]
+            x0 = int(max(0, min(w - 1, round(float(self._hud_roi_x0) * w))))
+            x1 = int(max(1, min(w, round(float(self._hud_roi_x1) * w))))
+            y0 = int(max(0, min(h - 1, round(float(self._hud_roi_y0) * h))))
+            y1 = int(max(1, min(h, round(float(self._hud_roi_y1) * h))))
+            if x1 <= x0 or y1 <= y0:
+                return None
+            return arr[y0:y1, x0:x1]
+        except Exception:
+            return None
+
+    def _detect_hud_minimap(self, jpeg_bytes: Optional[bytes]) -> bool:
+        if not self._hud_enabled or not jpeg_bytes:
+            return False
+        try:
+            import io
+            import cv2  # type: ignore
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
+            roi = self._hud_roi_from_frame(img)
+            if roi is None:
+                return False
+            hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            mean_s = float(hsv[:, :, 1].mean())
+            if mean_s < float(self._hud_sat_min):
+                return False
+            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 1.0)
+            h, w = gray.shape[:2]
+            min_dist = max(6, int(min(h, w) * float(self._hud_min_dist_frac)))
+            min_radius = max(4, int(min(h, w) * float(self._hud_min_radius_frac)))
+            max_radius = max(min_radius + 2, int(min(h, w) * float(self._hud_max_radius_frac)))
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                float(self._hud_hough_dp),
+                float(min_dist),
+                param1=float(self._hud_hough_param1),
+                param2=float(self._hud_hough_param2),
+                minRadius=min_radius,
+                maxRadius=max_radius,
+            )
+            if circles is None:
+                return False
+            return len(circles[0]) > 0
+        except Exception:
+            return False
+
+    def _update_hud_state(self, hud_present: bool) -> None:
+        if hud_present:
+            self._hud_on_count += 1
+            self._hud_off_count = 0
+        else:
+            self._hud_off_count += 1
+            self._hud_on_count = 0
+        if not self._hud_present and self._hud_on_count >= max(1, int(self._hud_on_frames)):
+            self._hud_present = True
+            self._hud_on_count = 0
+            self._hud_off_count = 0
+        elif self._hud_present and self._hud_off_count >= max(1, int(self._hud_off_frames)):
+            self._hud_present = False
+            self._hud_on_count = 0
+            self._hud_off_count = 0
 
     def _frame_is_black(self, stats: Optional[tuple[float, float, float]]) -> bool:
         if not stats:
@@ -2536,6 +2682,24 @@ class WorkerService:
                 except Exception:
                     pass
 
+            hud_rise = False
+            prev_hud = bool(self._hud_present)
+            hud_present = self._hud_present
+            if latest_image_bytes is not None:
+                try:
+                    hud_present = self._detect_hud_minimap(latest_image_bytes)
+                except Exception:
+                    hud_present = False
+                self._update_hud_state(bool(hud_present))
+                hud_rise = (not prev_hud) and bool(self._hud_present)
+                phase = "gameplay" if self._hud_present else "lobby"
+                if self._menu_log and phase != self._hud_last_phase:
+                    print(
+                        f"[HUD] instance={self.instance_id} phase={phase} hud={self._hud_present}",
+                        flush=True,
+                    )
+                    self._hud_last_phase = phase
+
             menu_hint: Optional[bool] = None
             if isinstance(vision_metrics, dict):
                 try:
@@ -2558,6 +2722,8 @@ class WorkerService:
                     pass
             if str(os.environ.get("METABONK_MENU_FORCE", "0")).lower() in ("1", "true", "yes"):
                 menu_hint = True
+            if self._hud_present:
+                menu_hint = False
 
             # Explicit menu-change logging for debug.
             if self._menu_log:
@@ -2589,7 +2755,7 @@ class WorkerService:
                     self._last_menu_log_ts = now
                 self._last_menu_raw = raw_menu
 
-            self._update_gameplay_state(menu_hint, game_state)
+            self._update_gameplay_state(menu_hint, game_state, hud_present=self._hud_present)
             self._update_menu_doom(menu_hint)
 
             if menu_hint is not None and menu_hint != self._last_menu_mode_log:
@@ -2830,7 +2996,11 @@ class WorkerService:
                     playing_flag = bool(game_state.get("isPlaying"))
                 except Exception:
                     playing_flag = False
-                in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
+                if self._hud_present:
+                    playing_flag = True
+                    in_menu = False
+                else:
+                    in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
             if (
                 self._input_backend
                 and (not menu_override_active)
@@ -3367,6 +3537,109 @@ class WorkerService:
                                     sheet.paste(img, (c * tile_w, r * tile_h))
                                 sheet.save(strip_path, format="JPEG", quality=85)
                                 print(f"[REWARD_HIT] strip={strip_path} frames={len(images)}", flush=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # Dump a frame on first gameplay (HUD detection).
+            if hud_rise and (not self._gameplay_hit_once or not self._gameplay_hit_saved):
+                try:
+                    base = Path(self._gameplay_hit_frame_path)
+                    if base.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                        out_path = base
+                    else:
+                        base.mkdir(parents=True, exist_ok=True)
+                        out_path = base / f"{self.instance_id}_gameplay_hit.jpg"
+                    strip_path = None
+                    if out_path.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                        strip_path = out_path.with_name(f"{out_path.stem}_strip.jpg")
+                    elif base:
+                        strip_path = base / f"{self.instance_id}_gameplay_strip.jpg"
+                    chosen = None
+                    chosen_stats = None
+                    chosen_source = None
+                    chosen_idx = None
+                    if latest_image_bytes:
+                        stats = self._frame_stats_from_bytes(latest_image_bytes)
+                        if not self._frame_is_black(stats):
+                            chosen = {
+                                "bytes": latest_image_bytes,
+                                "stats": stats,
+                                "source": latest_image_source or "current",
+                            }
+                            chosen_stats = stats
+                            chosen_source = str(latest_image_source or "current")
+                    if chosen is None and self._frame_ring:
+                        for offset, entry in enumerate(reversed(self._frame_ring)):
+                            stats = entry.get("stats")
+                            if not self._frame_is_black(stats):
+                                chosen = entry
+                                chosen_stats = stats
+                                chosen_source = str(entry.get("source") or "ring")
+                                chosen_idx = -(offset + 1)
+                                break
+                    if chosen is None and self._last_valid_frame is not None:
+                        chosen = self._last_valid_frame
+                        chosen_stats = chosen.get("stats")
+                        chosen_source = str(chosen.get("source") or "last_valid")
+                    if chosen is None and self.streamer is not None and hasattr(self.streamer, "capture_jpeg"):
+                        try:
+                            snap = self.streamer.capture_jpeg(
+                                timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5"))
+                            )
+                        except Exception:
+                            snap = None
+                        if snap:
+                            stats = self._frame_stats_from_bytes(snap)
+                            if not self._frame_is_black(stats):
+                                chosen = {"bytes": snap, "stats": stats, "source": "streamer_snapshot"}
+                                chosen_stats = stats
+                                chosen_source = "streamer_snapshot"
+                    if chosen and chosen.get("bytes"):
+                        out_path.write_bytes(chosen["bytes"])
+                        self._gameplay_hit_saved = True
+                        stat_msg = ""
+                        if chosen_stats:
+                            mean = float(chosen_stats[0])
+                            p99 = float(chosen_stats[1])
+                            mean_s = float(chosen_stats[2]) if len(chosen_stats) > 2 else 0.0
+                            stat_msg = f" mean={mean:.1f} p99={p99:.1f} sat={mean_s:.1f}"
+                        idx_msg = f" idx={chosen_idx}" if chosen_idx is not None else ""
+                        src_msg = f" source={chosen_source}" if chosen_source else ""
+                        print(f"[GAMEPLAY_HIT] saved={out_path}{src_msg}{idx_msg}{stat_msg}", flush=True)
+                    elif not self._gameplay_hit_saved:
+                        print("[GAMEPLAY_HIT] WARN: no non-black frame available", flush=True)
+                    if strip_path and self._frame_ring:
+                        try:
+                            from PIL import Image
+                            import io
+                            import math
+
+                            n_frames = max(1, int(self._gameplay_strip_n))
+                            frames = list(self._frame_ring)[-n_frames:]
+                            images = []
+                            for entry in frames:
+                                payload = entry.get("bytes")
+                                if not payload:
+                                    continue
+                                try:
+                                    img = Image.open(io.BytesIO(payload)).convert("RGB")
+                                    images.append(img)
+                                except Exception:
+                                    continue
+                            if images:
+                                cols = 4
+                                rows = int(math.ceil(len(images) / float(cols)))
+                                tile_w, tile_h = images[0].size
+                                sheet = Image.new("RGB", (tile_w * cols, tile_h * rows), color=(0, 0, 0))
+                                for idx, img in enumerate(images):
+                                    r = idx // cols
+                                    c = idx % cols
+                                    if img.size != (tile_w, tile_h):
+                                        img = img.resize((tile_w, tile_h))
+                                    sheet.paste(img, (c * tile_w, r * tile_h))
+                                sheet.save(strip_path, format="JPEG", quality=85)
+                                print(f"[GAMEPLAY_HIT] strip={strip_path} frames={len(images)}", flush=True)
                         except Exception:
                             pass
                 except Exception:
@@ -4207,6 +4480,9 @@ class WorkerService:
         out = {
             "instance_id": self.instance_id,
             "policy_name": self.policy_name,
+            "gameplay_started": bool(self._gameplay_started),
+            "hud_present": bool(self._hud_present),
+            "hud_phase": ("gameplay" if self._hud_present else "lobby"),
             "display": self.display,
             "display_name": os.environ.get("MEGABONK_AGENT_NAME"),
             "hparams": self.hparams,

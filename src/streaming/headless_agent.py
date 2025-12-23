@@ -35,6 +35,26 @@ def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _ffmpeg_supports_fps_mode() -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    try:
+        out = subprocess.check_output([ffmpeg, "-hide_banner", "-h", "full"], stderr=subprocess.STDOUT, timeout=5.0)
+        return "fps_mode" in out.decode("utf-8", "replace")
+    except Exception:
+        return False
+
+
+def _ffmpeg_cfr_args() -> list[str]:
+    mode = str(os.environ.get("METABONK_FFMPEG_FPS_MODE", "cfr") or "").strip().lower()
+    if mode != "cfr":
+        return []
+    if _ffmpeg_supports_fps_mode():
+        return ["-fps_mode", "cfr"]
+    return ["-vsync", "cfr"]
+
+
 def _best_effort_set_unbuffered_stdout() -> None:
     try:
         # Ensure binary writes are not block-buffered.
@@ -301,6 +321,7 @@ def _spawn_ffmpeg(*, w: int, h: int, fps: int, gop: int, bitrate: str, encoder: 
         str(int(gop)),
         "-bf",
         "0",
+        *_ffmpeg_cfr_args(),
         "-f",
         "h264",
         "pipe:1",

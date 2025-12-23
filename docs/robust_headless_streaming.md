@@ -74,7 +74,7 @@ Optional full checklist script (env + encoders + PipeWire + FIFO):
 Two supported patterns:
 
 ### 1) FIFO (demand-paged)
-- Agent writes raw Annex-B H.264 to a FIFO.
+- Agent writes raw Annex-B H.264 or MPEG-TS to a FIFO.
 - Go2RTC reads via `exec:cat ...#video=h264#raw`.
 - This repository already supports demand-paged FIFO streaming.
 

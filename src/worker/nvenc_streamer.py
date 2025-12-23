@@ -45,6 +45,7 @@ _FFMPEG_ENCODER_CACHE: dict[str, bool] = {}
 _FFMPEG_ENCODERS_TXT: Optional[str] = None
 _FFMPEG_BSFS_CACHE: dict[str, bool] = {}
 _FFMPEG_BSFS_TXT: Optional[str] = None
+_FFMPEG_FPS_MODE_SUPPORTED: Optional[bool] = None
 _STREAM_LOG_LAST: dict[str, float] = {}
 
 
@@ -224,6 +225,32 @@ def _ffmpeg_encoder_available(name: str) -> bool:
     ok = bool(txt) and (f" {n.lower()} " in txt or f"\t{n.lower()} " in txt)
     _FFMPEG_ENCODER_CACHE[n] = ok
     return ok
+
+
+def _ffmpeg_supports_fps_mode() -> bool:
+    global _FFMPEG_FPS_MODE_SUPPORTED
+    if _FFMPEG_FPS_MODE_SUPPORTED is not None:
+        return _FFMPEG_FPS_MODE_SUPPORTED
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        _FFMPEG_FPS_MODE_SUPPORTED = False
+        return False
+    try:
+        out = subprocess.check_output([ffmpeg, "-hide_banner", "-h", "full"], stderr=subprocess.STDOUT, timeout=5.0)
+        txt = out.decode("utf-8", "replace")
+        _FFMPEG_FPS_MODE_SUPPORTED = "fps_mode" in txt
+    except Exception:
+        _FFMPEG_FPS_MODE_SUPPORTED = False
+    return bool(_FFMPEG_FPS_MODE_SUPPORTED)
+
+
+def _ffmpeg_cfr_args() -> list[str]:
+    mode = str(os.environ.get("METABONK_FFMPEG_FPS_MODE", "cfr") or "").strip().lower()
+    if mode != "cfr":
+        return []
+    if _ffmpeg_supports_fps_mode():
+        return ["-fps_mode", "cfr"]
+    return ["-vsync", "cfr"]
 
 
 def _gst_element_properties(name: str) -> set[str]:
@@ -877,6 +904,10 @@ class NVENCStreamer:
         if extra_in:
             cmd += extra_in.split()
         cmd += [
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -904,6 +935,8 @@ class NVENCStreamer:
 
         if extra_out:
             cmd += extra_out.split()
+
+        cmd += _ffmpeg_cfr_args()
 
         if container == "h264":
             # Raw Annex-B elementary stream (for FIFO/go2rtc).
@@ -1568,6 +1601,10 @@ class NVENCStreamer:
         if extra_in:
             cmd += extra_in.split()
         cmd += [
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
             "-f",
             "x11grab",
             "-draw_mouse",
@@ -1593,6 +1630,8 @@ class NVENCStreamer:
 
         if extra_out:
             cmd += extra_out.split()
+
+        cmd += _ffmpeg_cfr_args()
 
         container = str(container or "mp4").strip().lower()
         if container not in ("mp4", "mpegts", "h264"):

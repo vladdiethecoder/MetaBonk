@@ -11,10 +11,11 @@ from src.streaming.fifo import DemandPagedFifoWriter, ensure_fifo
 class FifoPublishConfig:
     fifo_path: str
     pipe_size_bytes: int = 0
+    container: str = "mpegts"
 
 
 class FifoH264Publisher:
-    """On-demand raw H.264 publisher to a named pipe (FIFO).
+    """On-demand H.264 or MPEG-TS publisher to a named pipe (FIFO).
 
     The FIFO is opened O_WRONLY|O_NONBLOCK. If no reader is attached, open()
     fails with ENXIO and we stay idle. When a reader connects (go2rtc exec:cat),
@@ -37,9 +38,14 @@ class FifoH264Publisher:
             return
 
         def _iter():
-            # Request raw Annex-B H.264 (for FIFO/go2rtc).
+            container = str(self.cfg.container or "h264").strip().lower()
+            if container in ("ts", "mpegts"):
+                container = "mpegts"
+            else:
+                container = "h264"
+            # Request raw Annex-B H.264 or MPEG-TS (for FIFO/go2rtc).
             # Small chunks reduce FIFO backpressure issues and avoid partial writes.
-            yield from self.streamer.iter_chunks(chunk_size=4096, container="h264")
+            yield from self.streamer.iter_chunks(chunk_size=4096, container=container)
 
         w = DemandPagedFifoWriter(
             fifo_path=self.fifo_path,

@@ -14,3 +14,7 @@ Use FIFO + raw H.264 passthrough (`#video=h264#raw`) as the default go2rtc sourc
 - No transcoding cost in go2rtc.
 - Requires downstream clients to support H.264.
 - Hardware acceleration only needed if go2rtc is configured to transcode.
+
+## Update (2025-12-23)
+FIFO sources can also emit MPEG-TS for smoother pacing (`METABONK_FIFO_CONTAINER=mpegts`).
+Raw H.264 passthrough remains supported for lowest overhead.

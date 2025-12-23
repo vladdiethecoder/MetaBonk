@@ -45,8 +45,9 @@ Environment knobs:
 - `METABONK_STREAM_BLACKCHECK_S` (default 5.0)
 
 ## go2rtc Distribution (FIFO / Exec)
-MetaBonk’s default FIFO config uses raw H.264 passthrough to avoid any transcoding:
-- `exec:cat /streams/<instance>.h264#video=h264#raw`
+MetaBonk’s FIFO config can use raw H.264 passthrough or MPEG-TS to avoid transcoding:
+- raw: `exec:cat /streams/<instance>.h264#video=h264#raw`
+- MPEG-TS: `exec:cat /streams/<instance>.ts`
 
 Hardware acceleration is only required if you enable FFmpeg transcoding in go2rtc
 (e.g. `#video=h264` without `#raw`/`#video=copy`). In that case use the hardware

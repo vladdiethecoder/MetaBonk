@@ -362,6 +362,7 @@ def main() -> int:
             if go2rtc_mode == "fifo":
                 fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
                 env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
+                env.setdefault("METABONK_FIFO_CONTAINER", "mpegts")
                 env["METABONK_FIFO_STREAM"] = "1"
             else:
                 env["METABONK_FIFO_STREAM"] = "0"

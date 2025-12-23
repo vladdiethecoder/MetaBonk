@@ -2,23 +2,25 @@
 
 This is the “Metabonk” distribution layer:
 
-- Workers publish **raw Annex‑B H.264** to a per-worker FIFO.
-- go2rtc ingests via `exec:cat ...#video=h264#raw` and serves WebRTC/MSE/RTSP to clients.
+- Workers publish **raw Annex‑B H.264** or **MPEG‑TS** to a per-worker FIFO.
+- go2rtc ingests via `exec:cat ...` (raw H.264 uses `#video=h264#raw`) and serves WebRTC/MSE/RTSP to clients.
 - The FIFO writer is **demand-paged**: it only starts encoding when a reader is connected.
 
 ## Files
 - Docker compose: `docker/docker-compose.go2rtc.yml`
 - Generated go2rtc config: `temp/go2rtc.yaml`
-- FIFOs: `temp/streams/<instance_id>.h264`
+- FIFOs: `temp/streams/<instance_id>.h264` (raw) or `.ts` (MPEG‑TS)
 
 ## Start (recommended)
 ```
 bash ./start --mode train --workers 10 --go2rtc
 ```
+`./start` defaults `METABONK_FIFO_CONTAINER=mpegts` for smoother pacing.
 
 If you run compose manually, make sure the config/FIFO paths point at the repo `temp/` directory:
 - `METABONK_GO2RTC_CONFIG=$(pwd)/temp/go2rtc.yaml`
 - `METABONK_STREAM_FIFO_DIR=$(pwd)/temp/streams`
+- `METABONK_FIFO_CONTAINER=mpegts` (recommended for smoother pacing)
 
 ## View
 - go2rtc UI: `http://127.0.0.1:1984/`
@@ -45,9 +47,11 @@ docker compose -f docker/docker-compose.go2rtc.exec.yml up -d
 This validates the “renderer→CUDA→NVENC→FIFO→go2rtc” path without PipeWire.
 
 1) Add a stream entry to your generated config (or create your own):
-   - `demo: exec:cat /streams/demo.h264#video=h264#raw`
+   - raw: `demo: exec:cat /streams/demo.h264#video=h264#raw`
+   - MPEG‑TS: `demo: exec:cat /streams/demo.ts`
 2) Create the FIFO and run the demo (from repo root):
-   - `PYTHONPATH=. python scripts/egl_vpf_demo.py --fifo temp/streams/demo.h264 --frames 0 --width 1280 --height 720`
+   - raw: `PYTHONPATH=. python scripts/egl_vpf_demo.py --fifo temp/streams/demo.h264 --frames 0 --width 1280 --height 720`
+   - MPEG‑TS: `PYTHONPATH=. python scripts/egl_vpf_demo.py --fifo temp/streams/demo.ts --frames 0 --width 1280 --height 720`
 3) Open:
    - `http://127.0.0.1:1984/stream.html?src=demo&mode=webrtc`
 
@@ -80,5 +84,5 @@ stdout through FFmpeg to emit MPEG-TS.
 ## Security posture
 - go2rtc `exec:` is restricted by construction:
   - config is generated from fixed instance IDs
-  - only `/streams/*.h264` paths are referenced
+  - only `/streams/*.{h264,ts}` paths are referenced
 - The compose file mounts the FIFO directory read-only (`/streams:ro`).
