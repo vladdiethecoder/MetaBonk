@@ -91,6 +91,25 @@ BonkLink rebuild (compile against interop from a live instance):
 bash scripts/build_research_plugin.sh /path/to/megabonk --bonklink
 ```
 
+### Rewired CustomController Warning
+If `LogOutput.log` shows:
+`Failed to create Rewired CustomController (no suitable layout).`
+
+What it means:
+- BonkLink tried to create a Rewired CustomController, but the game has no matching
+  Custom Controller definition/layout for the requested source id.
+
+Impact:
+- **Non-blocking** when using OS-level input (xdotool/uinput). Video + state + telemetry
+  still work.
+- **Blocking** only if you rely on Rewired-based injection for gameplay inputs.
+
+Recommended handling:
+- If using xdotool: treat as warning-only.
+- If you need Rewired injection: add/patch a valid Custom Controller definition in the
+  game's Rewired config, or update BonkLink to skip CustomController creation when a
+  layout is missing.
+
 ## Input Sanity
 - uinput:
 ```bash
