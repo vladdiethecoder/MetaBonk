@@ -52,6 +52,12 @@ from src.neuro_genie.federated_dreaming import (
     FederatedDreamingConfig, FederatedDreamCoordinator,
     AgentRole, NICHE_REGISTRY,
 )
+from src.neuro_genie.blackwell_optimizer import (
+    BlackwellOptimConfig,
+    apply_blackwell_defaults,
+    maybe_compile,
+    CUDAGraphStep,
+)
 
 
 def format_time(seconds: float) -> str:
@@ -301,14 +307,40 @@ def train_dream_rl(args):
 └─────────────────────────────────────────────────────────────┘
     """)
 
-    pt_dir = Path(getattr(args, "pt_dir", "") or os.environ.get("METABONK_VIDEO_ROLLOUTS_PT_DIR", "") or args.data).expanduser()
+    pt_dir = Path(
+        getattr(args, "pt_dir", "")
+        or os.environ.get("METABONK_VIDEO_ROLLOUTS_PT_DIR", "")
+        or args.data
+    ).expanduser()
     print(f"[offline_replay] rollouts: {pt_dir}")
     env = OfflineReplayEnv(rollout_dir=pt_dir, sampling_mode="random")
 
     # Infer dims from one reset.
     obs0, info0 = env.reset()
     import torch
-    device = torch.device("cuda" if torch.cuda.is_available() and not getattr(args, "device", "cuda").lower().startswith("cpu") else "cpu")
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        and not getattr(args, "device", "cuda").lower().startswith("cpu")
+        else "cpu"
+    )
+    optimize_5090 = bool(getattr(args, "optimize_5090", False)) or str(
+        os.environ.get("METABONK_OPTIMIZE_5090", "0") or "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if optimize_5090 and device.type == "cuda":
+        cfg = BlackwellOptimConfig(
+            enable_tf32=True,
+            cudnn_benchmark=True,
+            matmul_precision=str(getattr(args, "matmul_precision", "high") or "high"),
+            alloc_conf=str(getattr(args, "alloc_conf", "") or "expandable_segments:True"),
+            memory_fraction=float(getattr(args, "memory_fraction", 0.0) or 0.0),
+            compile=bool(getattr(args, "compile", False)),
+            compile_mode=str(getattr(args, "compile_mode", "max-autotune") or "max-autotune"),
+        )
+        applied = apply_blackwell_defaults(cfg)
+        if applied:
+            print(f"[offline_replay] blackwell={applied}")
     obs0_t = torch.as_tensor(obs0, dtype=torch.float32, device=device)
 
     # Determine action dim from the first trajectory.
@@ -325,6 +357,11 @@ def train_dream_rl(args):
         torch.nn.ReLU(),
         torch.nn.Linear(512, act_dim),
     ).to(device)
+    policy = maybe_compile(
+        policy,
+        enabled=bool(getattr(args, "compile", False)) and device.type == "cuda",
+        mode=str(getattr(args, "compile_mode", "max-autotune") or "max-autotune"),
+    )
 
     opt = torch.optim.Adam(policy.parameters(), lr=float(args.lr))
     loss_fn = torch.nn.MSELoss()
@@ -332,6 +369,30 @@ def train_dream_rl(args):
     max_steps = int(args.max_steps)
     batch_size = int(args.batch_size)
     print(f"[offline_replay] device={device} obs_dim={obs_dim} act_dim={act_dim} steps={max_steps} batch={batch_size}")
+
+    # Optional CUDA graph capture (static shapes only).
+    use_cuda_graph = bool(getattr(args, "cuda_graph", False)) and device.type == "cuda"
+    graph = None
+    fixed_x = fixed_y = None
+    if use_cuda_graph:
+        fixed_x = torch.zeros((batch_size, obs_dim), device=device, dtype=torch.float32)
+        fixed_y = torch.zeros((batch_size, act_dim), device=device, dtype=torch.float32)
+
+        def _step_static():
+            pred = policy(fixed_x)
+            loss = loss_fn(pred, fixed_y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            return loss
+
+        graph = CUDAGraphStep(_step_static)
+        if graph.capture():
+            print("[offline_replay] cuda_graph=captured")
+        else:
+            print("[offline_replay] cuda_graph=capture_failed; eager fallback")
+            use_cuda_graph = False
+            graph = None
 
     # Batch sampling by repeatedly resetting to random trajectories and sampling random indices.
     # This stays honest: targets are the recorded actions.
@@ -349,11 +410,27 @@ def train_dream_rl(args):
         x = obs_all[idx].to(device=device, dtype=torch.float32)
         y = acts_all[idx].to(device=device, dtype=torch.float32)
 
-        pred = policy(x)
-        loss = loss_fn(pred, y)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        if use_cuda_graph and fixed_x is not None and fixed_y is not None and graph is not None:
+            if x.shape[0] != batch_size:
+                # Pad/truncate to static graph shape.
+                if x.shape[0] < batch_size:
+                    pad = batch_size - x.shape[0]
+                    x = torch.cat([x, x[:1].repeat(pad, 1)], dim=0)
+                    y = torch.cat([y, y[:1].repeat(pad, 1)], dim=0)
+                else:
+                    x = x[:batch_size]
+                    y = y[:batch_size]
+            fixed_x.copy_(x)
+            fixed_y.copy_(y)
+            graph.replay()
+            with torch.no_grad():
+                loss = loss_fn(policy(fixed_x), fixed_y)
+        else:
+            pred = policy(x)
+            loss = loss_fn(pred, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
 
         if (step + 1) % max(1, int(args.log_interval)) == 0:
             print(f"[offline_replay] step {step+1}/{max_steps} loss={float(loss.detach().item()):.6f}")
@@ -509,6 +586,20 @@ Examples:
                        help="Number of parallel dream envs")
     parser.add_argument("--episode_length", type=int, default=1000,
                        help="Episode length in dreams")
+    parser.add_argument("--optimize-5090", action="store_true",
+                       help="Enable RTX 5090/Blackwell-safe Torch optimizations (TF32, allocator, etc.).")
+    parser.add_argument("--compile", action="store_true",
+                       help="Use torch.compile() where applicable (CUDA only).")
+    parser.add_argument("--compile-mode", default="max-autotune",
+                       help="torch.compile mode (default: max-autotune).")
+    parser.add_argument("--cuda-graph", action="store_true",
+                       help="Attempt CUDA graph capture for the offline replay step (CUDA only; static shapes).")
+    parser.add_argument("--matmul-precision", default="high",
+                       help="torch.set_float32_matmul_precision (high|medium).")
+    parser.add_argument("--alloc-conf", default="",
+                       help="Override PYTORCH_CUDA_ALLOC_CONF (default: expandable_segments:True).")
+    parser.add_argument("--memory-fraction", type=float, default=0.0,
+                       help="Optional torch.cuda.set_per_process_memory_fraction (0 = unset).")
     
     # Federated settings
     parser.add_argument("--iterations", type=int, default=3,

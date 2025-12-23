@@ -291,6 +291,12 @@ def main() -> int:
         default=float(os.environ.get("METABONK_PHASE_DATASET_LOADING_RESTART_S", "0") or "0"),
         help="If >0, worker auto-restarts when stuck in loading this many seconds.",
     )
+    parser.add_argument(
+        "--optimize-5090",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("METABONK_OPTIMIZE_5090", "0") or "").strip().lower() in ("1", "true", "yes", "on"),
+        help="Set conservative RTX 5090/Blackwell optimization env vars for spawned processes.",
+    )
 
     args = parser.parse_args()
 
@@ -371,6 +377,10 @@ def main() -> int:
     env.setdefault("METABONK_MENU_THRESH", "0.5")
     if float(args.loading_restart_s or 0.0) > 0.0:
         env["METABONK_PHASE_DATASET_LOADING_RESTART_S"] = str(float(args.loading_restart_s))
+    if bool(args.optimize_5090):
+        env["METABONK_OPTIMIZE_5090"] = "1"
+        # Allocator tweaks are opt-in and can reduce fragmentation under long runs.
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     # Default posture: PipeWire -> NVENC -> fragmented MP4, and keep instances non-intrusive.
     # gamescope `--backend headless` is used by default in `scripts/start_omega.py` when
     # no explicit stream backend is selected, so windows do not appear on your desktop.
