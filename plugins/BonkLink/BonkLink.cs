@@ -59,6 +59,9 @@ namespace BonkLink
         private ConfigEntry<string> _rewiredTag;
         private ConfigEntry<bool> _rewiredUseSystemPlayer;
         private ConfigEntry<int> _rewiredPlayerId;
+        private ConfigEntry<bool> _rewiredDebugDump;
+        private ConfigEntry<int> _rewiredMinAxisCount;
+        private ConfigEntry<int> _rewiredMinButtonCount;
         
         // Networking
         private TcpListener _tcpListener;
@@ -145,6 +148,9 @@ namespace BonkLink
             _rewiredTag = Config.Bind("Input", "RewiredTag", "BonkLink", "Tag assigned to the custom controller.");
             _rewiredUseSystemPlayer = Config.Bind("Input", "RewiredUseSystemPlayer", true, "Attach the custom controller to the System Player (preferred for UI).");
             _rewiredPlayerId = Config.Bind("Input", "RewiredPlayerId", 0, "Player id to attach when not using System Player.");
+            _rewiredDebugDump = Config.Bind("Input", "RewiredDebugDump", false, "Log Rewired layout/controller info once to help diagnose input injection.");
+            _rewiredMinAxisCount = Config.Bind("Input", "RewiredMinAxisCount", 2, "Minimum axis count required for a custom controller layout.");
+            _rewiredMinButtonCount = Config.Bind("Input", "RewiredMinButtonCount", 2, "Minimum button count required for a custom controller layout.");
             
             // Initialize buffers
             _stateBuffer = new GameStateBuffer();
@@ -772,6 +778,9 @@ namespace BonkLink
                     _rewiredTag?.Value,
                     _rewiredUseSystemPlayer != null && _rewiredUseSystemPlayer.Value,
                     _rewiredPlayerId != null ? _rewiredPlayerId.Value : 0,
+                    _rewiredMinAxisCount != null ? _rewiredMinAxisCount.Value : 2,
+                    _rewiredMinButtonCount != null ? _rewiredMinButtonCount.Value : 2,
+                    _rewiredDebugDump != null && _rewiredDebugDump.Value,
                     Log
                 );
             }
@@ -827,6 +836,7 @@ namespace BonkLink
 
     internal class RewiredUiBridge
     {
+        private static bool _debugDumped;
         private readonly ManualLogSource _log;
         private CustomController _controller;
         private Player _player;
@@ -838,13 +848,25 @@ namespace BonkLink
         private float _pendingV;
         private bool _pendingSubmit;
         private bool _pendingCancel;
+        private int _minAxisCount = 2;
+        private int _minButtonCount = 2;
+        private bool _debug;
 
         private RewiredUiBridge(ManualLogSource log)
         {
             _log = log;
         }
 
-        public static RewiredUiBridge TryCreate(string layoutName, string tag, bool useSystemPlayer, int playerId, ManualLogSource log)
+        public static RewiredUiBridge TryCreate(
+            string layoutName,
+            string tag,
+            bool useSystemPlayer,
+            int playerId,
+            int minAxisCount,
+            int minButtonCount,
+            bool debug,
+            ManualLogSource log
+        )
         {
             if (!ReInput.isReady)
             {
@@ -852,6 +874,9 @@ namespace BonkLink
             }
 
             var bridge = new RewiredUiBridge(log);
+            bridge._minAxisCount = Math.Max(0, minAxisCount);
+            bridge._minButtonCount = Math.Max(0, minButtonCount);
+            bridge._debug = debug;
             if (!bridge.Init(layoutName, tag, useSystemPlayer, playerId))
             {
                 return null;
@@ -864,6 +889,10 @@ namespace BonkLink
             try
             {
                 var layouts = ReInput.mapping.CustomControllerLayouts;
+                if (_debug && !_debugDumped)
+                {
+                    _log?.LogInfo($"Rewired ready. CustomControllerLayouts count={GetIl2CppListCount(layouts)}");
+                }
                 if (layouts != null)
                 {
                     int count = GetIl2CppListCount(layouts);
@@ -876,6 +905,10 @@ namespace BonkLink
                             if (layout == null) continue;
                             var name = layout.name ?? layout.descriptiveName ?? layout.nonLocalizedDescriptiveName;
                             if (!string.IsNullOrEmpty(name)) names.Add($"{name} (id={layout.id})");
+                            if (_debug && !_debugDumped)
+                            {
+                                _log?.LogInfo($"Rewired layout candidate: name='{name}' id={layout.id} type={layout.GetType().Name}");
+                            }
                         }
                         if (names.Count > 0)
                         {
@@ -896,7 +929,14 @@ namespace BonkLink
                 CustomController controller = null;
                 if (layoutId >= 0)
                 {
-                    controller = ReInput.controllers.CreateCustomController(layoutId, tag ?? "BonkLink");
+                    try
+                    {
+                        controller = ReInput.controllers.CreateCustomController(layoutId, tag ?? "BonkLink");
+                    }
+                    catch (Exception e)
+                    {
+                        _log?.LogWarning($"Rewired CreateCustomController failed for layoutId={layoutId}: {e.Message}");
+                    }
                 }
                 else if (layouts != null)
                 {
@@ -910,9 +950,17 @@ namespace BonkLink
                         {
                             controller = ReInput.controllers.CreateCustomController(id, tag ?? "BonkLink");
                             if (controller == null) continue;
-                            if (controller.axisCount >= 2 && controller.buttonCount >= 2)
+                            if (_debug && !_debugDumped)
+                            {
+                                _log?.LogInfo($"Rewired layout id={id} created: axis={controller.axisCount} buttons={controller.buttonCount}");
+                            }
+                            if (controller.axisCount >= _minAxisCount && controller.buttonCount >= _minButtonCount)
                             {
                                 break;
+                            }
+                            if (_debug && !_debugDumped)
+                            {
+                                _log?.LogInfo($"Rewired layout id={id} rejected (need axis>={_minAxisCount}, buttons>={_minButtonCount}).");
                             }
                             ReInput.controllers.DestroyCustomController(controller);
                             controller = null;
@@ -930,7 +978,7 @@ namespace BonkLink
 
                 if (controller == null)
                 {
-                    _log?.LogWarning("Failed to create Rewired CustomController (no suitable layout).");
+                    _log?.LogWarning($"Failed to create Rewired CustomController (no suitable layout). axis>={_minAxisCount} buttons>={_minButtonCount}");
                     return false;
                 }
 
@@ -951,6 +999,11 @@ namespace BonkLink
                 _player.controllers.AddController(_controller, true);
                 ResolveElementIndices();
                 _log?.LogInfo($"Rewired CustomController active: layout sourceId={_controller.sourceControllerId}, axisCount={_controller.axisCount}, buttonCount={_controller.buttonCount}, player={_player.id}");
+                if (_debug && !_debugDumped)
+                {
+                    DumpControllerElements();
+                    _debugDumped = true;
+                }
                 return true;
             }
             catch (Exception e)
@@ -975,6 +1028,46 @@ namespace BonkLink
             catch (Exception e)
             {
                 _log?.LogWarning($"Rewired element mapping failed: {e.Message}");
+            }
+        }
+
+        private void DumpControllerElements()
+        {
+            try
+            {
+                DumpElementList("axis", _controller.AxisElementIdentifiers);
+                DumpElementList("button", _controller.ButtonElementIdentifiers);
+            }
+            catch (Exception e)
+            {
+                _log?.LogWarning($"Rewired element dump failed: {e.Message}");
+            }
+        }
+
+        private void DumpElementList(string label, Il2CppSystem.Collections.Generic.IList<ControllerElementIdentifier> ids)
+        {
+            if (ids == null) return;
+            int count = GetIl2CppListCount(ids);
+            if (count <= 0) return;
+            var names = new List<string>();
+            for (int i = 0; i < count; i++)
+            {
+                var id = GetIl2CppListItem(ids, i) as ControllerElementIdentifier;
+                if (id == null) continue;
+                string name = (id.name ?? id.nonLocalizedName ?? "").Trim();
+                if (string.IsNullOrEmpty(name))
+                {
+                    name = $"<unnamed:{id.id}>";
+                }
+                else
+                {
+                    name = $"{name}:{id.id}";
+                }
+                names.Add(name);
+            }
+            if (names.Count > 0)
+            {
+                _log?.LogInfo($"Rewired {label} elements: {string.Join(", ", names)}");
             }
         }
 
