@@ -1226,6 +1226,7 @@ body::before{
 .issue-header{ display:flex; align-items:center; justify-content:space-between; gap: 8px; }
 .issue-meta{ display:flex; gap: 10px; color: rgba(255,255,255,.55); font-size: 12px; text-transform: lowercase; }
 .issue-instances{ display:flex; align-items:center; flex-wrap:wrap; gap: 6px; }
+.issue-evidence{ display:flex; align-items:center; flex-wrap:wrap; gap: 6px; }
 .issue-actions{ display:flex; justify-content:flex-end; }
 .issue-high{ border-color: rgba(255,45,85,.45); box-shadow: 0 0 0 1px rgba(255,45,85,.35) inset; }
 .issue-medium{ border-color: rgba(255,136,0,.35); }

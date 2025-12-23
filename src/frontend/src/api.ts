@@ -183,6 +183,8 @@ export type OverviewHealth = {
 
 export type OverviewIssue = {
   id: string;
+  fingerprint?: string;
+  code?: string;
   label: string;
   severity: "low" | "medium" | "high";
   count: number;
@@ -190,6 +192,16 @@ export type OverviewIssue = {
   first_seen?: number | null;
   last_seen?: number | null;
   hint?: string | null;
+  run_id?: string | null;
+  step?: number | null;
+  ts?: number | null;
+  source?: string | null;
+  evidence?: Array<{ kind: string; url: string; label?: string | null }>;
+  acknowledged?: boolean;
+  ack_until?: number | null;
+  muted?: boolean;
+  muted_until?: number | null;
+  ttl_s?: number | null;
 };
 
 export type BuildLabExample = {
@@ -581,6 +593,22 @@ export async function fetchOverviewHealth(windowSeconds = 300): Promise<Overview
 export async function fetchOverviewIssues(windowSeconds = 600): Promise<OverviewIssue[]> {
   const qs = new URLSearchParams({ window: String(windowSeconds) });
   return fetchJson<OverviewIssue[]>(`${ORCH}/overview/issues?${qs.toString()}`);
+}
+
+export async function ackIssue(id: string, ttl_s?: number): Promise<{ ok: boolean }> {
+  return fetchJson(`${ORCH}/issues/ack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, ttl_s }),
+  });
+}
+
+export async function muteIssue(id: string, muted = true, ttl_s?: number): Promise<{ ok: boolean }> {
+  return fetchJson(`${ORCH}/issues/mute`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, muted, ttl_s }),
+  });
 }
 
 export async function fetchWorkers(): Promise<Record<string, Heartbeat>> {

@@ -3,6 +3,8 @@ import { useMemo, useRef, useEffect, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { EffectComposer, Bloom, Scanline } from "@react-three/postprocessing";
 import * as THREE from "three";
+import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
 import { useEventStream } from "../hooks";
 import useIssues from "../hooks/useIssues";
@@ -157,6 +159,39 @@ export default function Overview() {
       return hay.includes(qq);
     });
   }, [events, eventType, q, ctx.run, ctx.policy, windowSeconds]);
+
+  const EventRow = ({ index, style }: ListChildComponentProps) => {
+    if (!filtered.length) {
+      return (
+        <div style={style} className="event muted">
+          no events yet
+        </div>
+      );
+    }
+    const e = filtered[index];
+    if (!e) return null;
+    return (
+      <div
+        style={{ ...style, cursor: "pointer" }}
+        className="event"
+        onClick={() =>
+          openContext({
+            title: e.message,
+            kind: "event",
+            instanceId: e.instance_id ?? null,
+            runId: e.run_id ?? null,
+            ts: e.ts,
+            details: { ...(e.payload ?? {}), step: e.step ?? (e.payload as any)?.step ?? null },
+          })
+        }
+      >
+        <span className="badge">{e.event_type}</span>
+        <span>{e.message}</span>
+        {e.step != null ? <span className="muted">step {fmtNum(e.step)}</span> : null}
+        <span className="muted">{timeAgo(e.ts)}</span>
+      </div>
+    );
+  };
 
   const countsByType = useMemo(() => {
     const m = new Map<string, number>();
@@ -636,29 +671,14 @@ export default function Overview() {
             ))}
           </div>
         </div>
-        <div className="events" style={{ marginTop: 10 }}>
-          {filtered.map((e) => (
-            <div
-              key={e.event_id}
-              className="event"
-              style={{ cursor: "pointer" }}
-              onClick={() =>
-                openContext({
-                  title: e.message,
-                  kind: "event",
-                  instanceId: e.instance_id ?? null,
-                  runId: e.run_id ?? null,
-                  ts: e.ts,
-                  details: e.payload ?? {},
-                })
-              }
-            >
-              <span className="badge">{e.event_type}</span>
-              <span>{e.message}</span>
-              <span className="muted">{timeAgo(e.ts)}</span>
-            </div>
-          ))}
-          {!filtered.length && <div className="muted">no events yet</div>}
+        <div className="events" style={{ marginTop: 10, height: 360 }}>
+          <AutoSizer>
+            {({ height, width }) => (
+              <List height={height} width={width} itemCount={filtered.length || 1} itemSize={32}>
+                {EventRow}
+              </List>
+            )}
+          </AutoSizer>
         </div>
       </section>
     </div>

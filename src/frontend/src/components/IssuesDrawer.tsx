@@ -1,4 +1,6 @@
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ackIssue, muteIssue } from "../api";
 import { fmtNum, timeAgo } from "../lib/format";
 import useIssues from "../hooks/useIssues";
 
@@ -8,7 +10,17 @@ type Props = {
 };
 
 export default function IssuesDrawer({ open, onClose }: Props) {
+  const loc = useLocation();
   const issues = useIssues(240);
+  const qc = useQueryClient();
+  const ackMut = useMutation({
+    mutationFn: (id: string) => ackIssue(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["overviewIssues"] }),
+  });
+  const muteMut = useMutation({
+    mutationFn: ({ id, muted }: { id: string; muted: boolean }) => muteIssue(id, muted),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["overviewIssues"] }),
+  });
 
   return (
     <>
@@ -38,10 +50,24 @@ export default function IssuesDrawer({ open, onClose }: Props) {
                   {issue.lastSeen ? <span>last {timeAgo(issue.lastSeen)}</span> : null}
                 </div>
                 {issue.hint ? <div className="muted">{issue.hint}</div> : null}
+                {issue.evidence?.length ? (
+                  <div className="issue-evidence">
+                    {issue.evidence.slice(0, 3).map((ev) => (
+                      <a key={ev.url} className="chip chip-compact" href={ev.url} target="_blank" rel="noreferrer">
+                        {ev.label ?? ev.kind}
+                      </a>
+                    ))}
+                  </div>
+                ) : null}
                 {issue.instances.length ? (
                   <div className="issue-instances">
                     {issue.instances.slice(0, 6).map((iid) => (
-                      <Link key={iid} className="chip chip-compact" to={`/instances?instance=${iid}`} onClick={onClose}>
+                      <Link
+                        key={iid}
+                        className="chip chip-compact"
+                        to={`/instances?instance=${iid}${loc.search ? `&${loc.search.slice(1)}` : ""}`}
+                        onClick={onClose}
+                      >
                         {iid}
                       </Link>
                     ))}
@@ -49,7 +75,21 @@ export default function IssuesDrawer({ open, onClose }: Props) {
                   </div>
                 ) : null}
                 <div className="issue-actions">
-                  <Link className="btn btn-ghost btn-compact" to="/instances" onClick={onClose}>
+                  <button
+                    className="btn btn-ghost btn-compact"
+                    onClick={() => ackMut.mutate(issue.id)}
+                    disabled={ackMut.isPending}
+                  >
+                    {issue.acknowledged ? "acknowledged" : "ack"}
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-compact"
+                    onClick={() => muteMut.mutate({ id: issue.id, muted: !issue.muted })}
+                    disabled={muteMut.isPending}
+                  >
+                    {issue.muted ? "unmute" : "mute"}
+                  </button>
+                  <Link className="btn btn-ghost btn-compact" to={`/instances${loc.search || ""}`} onClick={onClose}>
                     open instances
                   </Link>
                 </div>

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState, useRef } from "react";
+import { useMemo, useState, useRef, useEffect } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { FixedSizeList as List, ListChildComponentProps } from "react-window";
@@ -7,6 +7,7 @@ import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
 import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
+import { useLocation, useNavigate } from "react-router-dom";
 
 function RunsCoreViz() {
   const ref = useRef<THREE.Mesh | null>(null);
@@ -38,6 +39,8 @@ export default function Runs() {
   const [selected, setSelected] = useState<string | null>(null);
   const [compareMode, setCompareMode] = useState(false);
   const [compareSelection, setCompareSelection] = useState<string[]>([]);
+  const loc = useLocation();
+  const nav = useNavigate();
 
   const compareQ = useQuery<RunCompareResponse>({
     queryKey: ["runsCompare", compareSelection.join(",")],
@@ -82,6 +85,12 @@ export default function Runs() {
   const dataAge = newestTs != null ? Date.now() / 1000 - newestTs : null;
 
   const compareRuns = useMemo(() => (compareQ.data?.runs ?? []).map((r) => r.run_id), [compareQ.data]);
+
+  useEffect(() => {
+    const qs = new URLSearchParams(loc.search);
+    const id = qs.get("run") ?? qs.get("run_id");
+    if (id) setSelected(String(id));
+  }, [loc.search]);
   const metricsByRun = useMemo(() => {
     const map: Record<string, RunMetricSeries[]> = {};
     for (const series of compareQ.data?.metrics ?? []) {
@@ -117,7 +126,15 @@ export default function Runs() {
       <div
         style={style}
         className={`v-row ${isSelected ? "active" : ""}`}
-        onClick={() => setSelected(r.run_id)}
+        onClick={() => {
+          setSelected(r.run_id);
+          const next = new URLSearchParams(loc.search);
+          next.set("run", r.run_id);
+          next.set("run_id", r.run_id);
+          next.set("step", String(r.last_step ?? ""));
+          next.set("ts", String(r.updated_ts ?? ""));
+          nav({ pathname: loc.pathname, search: next.toString() }, { replace: true });
+        }}
       >
         {compareMode && (
           <div className="v-cell" style={{ width: 40, justifyContent: "center" }}>

@@ -1,14 +1,14 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchInstances } from "../api";
-import type { Event, Heartbeat, InstanceView } from "../api";
-import { useEventStream } from "./useEventStream";
+import { fetchOverviewIssues } from "../api";
+import type { Heartbeat, OverviewIssue } from "../api";
 import { HEARTBEAT_SCHEMA_VERSION } from "../lib/schema";
 
 export type IssueSeverity = "low" | "medium" | "high";
 
 export type IssueItem = {
   id: string;
+  code?: string;
   label: string;
   severity: IssueSeverity;
   count: number;
@@ -16,6 +16,9 @@ export type IssueItem = {
   firstSeen?: number | null;
   lastSeen?: number | null;
   hint?: string | null;
+  evidence?: Array<{ kind: string; url: string; label?: string | null }>;
+  acknowledged?: boolean;
+  muted?: boolean;
 };
 
 const ISSUE_HINTS: Record<string, string> = {
@@ -60,62 +63,28 @@ export const deriveReasonCode = (hb?: Heartbeat | null): string | null => {
   return null;
 };
 
-const classifyEventIssue = (ev: Event): string | null => {
-  const type = String(ev.event_type || "").toLowerCase();
-  const msg = String(ev.message || "").toLowerCase();
-  if (type.includes("error") || msg.includes("error")) return "EVENT_ERRORS";
-  if (type.includes("stuck") || msg.includes("stuck")) return "STUCK_DETECTED";
-  if (type.includes("stream") && (msg.includes("missing") || msg.includes("stale"))) return "STREAM_GLITCHES";
-  if (type.includes("menu") || msg.includes("menu")) return "MENU_ISSUES";
-  return null;
-};
-
 export default function useIssues(limit = 240) {
-  const events = useEventStream(limit);
-  const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 2500 });
+  const issuesQ = useQuery({
+    queryKey: ["overviewIssues", limit],
+    queryFn: () => fetchOverviewIssues(Math.max(120, limit)),
+    refetchInterval: 5000,
+  });
 
   return useMemo(() => {
-    const issues = new Map<string, IssueItem>();
-
-    const pushIssue = (id: string, instanceId?: string | null, ts?: number | null) => {
-      const current = issues.get(id) ?? {
-        id,
-        label: id.replace(/_/g, " "),
-        severity: severityFor(id),
-        count: 0,
-        instances: [],
-        hint: ISSUE_HINTS[id] ?? null,
-        firstSeen: ts ?? null,
-        lastSeen: ts ?? null,
-      };
-      current.count += 1;
-      if (instanceId && !current.instances.includes(instanceId)) current.instances.push(instanceId);
-      if (ts != null) {
-        current.firstSeen = current.firstSeen == null ? ts : Math.min(current.firstSeen, ts);
-        current.lastSeen = current.lastSeen == null ? ts : Math.max(current.lastSeen, ts);
-      }
-      issues.set(id, current);
-    };
-
-    const instanceMap = (instQ.data ?? {}) as Record<string, InstanceView>;
-    Object.values(instanceMap).forEach((view) => {
-      const hb = view.heartbeat;
-      const reason = deriveReasonCode(hb);
-      if (reason) pushIssue(reason, hb.instance_id, hb.ts);
-    });
-
-    events.forEach((ev) => {
-      const issue = classifyEventIssue(ev);
-      if (!issue) return;
-      pushIssue(issue, ev.instance_id ?? null, ev.ts ?? null);
-    });
-
-    return Array.from(issues.values())
-      .sort((a, b) => {
-        const sev = { high: 3, medium: 2, low: 1 } as const;
-        if (sev[b.severity] !== sev[a.severity]) return sev[b.severity] - sev[a.severity];
-        return b.count - a.count;
-      })
-      .slice(0, 12);
-  }, [events, instQ.data]);
+    const raw = (issuesQ.data ?? []) as OverviewIssue[];
+    return raw.map((issue) => ({
+      id: issue.id,
+      code: issue.code ?? issue.id,
+      label: issue.label,
+      severity: issue.severity,
+      count: issue.count,
+      instances: issue.instances ?? [],
+      firstSeen: (issue as any).first_seen ?? (issue as any).firstSeen ?? null,
+      lastSeen: (issue as any).last_seen ?? (issue as any).lastSeen ?? null,
+      hint: issue.hint ?? ISSUE_HINTS[issue.code ?? issue.label.replace(/ /g, "_")] ?? null,
+      evidence: (issue as any).evidence ?? [],
+      acknowledged: (issue as any).acknowledged ?? false,
+      muted: (issue as any).muted ?? false,
+    })) as IssueItem[];
+  }, [issuesQ.data]);
 }

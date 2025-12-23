@@ -686,11 +686,14 @@ function eventIconIdx(eventType: string) {
   const t = String(eventType ?? "");
   if (t === "Overcrit" || t === "NewMaxHit") return sheetIcon("overcrit");
   if (t === "OverrunStart") return sheetIcon("warning");
+  if (t === "Disaster") return sheetIcon("warning");
   if (t === "LootDrop" || t === "BountyClaimed" || t === "BountyCreated") return sheetIcon("loot_chest");
+  if (t === "WeirdBuild") return sheetIcon("loot_chest");
   if (t === "Heal") return sheetIcon("health");
   if (t === "Eureka") return sheetIcon("info");
   if (t === "EpisodeEnd") return sheetIcon("heartbreak");
   if (t === "EpisodeStart") return sheetIcon("time");
+  if (t === "Clutch" || t === "ClutchClip") return sheetIcon("moment");
   if (t === "ChatSpike" || t === "CommunityPin") return sheetIcon("moment");
   if (t === "WorkerOnline") return sheetIcon("training");
   return sheetIcon("unknown");
@@ -788,11 +791,15 @@ function pickInterestingEvents(events: Event[], limit = 6) {
     "EpisodeStart",
     "EpisodeEnd",
     "OverrunStart",
+    "Disaster",
     "Overcrit",
     "NewMaxHit",
     "LootDrop",
     "Heal",
     "Eureka",
+    "Clutch",
+    "ClutchClip",
+    "WeirdBuild",
     "ChatSpike",
     "BountyCreated",
     "BountyClaimed",
@@ -1708,7 +1715,13 @@ export default function Stream() {
     return arr;
   }, [workersQ.data]);
   const pipewireDown = useMemo(() => {
-    return workers.filter((w) => (w as any)?.pipewire_node_ok === false || String((w as any)?.status ?? "").includes("no_pipewire"));
+    return workers.filter(
+      (w) =>
+        (w as any)?.pipewire_ok === false ||
+        (w as any)?.pipewire_session_ok === false ||
+        (w as any)?.pipewire_node_ok === false ||
+        String((w as any)?.status ?? "").includes("no_pipewire"),
+    );
   }, [workers]);
 
   const memeStats = useMemo(() => {
@@ -2401,6 +2414,9 @@ export default function Stream() {
                 <div className="meme-pill">Borgars {memeStats.borgars}</div>
                 <div className="meme-pill">Deaths/2m {memeStats.deaths2m}</div>
                 <div className="meme-pill">Hype {memeStats.hype}</div>
+                <div className="meme-pill">Bonk Conf {memeStats.bonkConfidence}%</div>
+                <div className="meme-pill">Menu Doom {memeStats.menuDoom}</div>
+                <div className="meme-pill">Chat Influence {memeStats.chatInfluence}%</div>
               </div>
 
               {fuseViz ? (

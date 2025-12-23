@@ -40,7 +40,7 @@ export default function App() {
         <div className="brand">MetaBonk Dev UI</div>
         <nav className="nav">
           {nav.map((n) => (
-            <Link key={n.to} to={n.to} className={loc.pathname === n.to ? "active" : ""}>
+            <Link key={n.to} to={`${n.to}${loc.search}`} className={loc.pathname === n.to ? "active" : ""}>
               {n.label}
             </Link>
           ))}

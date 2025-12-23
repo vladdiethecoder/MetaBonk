@@ -1434,6 +1434,7 @@ def emit_event(
     message: str,
     run_id: Optional[str] = None,
     instance_id: Optional[str] = None,
+    step: Optional[int] = None,
     payload: Optional[dict] = None,
 ):
     eid = f"evt-{next(_event_counter)}"
@@ -1443,6 +1444,7 @@ def emit_event(
         instance_id=instance_id,
         event_type=event_type,
         message=message,
+        step=step,
         payload=payload or {},
         ts=time.time(),
     )
@@ -2109,6 +2111,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
                         f"{iid} OVERRUN (incoming {float(inc):.1f} > clearing {float(clr):.1f})",
                         run_id=ev.run_id,
                         instance_id=iid,
+                        step=getattr(hb, "step", None) if hb is not None else None,
                         payload={"incoming_dps": float(inc), "clearing_dps": float(clr), "pressure": pressure},
                     )
                     try:
@@ -2127,6 +2130,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
                             f"{iid} DISASTER (pressure {pressure:.2f})",
                             run_id=ev.run_id,
                             instance_id=iid,
+                            step=getattr(hb, "step", None) if hb is not None else None,
                             payload={"pressure": pressure, "clip_url": clip_url},
                         )
                         _disaster_state[iid] = ts
@@ -2136,6 +2140,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
                         f"{iid} stabilized",
                         run_id=ev.run_id,
                         instance_id=iid,
+                        step=getattr(hb, "step", None) if hb is not None else None,
                         payload={"incoming_dps": float(inc), "clearing_dps": float(clr), "pressure": pressure},
                     )
         except Exception:
@@ -2169,6 +2174,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
                             f"{iid} WEIRD BUILD ({rare} rares, {len(kinds)} kinds)",
                             run_id=ev.run_id,
                             instance_id=iid,
+                            step=getattr(hb, "step", None) if hb is not None else None,
                             payload={"rare_count": rare, "kind_count": len(kinds), "clip_url": clip_url},
                         )
                         _weird_build_state[iid] = ts
@@ -2275,6 +2281,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
             f"{iid} CLUTCH survived (p_min={clutch['prob_min']:.3f} → {clutch['prob_recovered']:.3f})",
             run_id=ev.run_id,
             instance_id=iid,
+            step=getattr(hb, "step", None) if hb is not None else None,
             payload=dict(clutch),
         )
         # Request a highlight clip from the worker if possible.
@@ -2292,6 +2299,7 @@ def _handle_survival_telemetry(ev: Event) -> None:
                                 f"{iid} clutch clip encoded",
                                 run_id=ev.run_id,
                                 instance_id=iid,
+                                step=getattr(hb, "step", None) if hb is not None else None,
                                 payload={"clip_url": clip_url, **dict(clutch)},
                             )
                 except Exception:

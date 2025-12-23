@@ -500,6 +500,52 @@ def _write_svg_line(path: Path, series: List[Tuple[float, float]], title: str) -
     path.write_text(svg)
 
 
+def _copy_if_exists(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    except Exception:
+        pass
+
+
+def _collect_mod_logs(out_dir: Path, instance_prefix: str, workers: int) -> None:
+    dest_root = out_dir / "logs" / "modding"
+    inst_root = REPO_ROOT / "temp" / "megabonk_instances"
+    for i in range(workers):
+        iid = f"{instance_prefix}-{i}"
+        inst = inst_root / iid
+        if not inst.exists():
+            continue
+        dest = dest_root / iid
+        _copy_if_exists(inst / "BepInEx" / "LogOutput.log", dest / "BepInEx" / "LogOutput.log")
+        _copy_if_exists(inst / "BepInEx" / "config" / "BepInEx.cfg", dest / "BepInEx" / "config" / "BepInEx.cfg")
+        _copy_if_exists(inst / "doorstop_config.ini", dest / "doorstop_config.ini")
+        for cand in inst.glob("output_log.txt"):
+            _copy_if_exists(cand, dest / cand.name)
+        for pattern in ("doorstop*.log", "preloader*.log"):
+            for cand in inst.glob(pattern):
+                _copy_if_exists(cand, dest / cand.name)
+
+
+def _collect_unity_player_logs(out_dir: Path, instance_prefix: str, workers: int) -> None:
+    dest_root = out_dir / "logs" / "unity"
+    compat_root = REPO_ROOT / "temp" / "compatdata"
+    for i in range(workers):
+        iid = f"{instance_prefix}-{i}"
+        pfx = compat_root / iid / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "LocalLow"
+        if not pfx.exists():
+            continue
+        for log_path in pfx.glob("**/Player.log"):
+            try:
+                rel = log_path.relative_to(pfx)
+            except Exception:
+                rel = Path("Player.log")
+            dest = dest_root / iid / rel
+            _copy_if_exists(log_path, dest)
+
+
 def _write_svg_bar(path: Path, labels: List[str], values: List[float], title: str) -> None:
     if not labels:
         return
@@ -771,12 +817,15 @@ def main() -> int:
     env.setdefault("MEGABONK_LOG_DIR", str(game_log_dir))
     proton_log_dir = out_dir / "logs" / "proton"
     proton_crash_dir = out_dir / "logs" / "proton_crash"
+    dotnet_dump_dir = out_dir / "logs" / "dumps"
     proton_log_dir.mkdir(parents=True, exist_ok=True)
     proton_crash_dir.mkdir(parents=True, exist_ok=True)
+    dotnet_dump_dir.mkdir(parents=True, exist_ok=True)
     env.setdefault("METABONK_PROTON_LOG", "1")
     env.setdefault("METABONK_PROTON_LOG_DIR", str(proton_log_dir))
     env.setdefault("METABONK_PROTON_CRASH_DIR", str(proton_crash_dir))
     env.setdefault("METABONK_WINEDEBUG", "-all,+seh,+tid,+timestamp,+loaddll")
+    env.setdefault("METABONK_DOTNET_DUMP_DIR", str(dotnet_dump_dir))
     gamescope_enabled = _env_truthy(os.environ.get("METABONK_E2E_GAMESCOPE", "1"))
     omega_cmd = [
         sys.executable,
@@ -1120,6 +1169,11 @@ def main() -> int:
         write_manifest(out_dir / "manifest.json", manifest)
         exit_code = 1
     finally:
+        try:
+            _collect_mod_logs(out_dir, cfg.instance_prefix, cfg.workers)
+            _collect_unity_player_logs(out_dir, cfg.instance_prefix, cfg.workers)
+        except Exception:
+            pass
         _terminate(omega)
         if go2rtc_started:
             try:

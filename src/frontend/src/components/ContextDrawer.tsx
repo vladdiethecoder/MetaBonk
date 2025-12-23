@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useLocation } from "react-router-dom";
 import { fetchInstances } from "../api";
 import type { InstanceView } from "../api";
 import { contextDrawerEventName, ContextDrawerPayload } from "../hooks/useContextDrawer";
@@ -17,6 +18,7 @@ type FlightEntry = {
 };
 
 export default function ContextDrawer() {
+  const loc = useLocation();
   const [open, setOpen] = useState(false);
   const [payload, setPayload] = useState<ContextDrawerPayload | null>(null);
   const [flight, setFlight] = useState<FlightEntry[]>([]);
@@ -57,6 +59,13 @@ export default function ContextDrawer() {
     const base = instance?.heartbeat?.control_url ?? "";
     if (!base) return "";
     return `${String(base).replace(/\/+$/, "")}/frame.jpg`;
+  }, [instance]);
+
+  const keyframeAge = useMemo(() => {
+    const ts = instance?.heartbeat?.stream_keyframe_ts;
+    if (!ts) return null;
+    const now = Date.now() / 1000;
+    return Math.max(0, now - Number(ts));
   }, [instance]);
 
   const instanceEvents = useMemo(() => {
@@ -229,7 +238,7 @@ export default function ContextDrawer() {
                   </a>
                 ) : null}
                 {payload?.instanceId ? (
-                  <a className="btn btn-ghost btn-compact" href={`/instances?instance=${payload.instanceId}`}>
+                  <a className="btn btn-ghost btn-compact" href={`/instances?instance=${payload.instanceId}${loc.search ? `&${loc.search.slice(1)}` : ""}`}>
                     open instance
                   </a>
                 ) : null}
@@ -254,6 +263,10 @@ export default function ContextDrawer() {
                 <div className="v">{latestTelemetry.action_entropy ?? "—"}</div>
                 <div className="k">stream age</div>
                 <div className="v">{latestTelemetry.stream_age_s == null ? "—" : `${fmtNum(latestTelemetry.stream_age_s)}s`}</div>
+                <div className="k">stream fps</div>
+                <div className="v">{latestTelemetry.stream_fps ?? "—"}</div>
+                <div className="k">keyframe age</div>
+                <div className="v">{keyframeAge == null ? "—" : `${fmtNum(keyframeAge)}s`}</div>
               </div>
             </div>
           ) : null}

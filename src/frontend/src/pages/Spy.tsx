@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
+import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import AutoSizer from "react-virtualized-auto-sizer";
 import {
   buildDreamPolicy,
   buildWorldModel,
@@ -200,6 +202,26 @@ export default function Spy() {
     refetchInterval: 5000,
   });
   const events = useEventStream(80);
+
+  const EventRow = ({ index, style }: ListChildComponentProps) => {
+    if (!events.length) {
+      return (
+        <div style={style} className="event muted">
+          no events yet
+        </div>
+      );
+    }
+    const e = events[index];
+    if (!e) return null;
+    return (
+      <div style={style} className="event">
+        <span className="badge">{e.event_type}</span>
+        <span>{e.message}</span>
+        {e.step != null ? <span className="muted">step {e.step}</span> : null}
+        <span className="muted">{new Date(e.ts * 1000).toLocaleTimeString()}</span>
+      </div>
+    );
+  };
 
   const workers = Object.values(workersQ.data ?? {});
   workers.sort((a, b) => (b.steam_score ?? b.reward ?? 0) - (a.steam_score ?? a.reward ?? 0));
@@ -703,15 +725,14 @@ export default function Spy() {
 
       <section className="card">
         <h2>Events</h2>
-        <div className="events">
-          {events.map((e) => (
-            <div key={e.event_id} className="event">
-              <span className="badge">{e.event_type}</span>
-              <span>{e.message}</span>
-              <span className="muted">{new Date(e.ts * 1000).toLocaleTimeString()}</span>
-            </div>
-          ))}
-          {!events.length && <div className="muted">no events yet</div>}
+        <div className="events" style={{ height: 360 }}>
+          <AutoSizer>
+            {({ height, width }) => (
+              <List height={height} width={width} itemCount={events.length || 1} itemSize={32}>
+                {EventRow}
+              </List>
+            )}
+          </AutoSizer>
         </div>
       </section>
     </div>

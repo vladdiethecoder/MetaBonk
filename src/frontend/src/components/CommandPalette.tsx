@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchInstances, fetchRuns } from "../api";
 import type { InstanceView, Run } from "../api";
 
 export default function CommandPalette() {
   const nav = useNavigate();
+  const loc = useLocation();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 4000 });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: fetchRuns, refetchInterval: 8000 });
+  const qs = loc.search || "";
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -29,12 +31,12 @@ export default function CommandPalette() {
 
   const commands = useMemo(() => {
     const list: Array<{ id: string; label: string; action: () => void; meta?: string }> = [];
-    list.push({ id: "open-overview", label: "Open Overview", action: () => nav("/") });
-    list.push({ id: "open-instances", label: "Open Instances", action: () => nav("/instances") });
-    list.push({ id: "open-runs", label: "Open Runs", action: () => nav("/runs") });
-    list.push({ id: "open-build", label: "Open Build Lab", action: () => nav("/build") });
-    list.push({ id: "open-skills", label: "Open Skills", action: () => nav("/skills") });
-    list.push({ id: "open-spy", label: "Open Spy", action: () => nav("/spy") });
+    list.push({ id: "open-overview", label: "Open Overview", action: () => nav(`/${qs}`) });
+    list.push({ id: "open-instances", label: "Open Instances", action: () => nav(`/instances${qs}`) });
+    list.push({ id: "open-runs", label: "Open Runs", action: () => nav(`/runs${qs}`) });
+    list.push({ id: "open-build", label: "Open Build Lab", action: () => nav(`/build${qs}`) });
+    list.push({ id: "open-skills", label: "Open Skills", action: () => nav(`/skills${qs}`) });
+    list.push({ id: "open-spy", label: "Open Spy", action: () => nav(`/spy${qs}`) });
 
     const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
     Object.values(instances).slice(0, 40).forEach((v) => {
@@ -45,7 +47,7 @@ export default function CommandPalette() {
         id: `instance-${id}`,
         label: `Focus instance ${name}`,
         meta: id,
-        action: () => nav(`/instances?instance=${id}`),
+        action: () => nav(`/instances?instance=${id}${qs ? `&${qs.slice(1)}` : ""}`),
       });
     });
 
@@ -55,11 +57,11 @@ export default function CommandPalette() {
         id: `run-${r.run_id}`,
         label: `Open run ${r.run_id}`,
         meta: r.experiment_id,
-        action: () => nav(`/runs?run=${r.run_id}`),
+        action: () => nav(`/runs?run=${r.run_id}${qs ? `&${qs.slice(1)}` : ""}`),
       });
     });
     return list;
-  }, [instQ.data, runsQ.data, nav]);
+  }, [instQ.data, runsQ.data, nav, qs]);
 
   const filtered = useMemo(() => {
     const qq = q.trim().toLowerCase();

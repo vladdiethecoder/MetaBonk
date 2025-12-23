@@ -4,7 +4,7 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import { FixedSizeList as List, ListChildComponentProps } from "react-window";
 import AutoSizer from "react-virtualized-auto-sizer";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
 import { useEventStream } from "../hooks/useEventStream";
 import useContextFilters from "../hooks/useContextFilters";
@@ -85,6 +85,7 @@ export default function Instances() {
   const histQ = useQuery({ queryKey: ["historicLeaderboard"], queryFn: () => fetchHistoricLeaderboard(200, "best_score"), refetchInterval: 5000 });
   const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
   const loc = useLocation();
+  const nav = useNavigate();
   const { ctx, windowSeconds } = useContextFilters();
   const events = useEventStream(220);
   const [q, setQ] = useState("");
@@ -101,7 +102,7 @@ export default function Instances() {
 
   useEffect(() => {
     const qs = new URLSearchParams(loc.search);
-    const id = qs.get("id") ?? qs.get("instance") ?? qs.get("iid");
+    const id = qs.get("id") ?? qs.get("instance") ?? qs.get("iid") ?? qs.get("instance_id");
     if (id) setSelected(String(id));
   }, [loc.search]);
 
@@ -203,7 +204,20 @@ export default function Instances() {
     const r = rows[index];
     const isSelected = String(selectedRow?.id) === String(r.id);
     return (
-      <div style={style} className={`v-row ${isSelected ? "active" : ""}`} onClick={() => setSelected(r.id)}>
+      <div
+        style={style}
+        className={`v-row ${isSelected ? "active" : ""}`}
+        onClick={() => {
+          setSelected(r.id);
+          const next = new URLSearchParams(loc.search);
+          next.set("instance", r.id);
+          next.set("instance_id", r.id);
+          if (r.runId) next.set("run_id", String(r.runId));
+          next.set("step", String(r.step ?? ""));
+          next.set("ts", String(r.ts ?? ""));
+          nav({ pathname: loc.pathname, search: next.toString() }, { replace: true });
+        }}
+      >
         <div className="v-cell" style={{ flex: 1.5 }}>
           <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</div>
           <div className="muted mono" style={{ fontSize: "0.85em" }}>
