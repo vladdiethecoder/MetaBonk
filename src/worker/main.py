@@ -1212,20 +1212,29 @@ class WorkerService:
         # If we have no menu hint and no menu name, still attempt to advance prompts.
         return True
 
-    def _run_menu_bootstrap(self) -> None:
+    def _run_menu_bootstrap(self, current_menu: str = "") -> None:
         if not self._input_backend:
             return
         now = time.time()
         if now < self._menu_bootstrap_next_ts:
             return
-        steps = [
-            ("key_tap", "SPACE"),
-            ("key_tap", "ENTER"),
-            ("click_center", None),
-            ("key_tap", "ENTER"),
-            ("click_center", None),
-            ("key_tap", "W"),
-        ]
+        cm = (current_menu or "").strip().lower()
+        if cm in ("loadingscreen", "loading"):
+            return
+        if cm in ("generatedmap",):
+            steps = [
+                ("key_tap", "ENTER"),
+                ("key_tap", "SPACE"),
+                ("key_tap", "W"),
+            ]
+        else:
+            steps = [
+                ("key_tap", "SPACE"),
+                ("key_tap", "ENTER"),
+                ("click_center", None),
+                ("key_tap", "ENTER"),
+                ("click_center", None),
+            ]
         kind, payload = steps[self._menu_bootstrap_step % len(steps)]
         try:
             if kind == "key_tap":
@@ -2370,7 +2379,7 @@ class WorkerService:
                 and (not self._gameplay_started)
                 and self._input_should_bootstrap(menu_hint, game_state)
             ):
-                self._run_menu_bootstrap()
+                self._run_menu_bootstrap(str(game_state.get("currentMenu") or ""))
                 input_bootstrap = True
             elif self._input_backend and (not menu_override_active):
                 self._input_send_actions(a_cont, a_disc)
