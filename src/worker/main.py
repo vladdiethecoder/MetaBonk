@@ -192,8 +192,16 @@ class WorkerService:
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
         self._last_menu_name: Optional[str] = None
+        self._last_menu_raw: Optional[str] = None
+        self._last_menu_log_ts: float = 0.0
+        self._last_state_ts: float = 0.0
         self._menu_seen_main: bool = False
         self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
+        self._menu_log = os.environ.get("METABONK_MENU_LOG", "0") in ("1", "true", "True")
+        try:
+            self._menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
+        except Exception:
+            self._menu_start_bonus = 0.0
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
         self._action_source = self._normalize_action_source(
@@ -1977,6 +1985,7 @@ class WorkerService:
                     state_obj, jpeg_bytes = pkt
                     if not self._visual_only:
                         game_state.update(state_obj.to_dict())
+                        self._last_state_ts = now
                     if (not used_pixels) and (not detections) and jpeg_bytes:
                         try:
                             import base64
@@ -2053,6 +2062,8 @@ class WorkerService:
                 gf = self._bridge_read_frame()
                 if gf is not None and getattr(gf, "pixels", None) is not None:
                     game_state = {} if self._visual_only else (getattr(gf, "state", {}) or {})
+                    if not self._visual_only:
+                        self._last_state_ts = now
                     pixels = gf.pixels
                     try:
                         import base64
@@ -2184,6 +2195,36 @@ class WorkerService:
                     pass
             if str(os.environ.get("METABONK_MENU_FORCE", "0")).lower() in ("1", "true", "yes"):
                 menu_hint = True
+
+            # Explicit menu-change logging for debug.
+            if self._menu_log:
+                try:
+                    raw_menu = str(game_state.get("currentMenu") or "")
+                except Exception:
+                    raw_menu = ""
+                norm_menu = raw_menu.strip().lower()
+                prev_raw = self._last_menu_raw or ""
+                should_log = False
+                if raw_menu != prev_raw:
+                    should_log = True
+                elif (now - self._last_menu_log_ts) >= 1.0:
+                    should_log = True
+                if should_log and (raw_menu or prev_raw):
+                    try:
+                        playing_flag = bool(game_state.get("isPlaying"))
+                    except Exception:
+                        playing_flag = False
+                    if self._last_state_ts > 0:
+                        age_ms = int(max(0.0, (now - self._last_state_ts) * 1000.0))
+                    else:
+                        age_ms = -1
+                    print(
+                        f"[MENU] instance={self.instance_id} raw='{raw_menu}' norm='{norm_menu}' "
+                        f"prev='{prev_raw}' playing={playing_flag} seen_main={self._menu_seen_main} "
+                        f"menu_start_bonus={self._menu_start_bonus:.2f} age_ms={age_ms}"
+                    )
+                    self._last_menu_log_ts = now
+                self._last_menu_raw = raw_menu
 
             self._update_gameplay_state(menu_hint, game_state)
             self._update_menu_doom(menu_hint)
@@ -2728,10 +2769,7 @@ class WorkerService:
                     reward += menu_exit_bonus
                 self._last_menu_mode = bool(menu_hint)
             # Optional menu transition bonus (e.g., MainMenu -> GeneratedMap).
-            try:
-                menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
-            except Exception:
-                menu_start_bonus = 0.0
+            menu_start_bonus = float(self._menu_start_bonus or 0.0)
             try:
                 cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
             except Exception:
@@ -2740,9 +2778,19 @@ class WorkerService:
             if cur_menu:
                 if cur_menu == "mainmenu":
                     self._menu_seen_main = True
+                    if self._menu_log:
+                        print(
+                            f"[MENU] instance={self.instance_id} seen_main=True "
+                            f"raw='mainmenu' norm='mainmenu' prev='{prev_menu or ''}'"
+                        )
                 if menu_start_bonus and cur_menu == "generatedmap" and self._menu_seen_main:
                     reward += menu_start_bonus
                     self._menu_seen_main = False
+                    if self._menu_log:
+                        print(
+                            f"[MENU] instance={self.instance_id} start_bonus_fired={menu_start_bonus:.2f} "
+                            f"prev='{prev_menu or ''}' cur='generatedmap'"
+                        )
                 self._last_menu_name = cur_menu
             # Optional reward logging (useful for menu shaping/debug).
             if self._reward_log and abs(float(reward)) > 1e-9:
