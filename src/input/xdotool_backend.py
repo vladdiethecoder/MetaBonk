@@ -183,6 +183,34 @@ class XDoToolBackend:
         for _ in range(abs(int(steps))):
             self._run(["xdotool", "click", str(btn)])
 
+    def click_center(self) -> None:
+        wid = self._resolve_window_id()
+        if not wid:
+            return
+        if not self._ensure_focus():
+            return
+        geom = self._capture_output(["xdotool", "getwindowgeometry", "--shell", wid])
+        if not geom:
+            return
+        width = height = None
+        for line in geom.splitlines():
+            if line.startswith("WIDTH="):
+                try:
+                    width = int(line.split("=", 1)[1])
+                except Exception:
+                    width = None
+            elif line.startswith("HEIGHT="):
+                try:
+                    height = int(line.split("=", 1)[1])
+                except Exception:
+                    height = None
+        if not width or not height:
+            return
+        x = int(width // 2)
+        y = int(height // 2)
+        self._run(["xdotool", "mousemove", "--window", wid, str(x), str(y)])
+        self._run(["xdotool", "click", "1"])
+
     def _run(self, cmd: list[str]) -> None:
         subprocess.run(
             cmd,

@@ -1221,17 +1221,18 @@ class WorkerService:
         steps = [
             ("key_tap", "SPACE"),
             ("key_tap", "ENTER"),
-            ("key_tap", "ESC"),
-            ("mouse_move", (12, -8)),
-            ("mouse_click", "left"),
-            ("mouse_move", (-10, 6)),
-            ("mouse_click", "left"),
+            ("click_center", None),
+            ("key_tap", "ENTER"),
+            ("click_center", None),
         ]
         kind, payload = steps[self._menu_bootstrap_step % len(steps)]
         try:
             if kind == "key_tap":
                 self._input_backend.key_down(str(payload))
                 self._input_backend.key_up(str(payload))
+            elif kind == "click_center":
+                if hasattr(self._input_backend, "click_center"):
+                    self._input_backend.click_center()
             elif kind == "mouse_move":
                 dx, dy = payload
                 self._input_backend.mouse_move(int(dx), int(dy))
