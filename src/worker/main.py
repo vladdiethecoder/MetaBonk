@@ -1224,6 +1224,7 @@ class WorkerService:
             ("click_center", None),
             ("key_tap", "ENTER"),
             ("click_center", None),
+            ("key_tap", "W"),
         ]
         kind, payload = steps[self._menu_bootstrap_step % len(steps)]
         try:
