@@ -41,6 +41,7 @@ class Proc:
     role: str = "service"
     cmd: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
+    stdout_path: Optional[str] = None
     restart_count: int = 0
     last_start_ts: float = 0.0
 
@@ -52,6 +53,7 @@ def _spawn(
     env: Optional[Dict[str, str]] = None,
     role: str = "service",
     restart_count: int = 0,
+    stdout_path: Optional[str] = None,
 ) -> Proc:
     print(f"[start_omega] starting {name}: {' '.join(cmd)}")
     preexec_fn = None
@@ -70,13 +72,27 @@ def _spawn(
 
             preexec_fn = _bind_to_job_pgid
 
-    p = subprocess.Popen(cmd, env=env, preexec_fn=preexec_fn)
+    stdout = None
+    stderr = None
+    log_file = None
+    if stdout_path:
+        log_path = Path(stdout_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("a", encoding="utf-8")
+        stdout = log_file
+        stderr = subprocess.STDOUT
+        print(f"[start_omega] {name} logs -> {log_path}")
+
+    p = subprocess.Popen(cmd, env=env, preexec_fn=preexec_fn, stdout=stdout, stderr=stderr)
+    if log_file:
+        log_file.close()
     return Proc(
         name=name,
         popen=p,
         role=role,
         cmd=list(cmd),
         env=dict(env) if env else None,
+        stdout_path=str(stdout_path) if stdout_path else None,
         restart_count=int(restart_count),
         last_start_ts=time.time(),
     )
@@ -140,6 +156,7 @@ def _supervise(
                     env=dict(pr.env) if pr.env else None,
                     role=pr.role,
                     restart_count=int(pr.restart_count) + 1,
+                    stdout_path=pr.stdout_path,
                 )
                 procs[idx] = new_pr
             except Exception as e:
@@ -990,6 +1007,14 @@ def main() -> int:
                     wenv["METABONK_INPUT_DISPLAY"] = str(
                         wenv.get("METABONK_GAMESCOPE_INPUT_DISPLAY", ":1")
                     )
+                wenv.setdefault("METABONK_INPUT_BACKEND", "xdotool")
+                wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "1")
+                if not (
+                    wenv.get("METABONK_INPUT_BUTTONS")
+                    or wenv.get("METABONK_INPUT_KEYS")
+                    or wenv.get("METABONK_BUTTON_KEYS")
+                ):
+                    wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN"
                 # Default the xdotool window matcher to the game name if not specified.
                 if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                     wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
@@ -1003,6 +1028,7 @@ def main() -> int:
                         f.write(f"XVFB_ENABLED={str(bool(xvfb_ok))}\n")
                 except Exception:
                     pass
+            worker_log = (logs_dir / f"worker_{i}.log") if logs_dir else None
             procs.append(
                 _spawn(
                     iid,
@@ -1019,6 +1045,7 @@ def main() -> int:
                     ],
                     env=wenv,
                     role="worker",
+                    stdout_path=str(worker_log) if worker_log else None,
                 )
             )
 
