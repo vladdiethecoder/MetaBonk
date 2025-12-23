@@ -192,6 +192,7 @@ class WorkerService:
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
         self._last_menu_name: Optional[str] = None
+        self._menu_seen_main: bool = False
         self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
@@ -2737,9 +2738,11 @@ class WorkerService:
                 cur_menu = ""
             prev_menu = self._last_menu_name
             if cur_menu:
-                if menu_start_bonus and prev_menu and prev_menu != cur_menu:
-                    if prev_menu == "mainmenu" and cur_menu == "generatedmap":
-                        reward += menu_start_bonus
+                if cur_menu == "mainmenu":
+                    self._menu_seen_main = True
+                if menu_start_bonus and cur_menu == "generatedmap" and self._menu_seen_main:
+                    reward += menu_start_bonus
+                    self._menu_seen_main = False
                 self._last_menu_name = cur_menu
             # Optional reward logging (useful for menu shaping/debug).
             if self._reward_log and abs(float(reward)) > 1e-9:
