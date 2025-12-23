@@ -1707,6 +1707,9 @@ export default function Stream() {
     arr.sort((a, b) => scoreOf(b) - scoreOf(a));
     return arr;
   }, [workersQ.data]);
+  const pipewireDown = useMemo(() => {
+    return workers.filter((w) => (w as any)?.pipewire_node_ok === false || String((w as any)?.status ?? "").includes("no_pipewire"));
+  }, [workers]);
 
   const memeStats = useMemo(() => {
     const now = Date.now() / 1000;
@@ -1716,11 +1719,20 @@ export default function Stream() {
     const borgars = workers.reduce((sum, w) => sum + Number((w as any)?.borgar_count ?? 0), 0);
     const hype = workers.reduce((sum, w) => sum + Number((w as any)?.hype_score ?? 0), 0);
     const hypeAvg = workers.length ? hype / workers.length : 0;
+    const confVals = workers.map((w) => Number((w as any)?.bonk_confidence)).filter((v) => Number.isFinite(v));
+    const doomVals = workers.map((w) => Number((w as any)?.menu_doom_spiral)).filter((v) => Number.isFinite(v));
+    const chatVals = workers.map((w) => Number((w as any)?.chat_influence)).filter((v) => Number.isFinite(v));
+    const conf = confVals.length ? confVals.reduce((a, b) => a + b, 0) / confVals.length : 0;
+    const doom = doomVals.length ? doomVals.reduce((a, b) => a + b, 0) / doomVals.length : 0;
+    const chat = chatVals.length ? chatVals.reduce((a, b) => a + b, 0) / chatVals.length : 0;
     return {
       bonksPerMin: bonks.length / 2,
       deaths2m: deaths.length,
       borgars,
       hype: Math.round(hypeAvg * 100),
+      bonkConfidence: Math.round(conf * 100),
+      menuDoom: Math.round(doom),
+      chatInfluence: Math.round(chat * 100),
     };
   }, [events, workers]);
 
@@ -2347,6 +2359,11 @@ export default function Stream() {
                     <span className="stream-ticker-dot" />
                     <span className="stream-ticker-text">{tickerLines[tickerIdx] ?? ""}</span>
                   </div>
+                  {pipewireDown.length ? (
+                    <div className="stream-alert stream-alert-danger" role="alert">
+                      PipeWire missing on {pipewireDown.length} instance{pipewireDown.length === 1 ? "" : "s"} • audio graph detached
+                    </div>
+                  ) : null}
                 </div>
                 <div className="stream-kpis">
                   <div className="stream-kpi">

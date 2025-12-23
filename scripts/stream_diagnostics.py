@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import subprocess
 from pathlib import Path
 
 
@@ -12,6 +13,26 @@ def _add_repo_root() -> Path:
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     return repo_root
+
+
+def _vulkan_driver_status() -> tuple[bool, bool]:
+    """Return (has_64bit, has_32bit) Vulkan loader presence."""
+    try:
+        out = subprocess.check_output(["ldconfig", "-p"], stderr=subprocess.STDOUT, timeout=2.0)
+    except Exception:
+        return (False, False)
+    txt = out.decode("utf-8", "replace").splitlines()
+    has_64 = False
+    has_32 = False
+    for line in txt:
+        if "libvulkan.so.1" not in line:
+            continue
+        lower = line.lower()
+        if "x86-64" in lower or "x86_64" in lower:
+            has_64 = True
+        if "i386" in lower or "i686" in lower or "32-bit" in lower:
+            has_32 = True
+    return (has_64, has_32)
 
 
 def main() -> int:
@@ -87,6 +108,16 @@ def main() -> int:
     print(f"[stream_diagnostics] backend requested: {backend_raw} (normalized: {backend_norm or 'auto'})")
     print(f"[stream_diagnostics] codec: {codec}")
     print(f"[stream_diagnostics] container: {container}")
+
+    vk64, vk32 = _vulkan_driver_status()
+    if vk64:
+        print("[stream_diagnostics] vulkan loader: 64-bit OK")
+    else:
+        print("[stream_diagnostics] vulkan loader: 64-bit missing")
+    if vk32:
+        print("[stream_diagnostics] vulkan loader: 32-bit OK")
+    else:
+        print("[stream_diagnostics] vulkan loader: 32-bit missing (Proton/DXVK may exit early)")
 
     gst_ok = False
     gst_err = None

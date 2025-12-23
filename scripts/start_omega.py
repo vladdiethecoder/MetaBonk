@@ -487,6 +487,12 @@ def main() -> int:
         """
         if not args.game_dir:
             return
+        disable_bepinex = str(env.get("METABONK_DISABLE_BEPINEX", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         src = Path(args.game_dir).expanduser().resolve()
         exe = src / "Megabonk.exe"
         if not exe.exists():
@@ -569,6 +575,22 @@ def main() -> int:
                     _symlink(child, inst / child.name)
                 except Exception:
                     pass
+            if disable_bepinex:
+                try:
+                    bep = inst / "BepInEx"
+                    if bep.exists() and bep.is_dir() and not (inst / "BepInEx.disabled").exists():
+                        bep.rename(inst / "BepInEx.disabled")
+                except Exception:
+                    pass
+                # Disable common BepInEx entrypoints (instance-local symlinks).
+                for dll_name in ("winhttp.dll", "doorstop_config.ini"):
+                    try:
+                        target = inst / dll_name
+                        if target.exists():
+                            target.unlink()
+                    except Exception:
+                        pass
+                continue
             # Copy BepInEx folder once per instance.
             try:
                 _copytree_once(src / "BepInEx", inst / "BepInEx")
@@ -712,12 +734,27 @@ def main() -> int:
             "EXTRA_OVERRIDES=\\\"${METABONK_WINE_DLL_OVERRIDES:-}\\\"; "
             "if [ -n \\\"$EXTRA_OVERRIDES\\\" ]; then "
             "export WINEDLLOVERRIDES=\\\"$EXTRA_OVERRIDES;$WINEDLLOVERRIDES\\\"; fi; "
+            "if [ -n \\\"${METABONK_WINEDEBUG:-}\\\" ]; then export WINEDEBUG=\\\"$METABONK_WINEDEBUG\\\"; "
+            "else export WINEDEBUG=-all; fi; "
+            "if [ -n \\\"${METABONK_PROTON_LOG:-}\\\" ]; then export PROTON_LOG=1; fi; "
+            "if [ -n \\\"${METABONK_PROTON_LOG_DIR:-}\\\" ]; then export PROTON_LOG_DIR=\\\"$METABONK_PROTON_LOG_DIR\\\"; fi; "
+            "if [ -n \\\"${METABONK_PROTON_CRASH_DIR:-}\\\" ]; then export PROTON_CRASH_REPORT_DIR=\\\"$METABONK_PROTON_CRASH_DIR\\\"; fi; "
+            "if [ -n \\\"${METABONK_PROTON_USE_WINED3D:-}\\\" ]; then export PROTON_USE_WINED3D=1; fi; "
             f"export STEAM_COMPAT_CLIENT_INSTALL_PATH=\\\"{str(Path(args.steam_root).expanduser())}\\\"; "
             "export STEAM_COMPAT_DATA_PATH=\\\"$COMPAT\\\"; "
-            "export SteamAppId=$APPID; export SteamGameId=$APPID; export WINEDEBUG=-all; "
+            "export SteamAppId=$APPID; export SteamGameId=$APPID; "
+            "LOG_DIR=\\\"${MEGABONK_LOG_DIR:-}\\\"; "
+            "LOG_PATH=\\\"\\\"; "
+            "if [ -n \\\"$LOG_DIR\\\" ]; then mkdir -p \\\"$LOG_DIR\\\"; LOG_PATH=\\\"$LOG_DIR/$IID.log\\\"; fi; "
+            "if [ -n \\\"$LOG_PATH\\\" ]; then "
             "exec nice -n 10 ionice -c3 "
             f"{gs}"
-            f"\\\"{proton_bin}\\\" run \\\"$GAME\\\"\""
+            f"\\\"{proton_bin}\\\" run \\\"$GAME\\\" >\\\"$LOG_PATH\\\" 2>&1; "
+            "else "
+            "exec nice -n 10 ionice -c3 "
+            f"{gs}"
+            f"\\\"{proton_bin}\\\" run \\\"$GAME\\\"; "
+            "fi\""
         )
 
     procs: List[Proc] = []

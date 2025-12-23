@@ -7,6 +7,7 @@ aims for compatibility and forwards-extensibility.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict, Optional, Union
 
@@ -28,6 +29,8 @@ class MBBaseModel(BaseModel):
 
     class Config:
         extra = "allow"
+
+HEARTBEAT_SCHEMA_VERSION = int(os.environ.get("METABONK_HEARTBEAT_SCHEMA_VERSION", "2"))
 
 
 class TrainerConfig(MBBaseModel):
@@ -63,6 +66,7 @@ class InstanceConfig(MBBaseModel):
 
 
 class Heartbeat(MBBaseModel):
+    schema_version: int = Field(default=HEARTBEAT_SCHEMA_VERSION, ge=1)
     run_id: Optional[str] = None
     instance_id: str
     policy_name: Optional[str] = None
@@ -96,6 +100,8 @@ class Heartbeat(MBBaseModel):
     stream_active_clients: Optional[int] = None
     stream_max_clients: Optional[int] = None
     stream_fps: Optional[float] = None
+    stream_keyframe_ts: Optional[float] = None
+    stream_keyframe_count: Optional[int] = None
     stream_frame_var: Optional[float] = None
     stream_black_since_s: Optional[float] = None
     launcher_pid: Optional[int] = None
@@ -110,6 +116,8 @@ class Heartbeat(MBBaseModel):
     go2rtc_stream_name: Optional[str] = None
     go2rtc_base_url: Optional[str] = None
     pipewire_node_ok: Optional[bool] = None
+    pipewire_ok: Optional[bool] = None
+    pipewire_session_ok: Optional[bool] = None
     # Optional control base URL (for clip triggers, etc.)
     control_url: Optional[str] = None
     # Spectator selection (set by orchestrator).
@@ -136,6 +144,9 @@ class Heartbeat(MBBaseModel):
     obs_fps: Optional[float] = None
     act_hz: Optional[float] = None
     action_entropy: Optional[float] = None
+    bonk_confidence: Optional[float] = None
+    menu_doom_spiral: Optional[float] = None
+    chat_influence: Optional[float] = None
     stuck: Optional[dict[str, Any]] = None
     errors_recent: Optional[list[dict[str, Any]]] = None
     # Sponsor overlay (community agency).

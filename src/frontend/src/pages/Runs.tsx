@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
+import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
 import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
@@ -76,6 +78,8 @@ export default function Runs() {
   const selectedRun = useMemo(() => filtered.find((r) => String(r.run_id) === String(selected)) ?? null, [filtered, selected]);
   const activeCount = useMemo(() => runs.filter((r) => String(r.status ?? "").toLowerCase() !== "completed").length, [runs]);
   const bestOverall = useMemo(() => runs.reduce((m, r) => Math.max(m, Number(r.best_reward ?? 0)), 0), [runs]);
+  const newestTs = useMemo(() => (runs.length ? runs.reduce((m, r) => Math.max(m, Number(r.updated_ts ?? 0)), 0) : null), [runs]);
+  const dataAge = newestTs != null ? Date.now() / 1000 - newestTs : null;
 
   const compareRuns = useMemo(() => (compareQ.data?.runs ?? []).map((r) => r.run_id), [compareQ.data]);
   const metricsByRun = useMemo(() => {
@@ -104,6 +108,50 @@ export default function Runs() {
       if (prev.includes(runId)) return prev.filter((id) => id !== runId);
       return [...prev, runId];
     });
+  };
+
+  const RunRow = ({ index, style }: ListChildComponentProps) => {
+    const r = filtered[index];
+    const isSelected = String(selectedRun?.run_id) === String(r.run_id);
+    return (
+      <div
+        style={style}
+        className={`v-row ${isSelected ? "active" : ""}`}
+        onClick={() => setSelected(r.run_id)}
+      >
+        {compareMode && (
+          <div className="v-cell" style={{ width: 40, justifyContent: "center" }}>
+            <input
+              type="checkbox"
+              checked={compareSelection.includes(r.run_id)}
+              onChange={() => toggleCompare(r.run_id)}
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        )}
+        <div className="v-cell mono" style={{ flex: 1.2 }} title={r.run_id}>
+          {r.run_id}
+        </div>
+        <div className="v-cell mono" style={{ flex: 1.5 }} title={r.experiment_id}>
+          {r.experiment_id}
+        </div>
+        <div className="v-cell" style={{ width: 100 }}>
+          <span className="pill">{r.status}</span>
+        </div>
+        <div className="v-cell numeric" style={{ width: 80 }}>
+          {fmtFixed(r.best_reward, 2)}
+        </div>
+        <div className="v-cell numeric" style={{ width: 80 }}>
+          {fmtFixed(r.last_reward, 2)}
+        </div>
+        <div className="v-cell numeric" style={{ width: 80 }}>
+          {fmtNum(r.last_step)}
+        </div>
+        <div className="v-cell muted numeric" style={{ width: 100 }}>
+          {timeAgo(r.updated_ts)}
+        </div>
+      </div>
+    );
   };
 
   const miniSeries = (series: RunMetricSeries | undefined) => {
@@ -155,7 +203,7 @@ export default function Runs() {
           <RunsCoreViz />
         </div>
       </section>
-      <section className="card">
+      <section className="card flex-card">
         <div className="row-between">
           <h2>Runs</h2>
           <span className="badge">{fmtNum(filtered.length)} shown</span>
@@ -195,6 +243,9 @@ export default function Runs() {
             </button>
           </div>
           <div className="toolbar-right">
+            <span className={`pill ${dataAge != null && dataAge > 30 ? "pill-missing" : "pill-ok"}`}>
+              data age {dataAge == null || newestTs == null ? "—" : timeAgo(newestTs)}
+            </span>
             <button
               className="btn btn-ghost"
               onClick={async () => {
@@ -208,57 +259,32 @@ export default function Runs() {
           </div>
         </div>
 
-        <table className="table table-hover" style={{ marginTop: 10 }}>
-          <thead>
-            <tr>
-              {compareMode ? <th /> : null}
-              <th>Run</th>
-              <th>Experiment</th>
-              <th>Status</th>
-              <th>Best</th>
-              <th>Last</th>
-              <th>Step</th>
-              <th>Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((r) => (
-              <tr
-                key={r.run_id}
-                className={String(selectedRun?.run_id) === String(r.run_id) ? "active" : ""}
-                onClick={() => setSelected(r.run_id)}
-                style={{ cursor: "pointer" }}
-              >
-                {compareMode ? (
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={compareSelection.includes(r.run_id)}
-                      onChange={() => toggleCompare(r.run_id)}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </td>
-                ) : null}
-                <td className="mono">{r.run_id}</td>
-                <td className="mono">{r.experiment_id}</td>
-                <td>
-                  <span className="pill">{r.status}</span>
-                </td>
-                <td>{fmtFixed(r.best_reward, 2)}</td>
-                <td>{fmtFixed(r.last_reward, 2)}</td>
-                <td>{fmtNum(r.last_step)}</td>
-                <td className="muted">{timeAgo(r.updated_ts)}</td>
-              </tr>
-            ))}
-            {!filtered.length && (
-              <tr>
-                <td colSpan={compareMode ? 8 : 7} className="muted">
-                  no runs yet
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <div className="v-table-header" style={{ marginTop: 10 }}>
+          {compareMode && <div style={{ width: 40 }} />}
+          <div style={{ flex: 1.2 }}>Run</div>
+          <div style={{ flex: 1.5 }}>Experiment</div>
+          <div style={{ width: 100 }}>Status</div>
+          <div style={{ width: 80, textAlign: "right" }}>Best</div>
+          <div style={{ width: 80, textAlign: "right" }}>Last</div>
+          <div style={{ width: 80, textAlign: "right" }}>Step</div>
+          <div style={{ width: 100, textAlign: "right" }}>Updated</div>
+        </div>
+
+        <div className="v-table-body" style={{ flex: 1, minHeight: 0 }}>
+          {filtered.length ? (
+            <AutoSizer>
+              {({ height, width }) => (
+                <List height={height} width={width} itemCount={filtered.length} itemSize={42}>
+                  {RunRow}
+                </List>
+              )}
+            </AutoSizer>
+          ) : (
+            <div className="muted" style={{ marginTop: 8 }}>
+              no runs yet
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="card">
@@ -269,14 +295,18 @@ export default function Runs() {
         {compareMode ? (
           <>
             {compareSelection.length < 2 ? (
-              <div className="muted" style={{ marginTop: 10 }}>Select at least 2 runs to compare.</div>
+              <div className="muted" style={{ marginTop: 10 }}>
+                Select at least 2 runs to compare.
+              </div>
             ) : (
               <>
                 <div className="panel" style={{ marginTop: 10 }}>
                   <div className="muted">Compared runs</div>
                   <div className="statline">
                     {compareRuns.map((rid) => (
-                      <span key={rid} className="chip">{rid}</span>
+                      <span key={rid} className="chip">
+                        {rid}
+                      </span>
                     ))}
                   </div>
                 </div>

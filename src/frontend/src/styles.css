@@ -783,6 +783,7 @@ body::before{
   pointer-events:none;
 }
 .card > * { position: relative; z-index: 1; }
+.flex-card{ display: flex; flex-direction: column; min-height: 0; }
 .kpis { display: flex; gap: 12px; }
 .kpis-wrap { flex-wrap: wrap; }
 .kpi { background: #0f1418; padding: 10px; border-radius: 8px; min-width: 120px; }
@@ -808,6 +809,40 @@ body::before{
 .table-compact th, .table-compact td { padding: 6px; font-size: 13px; }
 .table-hover tbody tr:hover td { background: #0c141b; }
 .table tr.active td { background: #0c1a24; }
+.table-viewport { max-height: 520px; overflow: auto; border: 1px solid #151b22; border-radius: 10px; }
+.table-virtual .table-header-row th { position: sticky; top: 0; background: #0b1116; z-index: 2; }
+.table-virtual .table-spacer td { padding: 0; border-bottom: 0; }
+.v-table-header{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: rgba(255,255,255,.7);
+  padding: 8px 6px;
+  border-bottom: 1px solid #1b1f22;
+}
+.v-table-header > div{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v-table-body{ min-height: 0; }
+.v-row{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px;
+  border-bottom: 1px solid #1b1f22;
+  cursor: pointer;
+  height: 100%;
+}
+.v-row:hover{ background: #0c141b; }
+.v-row.active{ background: #0c1a24; }
+.v-cell{ display: flex; align-items: center; min-width: 0; gap: 6px; }
+.v-cell.numeric{
+  justify-content: flex-end;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+.v-row .mono{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lb-lane-head{ width: 14px; }
 .lb-lane{
   width: 14px;
@@ -1578,6 +1613,20 @@ body::before{
   -webkit-text-stroke: 1px rgba(0,0,0,.85);
   text-shadow: 0 3px 0 rgba(0,0,0,.85);
   animation: valueSlam 280ms cubic-bezier(.2,1.2,.2,1) 1;
+}
+.stream-alert {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: rgba(255, 196, 120, 0.12);
+  border: 1px solid rgba(255, 196, 120, 0.25);
+  color: rgba(255, 226, 190, 0.95);
+}
+.stream-alert-danger {
+  background: rgba(255, 102, 72, 0.16);
+  border-color: rgba(255, 102, 72, 0.32);
+  color: rgba(255, 205, 190, 0.98);
 }
 
 .fuse-wrap{ margin-top: 0; }

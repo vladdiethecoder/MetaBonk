@@ -20,7 +20,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import List, Optional, TYPE_CHECKING
+from typing import Deque, List, Optional, TYPE_CHECKING
 
 try:
     import requests
@@ -39,7 +39,7 @@ except Exception as e:  # pragma: no cover
 else:
     _import_error = None
 
-from src.common.schemas import CurriculumConfig, Heartbeat, InstanceConfig, TrainerConfig
+from src.common.schemas import CurriculumConfig, HEARTBEAT_SCHEMA_VERSION, Heartbeat, InstanceConfig, TrainerConfig
 from .launcher import GameLauncher
 from .stream import CaptureStream
 from .trainer import Trainer
@@ -176,6 +176,12 @@ class WorkerService:
         self._last_frame_var_ts: float = 0.0
         self._last_frame_var: Optional[float] = None
         self._black_frame_since: float = 0.0
+        self._obs_frame_times: Deque[float] = deque(maxlen=120)
+        self._obs_fps: Optional[float] = None
+        self._pipewire_health_ts: float = 0.0
+        self._pipewire_daemon_ok: Optional[bool] = None
+        self._pipewire_session_ok: Optional[bool] = None
+        self._menu_doom_score: float = 0.0
         self._game_restart_enabled = os.environ.get("METABONK_GAME_RESTART", "1") in ("1", "true", "True")
         self._game_restart_possible = _game_restart_possible()
         self._game_restart_count = 0
@@ -836,6 +842,7 @@ class WorkerService:
             return
         self._latest_jpeg_bytes = data
         self._latest_frame_ts = time.time()
+        self._record_obs_frame_ts(self._latest_frame_ts)
         try:
             import io
             from PIL import Image
@@ -848,6 +855,16 @@ class WorkerService:
             self._latest_thumb_b64 = base64.b64encode(buf_thumb.getvalue()).decode("ascii")
         except Exception:
             self._latest_thumb_b64 = None
+
+    def _record_obs_frame_ts(self, ts: float) -> None:
+        try:
+            self._obs_frame_times.append(float(ts))
+            if len(self._obs_frame_times) >= 2:
+                dt = float(self._obs_frame_times[-1]) - float(self._obs_frame_times[0])
+                if dt > 0:
+                    self._obs_fps = float((len(self._obs_frame_times) - 1) / dt)
+        except Exception:
+            pass
 
     def _record_flight_frame(
         self,
@@ -922,6 +939,15 @@ class WorkerService:
                 self._gameplay_start_ts = time.time()
         except Exception:
             return
+
+    def _update_menu_doom(self, menu_hint: Optional[bool]) -> None:
+        if menu_hint is None:
+            return
+        # Increment slowly while stuck in menus, decay faster when gameplay resumes.
+        if menu_hint:
+            self._menu_doom_score = min(100.0, float(self._menu_doom_score) + 1.8)
+        else:
+            self._menu_doom_score = max(0.0, float(self._menu_doom_score) - 3.6)
 
     def _flag_action_guard_violation(self, reason: str) -> None:
         if self._action_guard_violation:
@@ -1406,6 +1432,16 @@ class WorkerService:
         next_retry = 0.0
         while not self._stop.is_set():
             now = time.time()
+            if (now - float(self._pipewire_health_ts or 0.0)) >= 5.0:
+                try:
+                    self._pipewire_daemon_ok = bool(GameLauncher.pipewire_daemon_ok(timeout_s=0.4))
+                except Exception:
+                    self._pipewire_daemon_ok = None
+                try:
+                    self._pipewire_session_ok = bool(GameLauncher.pipewire_session_ok(timeout_s=0.4))
+                except Exception:
+                    self._pipewire_session_ok = None
+                self._pipewire_health_ts = now
             launcher_proc = getattr(self.launcher, "proc", None)
             launcher_pid = None
             launcher_alive = False
@@ -1565,12 +1601,45 @@ class WorkerService:
             vision_device = str(os.environ.get("METABONK_VISION_DEVICE", "") or "")
             learned_reward_device = str(os.environ.get("METABONK_LEARNED_REWARD_DEVICE", "") or "")
             reward_device = str(os.environ.get("METABONK_REWARD_DEVICE", "") or "")
+            stream_fps = None
+            stream_keyframe_ts = None
+            stream_keyframe_count = None
+            if self.streamer is not None:
+                try:
+                    stream_fps = float(getattr(self.streamer, "stream_fps", None)) if getattr(self.streamer, "stream_fps", None) is not None else None
+                except Exception:
+                    stream_fps = None
+                try:
+                    kts = float(getattr(self.streamer, "last_keyframe_ts", 0.0) or 0.0)
+                    stream_keyframe_ts = kts if kts > 0 else None
+                except Exception:
+                    stream_keyframe_ts = None
+                try:
+                    kc = int(getattr(self.streamer, "keyframe_count", 0) or 0)
+                    stream_keyframe_count = kc if kc > 0 else None
+                except Exception:
+                    stream_keyframe_count = None
+            action_entropy = None
+            try:
+                action_entropy = float(getattr(self.trainer, "last_entropy", None))
+            except Exception:
+                action_entropy = None
+            bonk_confidence = None
+            if action_entropy is not None:
+                try:
+                    entropy_max = float(os.environ.get("METABONK_ENTROPY_MAX", "3.0"))
+                except Exception:
+                    entropy_max = 3.0
+                if entropy_max <= 0:
+                    entropy_max = 3.0
+                bonk_confidence = max(0.0, min(1.0, 1.0 - float(action_entropy) / entropy_max))
             step_now = int(getattr(self.trainer, "step_count", 0) or 0)
             if step_now != self._last_step_seen:
                 self._last_step_seen = step_now
                 self._last_step_ts = now
             step_age_s = (now - self._last_step_ts) if self._last_step_ts > 0 else None
             hb = Heartbeat(
+                schema_version=int(HEARTBEAT_SCHEMA_VERSION),
                 run_id=os.environ.get("METABONK_RUN_ID"),
                 instance_id=self.instance_id,
                 policy_name=self.policy_name,
@@ -1594,6 +1663,9 @@ class WorkerService:
                 stream_backend=getattr(self.streamer, "backend", None) if self.streamer else None,
                 stream_active_clients=active_clients,
                 stream_max_clients=max_clients,
+                stream_fps=stream_fps,
+                stream_keyframe_ts=stream_keyframe_ts,
+                stream_keyframe_count=stream_keyframe_count,
                 stream_frame_var=self._last_frame_var,
                 stream_black_since_s=(now - self._black_frame_since) if self._black_frame_since > 0 else None,
                 fifo_stream_enabled=bool(getattr(self, "_fifo_stream_enabled", False)),
@@ -1602,6 +1674,8 @@ class WorkerService:
                 go2rtc_stream_name=self.instance_id,
                 go2rtc_base_url=os.environ.get("METABONK_GO2RTC_URL"),
                 pipewire_node_ok=bool(getattr(self, "_pipewire_node_ok", False)),
+                pipewire_ok=self._pipewire_daemon_ok,
+                pipewire_session_ok=self._pipewire_session_ok,
                 worker_device=worker_device or None,
                 vision_device=vision_device or None,
                 learned_reward_device=learned_reward_device or None,
@@ -1613,6 +1687,10 @@ class WorkerService:
                 game_restart_failed=self._game_restart_failed,
                 step_age_s=step_age_s,
                 control_url=self.control_url(),
+                obs_fps=self._obs_fps,
+                action_entropy=action_entropy,
+                bonk_confidence=bonk_confidence,
+                menu_doom_spiral=float(self._menu_doom_score),
             )
             if requests:
                 try:
@@ -1978,6 +2056,7 @@ class WorkerService:
                         self._latest_frame_ts = float(getattr(frame, "timestamp", 0.0) or time.time())
                     except Exception:
                         self._latest_frame_ts = time.time()
+                    self._record_obs_frame_ts(self._latest_frame_ts)
                     frame_size = (frame.width, frame.height)
                     if self.highlight and frame.cpu_rgb:
                         self.highlight.add_frame(frame.cpu_rgb, frame.width, frame.height)
@@ -2057,6 +2136,7 @@ class WorkerService:
                 menu_hint = True
 
             self._update_gameplay_state(menu_hint, game_state)
+            self._update_menu_doom(menu_hint)
 
             if menu_hint is not None and menu_hint != self._last_menu_mode_log:
                 try:

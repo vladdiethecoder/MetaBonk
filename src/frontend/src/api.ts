@@ -1,4 +1,5 @@
 export type Heartbeat = {
+  schema_version?: number | null;
   run_id?: string | null;
   instance_id: string;
   policy_name?: string | null;
@@ -44,12 +45,16 @@ export type Heartbeat = {
   stream_active_clients?: number | null;
   stream_max_clients?: number | null;
   stream_fps?: number | null;
+  stream_keyframe_ts?: number | null;
+  stream_keyframe_count?: number | null;
   fifo_stream_enabled?: boolean | null;
   fifo_stream_path?: string | null;
   fifo_stream_last_error?: string | null;
   go2rtc_stream_name?: string | null;
   go2rtc_base_url?: string | null;
   pipewire_node_ok?: boolean | null;
+  pipewire_ok?: boolean | null;
+  pipewire_session_ok?: boolean | null;
   worker_device?: string | null;
   vision_device?: string | null;
   learned_reward_device?: string | null;
@@ -61,6 +66,9 @@ export type Heartbeat = {
   sponsor_user?: string | null;
   sponsor_user_id?: string | null;
   sponsor_avatar_url?: string | null;
+  bonk_confidence?: number | null;
+  menu_doom_spiral?: number | null;
+  chat_influence?: number | null;
   ts: number;
 };
 
@@ -207,6 +215,7 @@ export type Event = {
   instance_id?: string | null;
   event_type: string;
   message: string;
+  step?: number | null;
   ts: number;
   payload?: Record<string, unknown>;
 };

@@ -5,6 +5,7 @@ import type { InstanceView } from "../api";
 import { contextDrawerEventName, ContextDrawerPayload } from "../hooks/useContextDrawer";
 import { useEventStream } from "../hooks/useEventStream";
 import { fmtNum, timeAgo } from "../lib/format";
+import { HEARTBEAT_SCHEMA_VERSION, schemaMismatchLabel } from "../lib/schema";
 
 type FlightEntry = {
   step_id: number;
@@ -45,6 +46,11 @@ export default function ContextDrawer() {
     const hist = instance?.telemetry?.history ?? [];
     if (!hist.length) return null;
     return hist[hist.length - 1];
+  }, [instance]);
+  const schemaMismatch = useMemo(() => {
+    const v = instance?.heartbeat?.schema_version;
+    if (v == null) return false;
+    return Number(v) !== HEARTBEAT_SCHEMA_VERSION;
   }, [instance]);
 
   const frameUrl = useMemo(() => {
@@ -160,7 +166,7 @@ export default function ContextDrawer() {
                 <div className="k">score</div>
                 <div className="v">{instance.heartbeat?.steam_score ?? instance.heartbeat?.reward ?? "—"}</div>
                 <div className="k">stream</div>
-                <div className="v">{instance.heartbeat?.stream_ok ? "ok" : "stale"}</div>
+                <div className="v">{schemaMismatch ? schemaMismatchLabel(instance?.heartbeat?.schema_version) : instance.heartbeat?.stream_ok ? "ok" : "stale"}</div>
               </div>
             </div>
           ) : null}

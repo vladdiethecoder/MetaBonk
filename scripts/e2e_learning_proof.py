@@ -158,6 +158,10 @@ def _orch_url(cfg: ProofConfig) -> str:
     return f"http://127.0.0.1:{cfg.orch_port}"
 
 
+def _env_truthy(val: Optional[str]) -> bool:
+    return str(val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _wait_for_workers(cfg: ProofConfig, timeout_s: float = 120.0) -> Dict[str, Any]:
     deadline = time.time() + timeout_s
     url = f"{_orch_url(cfg)}/workers"
@@ -761,25 +765,43 @@ def main() -> int:
             go2rtc_started = True
 
     omega_log = out_dir / "logs" / "start_omega.log"
+    env["METABONK_RUN_DIR"] = str(out_dir)
+    game_log_dir = out_dir / "logs" / "game"
+    game_log_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("MEGABONK_LOG_DIR", str(game_log_dir))
+    proton_log_dir = out_dir / "logs" / "proton"
+    proton_crash_dir = out_dir / "logs" / "proton_crash"
+    proton_log_dir.mkdir(parents=True, exist_ok=True)
+    proton_crash_dir.mkdir(parents=True, exist_ok=True)
+    env.setdefault("METABONK_PROTON_LOG", "1")
+    env.setdefault("METABONK_PROTON_LOG_DIR", str(proton_log_dir))
+    env.setdefault("METABONK_PROTON_CRASH_DIR", str(proton_crash_dir))
+    env.setdefault("METABONK_WINEDEBUG", "-all,+seh,+tid,+timestamp,+loaddll")
+    gamescope_enabled = _env_truthy(os.environ.get("METABONK_E2E_GAMESCOPE", "1"))
+    omega_cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "start_omega.py"),
+        "--mode",
+        "train",
+        "--workers",
+        str(cfg.workers),
+        "--orch-port",
+        str(cfg.orch_port),
+        "--worker-base-port",
+        str(cfg.worker_base_port),
+        "--instance-prefix",
+        cfg.instance_prefix,
+        "--stream-backend",
+        cfg.stream_backend,
+        "--game-dir",
+        cfg.game_dir,
+    ]
+    if gamescope_enabled:
+        omega_cmd.append("--gamescope")
+    else:
+        omega_cmd.append("--no-gamescope")
     omega = _run(
-        [
-            sys.executable,
-            str(REPO_ROOT / "scripts" / "start_omega.py"),
-            "--mode",
-            "train",
-            "--workers",
-            str(cfg.workers),
-            "--orch-port",
-            str(cfg.orch_port),
-            "--worker-base-port",
-            str(cfg.worker_base_port),
-            "--instance-prefix",
-            cfg.instance_prefix,
-            "--stream-backend",
-            cfg.stream_backend,
-            "--game-dir",
-            cfg.game_dir,
-        ],
+        omega_cmd,
         cwd=REPO_ROOT,
         env=env,
         stdout=omega_log,

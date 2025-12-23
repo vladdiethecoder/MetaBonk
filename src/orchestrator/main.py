@@ -21,6 +21,7 @@ import time
 from collections import deque
 from typing import Dict, Optional
 import json
+import hashlib
 import itertools
 from dataclasses import asdict
 from pathlib import Path
@@ -68,6 +69,7 @@ from src.common.schemas import (
     ACEEpisodeReport,
     ACERevertRequest,
     CurriculumConfig,
+    HEARTBEAT_SCHEMA_VERSION,
     Heartbeat,
     InstanceConfig,
 )
@@ -370,23 +372,68 @@ def _sparkline(hist: list[dict[str, Any]], key: str, limit: int = 24) -> list[fl
     return vals[-limit:]
 
 
+def _chat_influence_index(iid: str, entropy: Optional[float], now: float) -> Optional[float]:
+    if not iid:
+        return None
+    if not _chat_spike_times:
+        return 0.0
+    try:
+        window_s = float(os.environ.get("METABONK_CHAT_INFLUENCE_WINDOW_S", "15.0"))
+    except Exception:
+        window_s = 15.0
+    if window_s <= 0:
+        return 0.0
+    try:
+        last_spike = float(_chat_spike_times[-1])
+    except Exception:
+        return 0.0
+    if (now - last_spike) > window_s:
+        return 0.0
+    if entropy is None:
+        return 0.2
+    baseline = None
+    try:
+        hist = _history_snapshot(iid, limit=20)
+        vals = [float(r.get("action_entropy")) for r in hist if r.get("action_entropy") is not None]
+        if vals:
+            vals.sort()
+            baseline = vals[len(vals) // 2]
+    except Exception:
+        baseline = None
+    base = float(baseline if baseline is not None else entropy)
+    if base <= 0:
+        base = 1.0
+    delta = float(entropy) - base
+    score = 0.5 + 0.5 * (delta / base)
+    return max(0.0, min(1.0, score))
+
+
 _ISSUE_HINTS: dict[str, str] = {
     "STREAM_MISSING_NO_PIPEWIRE": "Check PipeWire + streamer service.",
+    "STREAM_MISSING_SESSION": "PipeWire session manager missing (WirePlumber).",
     "STREAM_MISSING_NO_URL": "Streamer not reporting URL.",
     "STREAM_STALE_NO_FRAMES": "Encoder stalled; restart stream pipeline.",
+    "STREAM_NO_KEYFRAME": "No keyframes; encoder stalled or GOP mis-set.",
     "WORKER_OFFLINE": "Worker heartbeat stopped.",
     "WORKER_CRASHED": "Check last crash logs.",
     "INVENTORY_EMPTY": "Bridge inventory feed missing.",
     "STUCK_MENU": "Game stuck in menus; verify input hook.",
     "STREAM_MAX_CLIENTS": "Stream maxed out; reduce consumers.",
+    "HEARTBEAT_SCHEMA_MISMATCH": "Heartbeat schema mismatch; update worker or UI.",
 }
+
+_ISSUE_LOCK = threading.Lock()
+_ISSUE_REGISTRY: dict[str, dict[str, Any]] = {}
+_ISSUE_TTL_S = float(os.environ.get("METABONK_ISSUE_TTL_S", "900.0"))
+_ISSUE_MUTE_DEFAULT_S = float(os.environ.get("METABONK_ISSUE_MUTE_S", "600.0"))
+_ISSUE_ACK_DEFAULT_S = float(os.environ.get("METABONK_ISSUE_ACK_S", "900.0"))
 
 
 def _issue_severity(code: str) -> str:
     c = code.upper()
-    if "CRASH" in c or "PIPEWIRE" in c:
+    if "CRASH" in c or "PIPEWIRE" in c or "SCHEMA" in c:
         return "high"
-    if "MISSING" in c or "STUCK" in c or "STALE" in c:
+    if "MISSING" in c or "STUCK" in c or "STALE" in c or "KEYFRAME" in c:
         return "medium"
     return "low"
 
@@ -394,6 +441,12 @@ def _issue_severity(code: str) -> str:
 def _derive_reason_code_backend(hb: Heartbeat) -> Optional[str]:
     if hb is None:
         return None
+    try:
+        sv = getattr(hb, "schema_version", None)
+        if sv is not None and int(sv) != int(HEARTBEAT_SCHEMA_VERSION):
+            return "HEARTBEAT_SCHEMA_MISMATCH"
+    except Exception:
+        pass
     status = str(getattr(hb, "status", "") or "").lower()
     if status and status != "running":
         if "crash" in status:
@@ -401,12 +454,34 @@ def _derive_reason_code_backend(hb: Heartbeat) -> Optional[str]:
         if "offline" in status:
             return "WORKER_OFFLINE"
         return f"WORKER_{status.upper()}"
-    if bool(getattr(hb, "pipewire_node_ok", True)) is False or "no_pipewire" in status:
+    if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False or "no_pipewire" in status:
         return "STREAM_MISSING_NO_PIPEWIRE"
+    if bool(getattr(hb, "pipewire_session_ok", True)) is False:
+        return "STREAM_MISSING_SESSION"
     if not getattr(hb, "stream_url", None):
         return "STREAM_MISSING_NO_URL"
     if getattr(hb, "stream_ok", None) is False:
         return "STREAM_STALE_NO_FRAMES"
+    try:
+        key_ttl = float(os.environ.get("METABONK_STREAM_KEYFRAME_TTL_S", "12.0"))
+    except Exception:
+        key_ttl = 12.0
+    if key_ttl > 0 and bool(getattr(hb, "stream_ok", False)):
+        now = time.time()
+        kts = getattr(hb, "stream_keyframe_ts", None)
+        lts = getattr(hb, "stream_last_frame_ts", None)
+        if kts is not None:
+            try:
+                if (now - float(kts)) > key_ttl:
+                    return "STREAM_NO_KEYFRAME"
+            except Exception:
+                pass
+        elif lts is not None:
+            try:
+                if (now - float(lts)) > key_ttl:
+                    return "STREAM_NO_KEYFRAME"
+            except Exception:
+                pass
     # Stream max clients reached (optional telemetry).
     try:
         active = int(getattr(hb, "stream_active_clients", 0) or 0)
@@ -438,17 +513,77 @@ def _classify_event_issue(ev: Event) -> Optional[str]:
     return None
 
 
-def _collect_issues(window_s: float = 600.0) -> list[dict[str, Any]]:
-    now = time.time()
-    issues: dict[str, dict[str, Any]] = {}
+def _issue_fingerprint(
+    code: str,
+    *,
+    instance_id: Optional[str],
+    run_id: Optional[str],
+    source: str,
+    message: Optional[str] = None,
+    event_type: Optional[str] = None,
+) -> str:
+    base = f"{code}|{instance_id or ''}|{run_id or ''}|{source}|{event_type or ''}|{(message or '')[:120].lower()}"
+    digest = hashlib.md5(base.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"iss-{digest}"
 
-    def _push(code: str, iid: Optional[str], ts: Optional[float]):
-        if not code:
-            return
-        rec = issues.get(code)
-        if rec is None:
-            rec = {
-                "id": code,
+
+def _issue_evidence(payload: Optional[dict], hb: Optional[Heartbeat]) -> list[dict[str, Any]]:
+    evid: list[dict[str, Any]] = []
+    if isinstance(payload, dict):
+        for key, kind in (
+            ("clip_url", "clip"),
+            ("clipUrl", "clip"),
+            ("log_url", "log"),
+            ("trace_url", "trace"),
+            ("snapshot_url", "snapshot"),
+            ("frame_url", "frame"),
+            ("metrics_url", "metrics"),
+        ):
+            url = payload.get(key)
+            if url:
+                evid.append({"kind": kind, "url": str(url), "label": str(kind)})
+    if hb is not None:
+        try:
+            su = getattr(hb, "stream_url", None)
+            if su:
+                evid.append({"kind": "stream", "url": str(su), "label": "stream"})
+        except Exception:
+            pass
+        try:
+            base = getattr(hb, "control_url", None)
+            if base:
+                evid.append({"kind": "frame", "url": f"{str(base).rstrip('/')}/frame.jpg", "label": "frame.jpg"})
+        except Exception:
+            pass
+    # Dedupe by URL.
+    seen = set()
+    out: list[dict[str, Any]] = []
+    for e in evid:
+        u = e.get("url")
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(e)
+    return out
+
+
+def _collect_issues(window_s: float = 600.0, include_muted: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    ttl_s = max(30.0, float(_ISSUE_TTL_S or 0.0))
+    with _ISSUE_LOCK:
+        # Refresh from heartbeats.
+        for hb in workers.values():
+            code = _derive_reason_code_backend(hb)
+            if not code:
+                continue
+            iid = getattr(hb, "instance_id", None)
+            rid = getattr(hb, "run_id", None)
+            ts = float(getattr(hb, "ts", now) or now)
+            fp = _issue_fingerprint(code, instance_id=iid, run_id=rid, source="heartbeat")
+            rec = _ISSUE_REGISTRY.get(fp) or {
+                "id": fp,
+                "fingerprint": fp,
+                "code": code,
                 "label": code.replace("_", " "),
                 "severity": _issue_severity(code),
                 "count": 0,
@@ -456,38 +591,92 @@ def _collect_issues(window_s: float = 600.0) -> list[dict[str, Any]]:
                 "first_seen": ts,
                 "last_seen": ts,
                 "hint": _ISSUE_HINTS.get(code),
+                "ack_until": None,
+                "muted_until": None,
+                "source": "heartbeat",
+                "evidence": [],
             }
-        rec["count"] = int(rec.get("count", 0)) + 1
-        if iid and iid not in rec["instances"]:
-            rec["instances"].append(iid)
-        if ts is not None:
+            rec["count"] = int(rec.get("count", 0)) + 1
+            if iid and iid not in rec["instances"]:
+                rec["instances"].append(iid)
             rec["first_seen"] = ts if rec.get("first_seen") is None else min(rec.get("first_seen"), ts)
             rec["last_seen"] = ts if rec.get("last_seen") is None else max(rec.get("last_seen"), ts)
-        issues[code] = rec
+            rec["run_id"] = rid
+            rec["step"] = getattr(hb, "step", None)
+            rec["ts"] = ts
+            rec["evidence"] = _issue_evidence({}, hb)
+            _ISSUE_REGISTRY[fp] = rec
 
-    for hb in workers.values():
-        code = _derive_reason_code_backend(hb)
-        if code:
-            _push(code, getattr(hb, "instance_id", None), getattr(hb, "ts", now))
+        # Refresh from events.
+        for ev in events:
+            if window_s > 0 and (now - float(ev.ts or 0.0)) > window_s:
+                continue
+            code = _classify_event_issue(ev)
+            if not code:
+                continue
+            iid = getattr(ev, "instance_id", None)
+            rid = getattr(ev, "run_id", None)
+            ts = float(ev.ts or now)
+            fp = _issue_fingerprint(
+                code,
+                instance_id=iid,
+                run_id=rid,
+                source="event",
+                message=str(getattr(ev, "message", "") or ""),
+                event_type=str(getattr(ev, "event_type", "") or ""),
+            )
+            rec = _ISSUE_REGISTRY.get(fp) or {
+                "id": fp,
+                "fingerprint": fp,
+                "code": code,
+                "label": code.replace("_", " "),
+                "severity": _issue_severity(code),
+                "count": 0,
+                "instances": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "hint": _ISSUE_HINTS.get(code),
+                "ack_until": None,
+                "muted_until": None,
+                "source": "event",
+                "evidence": [],
+            }
+            rec["count"] = int(rec.get("count", 0)) + 1
+            if iid and iid not in rec["instances"]:
+                rec["instances"].append(iid)
+            rec["first_seen"] = ts if rec.get("first_seen") is None else min(rec.get("first_seen"), ts)
+            rec["last_seen"] = ts if rec.get("last_seen") is None else max(rec.get("last_seen"), ts)
+            rec["run_id"] = rid
+            rec["step"] = getattr(ev, "step", None) or (ev.payload or {}).get("step")
+            rec["ts"] = ts
+            rec["evidence"] = _issue_evidence(ev.payload or {}, workers.get(str(iid)) if iid else None)
+            _ISSUE_REGISTRY[fp] = rec
 
-    for ev in events:
-        if window_s > 0 and (now - float(ev.ts or 0.0)) > window_s:
-            continue
-        code = _classify_event_issue(ev)
-        if code:
-            _push(code, getattr(ev, "instance_id", None), getattr(ev, "ts", None))
+        # Prune stale.
+        prune_keys = [k for k, v in _ISSUE_REGISTRY.items() if (now - float(v.get("last_seen") or 0.0)) > ttl_s]
+        for k in prune_keys:
+            _ISSUE_REGISTRY.pop(k, None)
 
-    def _impact(rec: dict[str, Any]) -> float:
-        sev = {"high": 3.0, "medium": 2.0, "low": 1.0}.get(str(rec.get("severity")), 1.0)
-        cnt = float(rec.get("count") or 0.0)
-        first = rec.get("first_seen") or now
-        last = rec.get("last_seen") or now
-        dur = max(0.0, float(last) - float(first))
-        return sev * (1.0 + cnt) * (1.0 + dur / 60.0)
+        def _impact(rec: dict[str, Any]) -> float:
+            sev = {"high": 3.0, "medium": 2.0, "low": 1.0}.get(str(rec.get("severity")), 1.0)
+            cnt = float(rec.get("count") or 0.0)
+            first = rec.get("first_seen") or now
+            last = rec.get("last_seen") or now
+            dur = max(0.0, float(last) - float(first))
+            return sev * (1.0 + cnt) * (1.0 + dur / 60.0)
 
-    out = list(issues.values())
-    out.sort(key=_impact, reverse=True)
-    return out
+        out = []
+        for rec in _ISSUE_REGISTRY.values():
+            muted_until = rec.get("muted_until")
+            if not include_muted and muted_until is not None and float(muted_until) > now:
+                continue
+            rec["ttl_s"] = ttl_s
+            rec["muted"] = bool(muted_until is not None and float(muted_until) > now)
+            ack_until = rec.get("ack_until")
+            rec["acknowledged"] = bool(ack_until is not None and float(ack_until) > now)
+            out.append(rec)
+        out.sort(key=_impact, reverse=True)
+        return out
 
 
 def _build_db_path() -> Path:
@@ -860,11 +1049,14 @@ survival.load()
 
 # Per-instance clutch tracking.
 _clutch_state: Dict[str, Dict[str, Any]] = {}
+_weird_build_state: Dict[str, float] = {}
+_disaster_state: Dict[str, float] = {}
 CLUTCH_THRESHOLD = float(os.environ.get("METABONK_CLUTCH_THRESHOLD", "0.01"))  # 1%
 RED_ZONE_THRESHOLD = float(os.environ.get("METABONK_RED_ZONE_THRESHOLD", "0.10"))  # 10%
 
 # Fun stats (luck gauge, borgar count, etc.) per instance.
 _fun_stats: Dict[str, FunStats] = {}
+_chat_spike_times: deque[float] = deque(maxlen=200)
 _overrun_state: Dict[str, bool] = {}
 
 # Stream selection hype tracker (0..100), derived from events + danger.
@@ -1826,6 +2018,31 @@ def _worker_base_url(hb: Heartbeat) -> Optional[str]:
         return None
 
 
+def _request_clip(hb: Heartbeat, *, tag: str, speed: Optional[float] = None) -> Optional[str]:
+    if not requests or hb is None:
+        return None
+    base = _worker_base_url(hb)
+    if not base:
+        return None
+    if speed is None:
+        try:
+            speed = float(os.environ.get("METABONK_HIGHLIGHT_SPEED", "2.5"))
+        except Exception:
+            speed = 2.5
+    try:
+        r = requests.post(
+            f"{base}/highlight/encode",
+            json={"tag": tag, "speed": float(speed)},
+            timeout=2.5,
+        )
+        if r.ok:
+            data = r.json() or {}
+            return data.get("clip_url")
+    except Exception:
+        return None
+    return None
+
+
 def _maybe_trigger_clutch(instance_id: str, p: float, ts: float) -> Optional[dict]:
     st = _clutch_state.setdefault(instance_id, {})
     armed = bool(st.get("armed"))
@@ -1894,6 +2111,25 @@ def _handle_survival_telemetry(ev: Event) -> None:
                         instance_id=iid,
                         payload={"incoming_dps": float(inc), "clearing_dps": float(clr), "pressure": pressure},
                     )
+                    try:
+                        cooldown = float(os.environ.get("METABONK_DISASTER_COOLDOWN_S", "60.0"))
+                    except Exception:
+                        cooldown = 60.0
+                    try:
+                        threshold = float(os.environ.get("METABONK_DISASTER_PRESSURE", "2.0"))
+                    except Exception:
+                        threshold = 2.0
+                    last_ts = float(_disaster_state.get(iid, 0.0) or 0.0)
+                    if pressure >= threshold and (ts - last_ts) >= max(5.0, cooldown):
+                        clip_url = _request_clip(hb, tag="disaster") if hb is not None else None
+                        emit_event(
+                            "Disaster",
+                            f"{iid} DISASTER (pressure {pressure:.2f})",
+                            run_id=ev.run_id,
+                            instance_id=iid,
+                            payload={"pressure": pressure, "clip_url": clip_url},
+                        )
+                        _disaster_state[iid] = ts
                 elif (not overrun) and prev:
                     emit_event(
                         "OverrunEnd",
@@ -1909,6 +2145,33 @@ def _handle_survival_telemetry(ev: Event) -> None:
             inv = payload.get("inventory_items")
             if isinstance(inv, list):
                 hb.inventory_items = inv  # type: ignore[assignment]
+                try:
+                    cooldown = float(os.environ.get("METABONK_WEIRD_BUILD_COOLDOWN_S", "120.0"))
+                except Exception:
+                    cooldown = 120.0
+                last_ts = float(_weird_build_state.get(iid, 0.0) or 0.0)
+                if inv and (ts - last_ts) >= max(10.0, cooldown):
+                    rare = 0
+                    kinds: set[str] = set()
+                    for it in inv:
+                        if not isinstance(it, dict):
+                            continue
+                        rarity = str(it.get("rarity") or it.get("tier") or "").lower()
+                        if any(tag in rarity for tag in ("legendary", "mythic", "epic", "tier4", "tier5")):
+                            rare += 1
+                        kind = str(it.get("kind") or it.get("type") or it.get("category") or "")
+                        if kind:
+                            kinds.add(kind.lower())
+                    if rare >= 3 or (len(inv) >= 6 and len(kinds) >= 4):
+                        clip_url = _request_clip(hb, tag="weird_build") if hb is not None else None
+                        emit_event(
+                            "WeirdBuild",
+                            f"{iid} WEIRD BUILD ({rare} rares, {len(kinds)} kinds)",
+                            run_id=ev.run_id,
+                            instance_id=iid,
+                            payload={"rare_count": rare, "kind_count": len(kinds), "clip_url": clip_url},
+                        )
+                        _weird_build_state[iid] = ts
         except Exception:
             pass
         try:
@@ -2470,6 +2733,46 @@ if app:
         window = max(60.0, window)
         return _collect_issues(window_s=window)
 
+    @app.post("/issues/ack")
+    def issues_ack(req: dict):
+        issue_id = str(req.get("id") or req.get("fingerprint") or "")
+        if not issue_id:
+            raise HTTPException(status_code=400, detail="id required")
+        try:
+            ttl_s = float(req.get("ttl_s") or _ISSUE_ACK_DEFAULT_S)
+        except Exception:
+            ttl_s = float(_ISSUE_ACK_DEFAULT_S)
+        now = time.time()
+        with _ISSUE_LOCK:
+            rec = _ISSUE_REGISTRY.get(issue_id)
+            if rec is None:
+                raise HTTPException(status_code=404, detail="issue not found")
+            rec["ack_until"] = now + max(0.0, ttl_s)
+            _ISSUE_REGISTRY[issue_id] = rec
+        return {"ok": True, "ack_until": rec.get("ack_until")}
+
+    @app.post("/issues/mute")
+    def issues_mute(req: dict):
+        issue_id = str(req.get("id") or req.get("fingerprint") or "")
+        if not issue_id:
+            raise HTTPException(status_code=400, detail="id required")
+        muted = req.get("muted")
+        try:
+            ttl_s = float(req.get("ttl_s") or _ISSUE_MUTE_DEFAULT_S)
+        except Exception:
+            ttl_s = float(_ISSUE_MUTE_DEFAULT_S)
+        now = time.time()
+        with _ISSUE_LOCK:
+            rec = _ISSUE_REGISTRY.get(issue_id)
+            if rec is None:
+                raise HTTPException(status_code=404, detail="issue not found")
+            if muted is False or ttl_s <= 0:
+                rec["muted_until"] = None
+            else:
+                rec["muted_until"] = now + max(0.0, ttl_s)
+            _ISSUE_REGISTRY[issue_id] = rec
+        return {"ok": True, "muted_until": rec.get("muted_until")}
+
     @app.get("/attract/highlights")
     def attract_highlights():
         """Return best-effort Hall-of-Fame and Wall-of-Shame clip selections."""
@@ -2787,6 +3090,22 @@ if app:
         except Exception:
             pass
         worker_last_seen[hb.instance_id] = now
+        try:
+            if getattr(hb, "bonk_confidence", None) is None and getattr(hb, "action_entropy", None) is not None:
+                ent = float(getattr(hb, "action_entropy"))
+                try:
+                    ent_max = float(os.environ.get("METABONK_ENTROPY_MAX", "3.0"))
+                except Exception:
+                    ent_max = 3.0
+                if ent_max <= 0:
+                    ent_max = 3.0
+                hb.bonk_confidence = max(0.0, min(1.0, 1.0 - ent / ent_max))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            hb.chat_influence = _chat_influence_index(str(hb.instance_id), getattr(hb, "action_entropy", None), now)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         workers[hb.instance_id] = _with_sponsor_fields(hb)
         _prune_stale_workers(now=now)
         # Track continuous "GPU stream ready" time for warm-up gating.
@@ -3241,6 +3560,11 @@ if app:
         events.append(ev)
         if len(events) > MAX_EVENTS:
             del events[: len(events) - MAX_EVENTS]
+        try:
+            if str(ev.event_type or "") == "ChatSpike":
+                _chat_spike_times.append(float(ev.ts or time.time()))
+        except Exception:
+            pass
         # Side effects (real data only).
         try:
             if ev.event_type == "Telemetry":

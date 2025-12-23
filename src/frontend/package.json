@@ -9,8 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@react-three/postprocessing": "^2.16.1",
     "@react-three/fiber": "^8.17.10",
+    "@react-three/postprocessing": "^2.16.1",
     "@tanstack/react-query": "^5.62.0",
     "cytoscape": "^3.33.1",
     "leva": "^0.9.35",
@@ -20,11 +20,15 @@
     "react-dom": "^18.3.1",
     "react-force-graph-3d": "^1.29.0",
     "react-router-dom": "^6.28.0",
+    "react-virtualized-auto-sizer": "^1.0.26",
+    "react-window": "^2.2.3",
     "three": "^0.164.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/react-virtualized-auto-sizer": "^1.0.4",
+    "@types/react-window": "^1.8.8",
     "@vitejs/plugin-react": "^4.3.3",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"

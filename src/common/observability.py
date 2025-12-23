@@ -58,6 +58,6 @@ class Event(MBBaseModel):
     host: Optional[str] = None
     event_type: str  # e.g. WorkerOnline, NewBestScore, RewardCollapse
     message: str
+    step: Optional[int] = None
     ts: float = time.time()
     payload: Dict[str, Any] = {}
-

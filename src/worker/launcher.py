@@ -13,14 +13,14 @@ either in ``<id>/Saves/`` or at ``<id>/`` root.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
-import json
 import time
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -67,6 +67,55 @@ def _parse_pw_cli_list(text: str) -> list[dict]:
     return out
 
 
+class _TemplateDefault(dict):
+    def __missing__(self, key: str) -> str:  # type: ignore[override]
+        return f"{{{key}}}"
+
+
+def _render_template(text: str, ctx: dict[str, str], label: str) -> str:
+    out = str(text)
+    for k, v in ctx.items():
+        out = out.replace(f"{{{k}}}", v)
+    leftovers = [k for k in ctx.keys() if f"{{{k}}}" in out]
+    if leftovers:
+        raise ValueError(f"Unexpanded template in {label}: {out!r} (missing={leftovers})")
+    return out
+
+
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _infer_exe_path(instance_id: str, env: dict[str, str]) -> Optional[Path]:
+    explicit = env.get("MEGABONK_EXE_PATH") or env.get("METABONK_EXE_PATH")
+    if explicit:
+        return Path(explicit).expanduser()
+    repo_root = _repo_root()
+    inst_exe = repo_root / "temp" / "megabonk_instances" / instance_id / "Megabonk.exe"
+    if inst_exe.exists():
+        return inst_exe
+    game_dir = env.get("MEGABONK_GAME_DIR") or env.get("METABONK_GAME_DIR") or ""
+    if game_dir:
+        gd_exe = Path(game_dir).expanduser() / "Megabonk.exe"
+        return gd_exe
+    return None
+
+
+def _dump_launch(run_dir: Path, payload: dict) -> None:
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "launch_cmd.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+
 def _pw_cli_objects(kind: str) -> list[dict]:
     if not shutil.which("pw-cli"):
         return []
@@ -101,6 +150,18 @@ def _pipewire_objects() -> list[dict]:
     nodes = _pw_cli_objects("Node")
     ports = _pw_cli_objects("Port")
     return nodes + ports
+
+
+def _pipewire_clients() -> list[dict]:
+    if shutil.which("pw-dump"):
+        try:
+            out = subprocess.check_output(["pw-dump"], stderr=subprocess.DEVNULL, timeout=1.0)
+            data = json.loads(out.decode("utf-8", "replace"))
+            if isinstance(data, list):
+                return [obj for obj in data if str(obj.get("type") or "") == "PipeWire:Interface:Client"]
+        except Exception:
+            return []
+    return _pw_cli_objects("Client")
 
 
 def _find_gamescope_capture_target() -> Optional[str]:
@@ -296,17 +357,15 @@ class GameLauncher:
         if not cmd:
             tmpl = os.environ.get("MEGABONK_CMD_TEMPLATE") or os.environ.get("MEGABONK_COMMAND_TEMPLATE")
             if tmpl:
-                try:
-                    cmd = str(tmpl).format(
-                        instance_id=self.instance_id,
-                        sidecar_port=self.sidecar_port if self.sidecar_port is not None else "",
-                        display=self.display or "",
-                        worker_port=os.environ.get("WORKER_PORT") or os.environ.get("MEGABONK_WORKER_PORT") or "",
-                        bonklink_host=os.environ.get("METABONK_BONKLINK_HOST") or "",
-                        bonklink_port=os.environ.get("METABONK_BONKLINK_PORT") or "",
-                    )
-                except Exception:
-                    cmd = str(tmpl)
+                ctx = {
+                    "instance_id": self.instance_id,
+                    "sidecar_port": str(self.sidecar_port if self.sidecar_port is not None else ""),
+                    "display": str(self.display or ""),
+                    "worker_port": str(os.environ.get("WORKER_PORT") or os.environ.get("MEGABONK_WORKER_PORT") or ""),
+                    "bonklink_host": str(os.environ.get("METABONK_BONKLINK_HOST") or ""),
+                    "bonklink_port": str(os.environ.get("METABONK_BONKLINK_PORT") or ""),
+                }
+                cmd = _render_template(str(tmpl), ctx, "MEGABONK_CMD_TEMPLATE")
         if not cmd:
             return
 
@@ -320,6 +379,13 @@ class GameLauncher:
             env["DISPLAY"] = self.display
         if self.sidecar_port is not None:
             env.setdefault("MEGABONK_SIDECAR_PORT", str(self.sidecar_port))
+
+        exe_path = _infer_exe_path(self.instance_id, env)
+        if exe_path is not None:
+            if not _safe_is_file(exe_path):
+                raise FileNotFoundError(f"game exe missing: {exe_path}")
+        else:
+            print(f"[launcher] WARN: unable to infer exe path for {self.instance_id}")
 
         # Optional logging for discovery (e.g., parsing Gamescope PipeWire node IDs).
         log_dir = env.get("MEGABONK_LOG_DIR") or ""
@@ -362,6 +428,38 @@ class GameLauncher:
         # Avoid spawning multiple copies.
         if self.proc and getattr(self.proc, "poll", lambda: None)() is None:
             return
+
+        cmd_pretty = " ".join(shlex.quote(a) for a in args)
+        run_dir = (
+            env.get("METABONK_RUN_DIR")
+            or env.get("MEGABONK_RUN_DIR")
+            or env.get("MEGABONK_LOG_DIR")
+        )
+        if run_dir:
+            payload = {
+                "instance_id": self.instance_id,
+                "exe_path": str(exe_path) if exe_path else None,
+                "cwd": None,
+                "cmd": args,
+                "cmd_pretty": cmd_pretty,
+                "env_subset": {
+                    k: env.get(k)
+                    for k in (
+                        "STEAM_COMPAT_DATA_PATH",
+                        "STEAM_COMPAT_CLIENT_INSTALL_PATH",
+                        "PROTON_LOG",
+                        "PROTON_LOG_DIR",
+                        "PROTON_CRASH_REPORT_DIR",
+                        "PROTON_USE_WINED3D",
+                        "WINEDEBUG",
+                        "WINEDLLOVERRIDES",
+                        "METABONK_WINE_DLL_OVERRIDES",
+                    )
+                    if env.get(k) is not None
+                },
+            }
+            _dump_launch(Path(run_dir) / "logs" / f"launch_{self.instance_id}", payload)
+        print(f"[launcher] launch {self.instance_id}: {cmd_pretty}")
 
         try:
             self.proc = subprocess.Popen(
@@ -492,6 +590,43 @@ class GameLauncher:
             if time.time() >= deadline:
                 break
             time.sleep(0.05)
+        return False
+
+    @staticmethod
+    def pipewire_daemon_ok(timeout_s: float = 0.5) -> bool:
+        """Best-effort check that the PipeWire daemon is reachable."""
+        if shutil.which("pw-dump"):
+            try:
+                out = subprocess.check_output(["pw-dump"], stderr=subprocess.DEVNULL, timeout=timeout_s)
+                data = json.loads(out.decode("utf-8", "replace"))
+                return isinstance(data, list) and len(data) > 0
+            except Exception:
+                return False
+        if shutil.which("pw-cli"):
+            try:
+                subprocess.check_output(["pw-cli", "info", "0"], stderr=subprocess.DEVNULL, timeout=timeout_s)
+                return True
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
+    def pipewire_session_ok(timeout_s: float = 0.5) -> bool:
+        """Best-effort check that a session manager (WirePlumber/media-session) is present."""
+        try:
+            clients = _pipewire_clients()
+        except Exception:
+            clients = []
+        if not clients:
+            # If the daemon is running but we can't list clients, treat as unhealthy.
+            return False if GameLauncher.pipewire_daemon_ok(timeout_s=timeout_s) else False
+        for obj in clients:
+            props = (obj.get("info") or {}).get("props") or {}
+            if not isinstance(props, dict):
+                continue
+            name = str(props.get("application.name") or props.get("client.name") or "").lower()
+            if "wireplumber" in name or "pipewire-media-session" in name or "media-session" in name:
+                return True
         return False
 
     @staticmethod

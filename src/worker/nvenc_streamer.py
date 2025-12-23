@@ -16,6 +16,7 @@ import os
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterator, Optional
 import shutil
@@ -344,9 +345,15 @@ class NVENCStreamer:
         self._lock = threading.Lock()
         self._active_clients: int = 0
         self.last_chunk_ts: float = 0.0
+        self.last_keyframe_ts: float = 0.0
+        self.keyframe_count: int = 0
+        self.stream_fps: float = 0.0
         self.last_error: Optional[str] = None
         self.last_error_ts: float = 0.0
         self.backend: Optional[str] = None
+        self._frame_times = deque(maxlen=180)
+        self._mp4_scan_buf = bytearray()
+        self._h264_scan_buf = bytearray()
         # Best-effort: expose an initial backend guess so /status isn't empty before a client connects.
         try:
             self.backend = self._guess_backend()
@@ -391,6 +398,78 @@ class NVENCStreamer:
             self.last_error = str(msg)
             self.last_error_ts = time.time()
         _log_stream_event("stream_error", message=str(msg))
+
+    def _record_frame_ts(self, ts: float) -> None:
+        with self._lock:
+            self._frame_times.append(float(ts))
+            if len(self._frame_times) >= 2:
+                dt = float(self._frame_times[-1]) - float(self._frame_times[0])
+                if dt > 0:
+                    self.stream_fps = float((len(self._frame_times) - 1) / dt)
+
+    def _record_keyframe(self) -> None:
+        now = time.time()
+        with self._lock:
+            self.last_keyframe_ts = now
+            self.keyframe_count += 1
+
+    def _scan_mp4_for_keyframes(self, data: bytes) -> None:
+        if not data:
+            return
+        buf = self._mp4_scan_buf
+        buf.extend(data)
+        i = 0
+        while len(buf) - i >= 8:
+            size = int.from_bytes(buf[i : i + 4], "big")
+            typ = bytes(buf[i + 4 : i + 8])
+            header = 8
+            if size == 1:
+                if len(buf) - i < 16:
+                    break
+                hi = int.from_bytes(buf[i + 8 : i + 12], "big")
+                lo = int.from_bytes(buf[i + 12 : i + 16], "big")
+                size = hi * (2 ** 32) + lo
+                header = 16
+            if size == 0 or size < header:
+                break
+            if len(buf) - i < size:
+                break
+            if typ == b"moof":
+                self._record_keyframe()
+            i += size
+        if i:
+            del buf[:i]
+        if len(buf) > 262144:
+            del buf[: len(buf) - 262144]
+
+    def _scan_h264_for_keyframes(self, data: bytes) -> None:
+        if not data:
+            return
+        buf = self._h264_scan_buf
+        buf.extend(data)
+        i = 0
+        while i + 4 < len(buf):
+            if buf[i] == 0 and buf[i + 1] == 0 and (buf[i + 2] == 1 or (buf[i + 2] == 0 and buf[i + 3] == 1)):
+                nal_idx = i + 3 if buf[i + 2] == 1 else i + 4
+                if nal_idx < len(buf):
+                    nal_type = buf[nal_idx] & 0x1F
+                    if nal_type == 5:
+                        self._record_keyframe()
+                i = nal_idx + 1
+                continue
+            i += 1
+        if len(buf) > 4096:
+            del buf[: len(buf) - 4096]
+
+    def _record_output_chunk(self, data: bytes, container: str) -> None:
+        now = time.time()
+        with self._lock:
+            self.last_chunk_ts = now
+        c = str(container or "").lower()
+        if c in ("mp4", "fmp4"):
+            self._scan_mp4_for_keyframes(data)
+        elif c in ("h264", "mpegts", "ts"):
+            self._scan_h264_for_keyframes(data)
 
     def is_busy(self) -> bool:
         try:
@@ -979,8 +1058,7 @@ class NVENCStreamer:
                     return Gst.FlowReturn.OK
                 with chunk_cv:
                     chunk_q.append(data)
-                    with self._lock:
-                        self.last_chunk_ts = time.time()
+                    self._record_output_chunk(data, container_name)
                     chunk_cv.notify_all()
             except Exception:
                 return Gst.FlowReturn.ERROR
@@ -1052,8 +1130,7 @@ class NVENCStreamer:
                 bus = None
 
         def _on_buffer(_pad, _info):
-            with self._lock:
-                self.last_chunk_ts = time.time()
+            self._record_output_chunk(b"", container_name)
             return Gst.PadProbeReturn.OK
 
         try:
@@ -1279,6 +1356,8 @@ class NVENCStreamer:
                     if not data:
                         continue
 
+                    self._record_frame_ts(time.time())
+
                     if ffmpeg_proc is None:
                         if not width or not height:
                             # Can't start ffmpeg without frame size; wait for next sample.
@@ -1399,8 +1478,7 @@ class NVENCStreamer:
                     data = b""
                 if not data:
                     continue
-                with self._lock:
-                    self.last_chunk_ts = time.time()
+                self._record_output_chunk(data, container)
                 last_out_ts = time.time()
                 yield data
         finally:
@@ -1633,8 +1711,7 @@ class NVENCStreamer:
                     data = b""
                 if not data:
                     continue
-                with self._lock:
-                    self.last_chunk_ts = time.time()
+                self._record_output_chunk(data, container)
                 last_out_ts = time.time()
                 yield data
         finally:

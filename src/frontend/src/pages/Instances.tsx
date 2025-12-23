@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
+import { FixedSizeList as List, ListChildComponentProps } from "react-window";
+import AutoSizer from "react-virtualized-auto-sizer";
 import { Link, useLocation } from "react-router-dom";
 import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
 import { useEventStream } from "../hooks/useEventStream";
@@ -9,6 +11,7 @@ import useContextFilters from "../hooks/useContextFilters";
 import { useContextDrawer } from "../hooks/useContextDrawer";
 import { deriveReasonCode } from "../hooks/useIssues";
 import { clamp01, copyToClipboard, fmtFixed, fmtNum, fmtPct01, timeAgo } from "../lib/format";
+import { HEARTBEAT_SCHEMA_VERSION, schemaMismatchLabel } from "../lib/schema";
 
 function InstanceLatticeViz() {
   const ref = useRef<THREE.Mesh | null>(null);
@@ -116,9 +119,10 @@ export default function Instances() {
       const ts = Number(hb?.ts ?? 0);
       const streamUrl = String(hb?.stream_url ?? "");
       const streamOk = Boolean(hb?.stream_ok);
-      const streamState = !streamUrl ? "missing" : streamOk ? "ok" : "stale";
+      const schemaMismatch = hb?.schema_version != null && Number(hb.schema_version) !== HEARTBEAT_SCHEMA_VERSION;
+      const streamState = schemaMismatch ? "schema" : !streamUrl ? "missing" : streamOk ? "ok" : "stale";
       const streamError = hb?.stream_error ?? hb?.streamer_last_error ?? null;
-      const reason = deriveReasonCode(hb);
+      const reason = schemaMismatch ? schemaMismatchLabel(hb?.schema_version) : deriveReasonCode(hb);
       const survival = hb?.survival_prob != null ? clamp01(Number(hb.survival_prob)) : null;
       const danger = hb?.danger_level != null ? clamp01(Number(hb.danger_level)) : survival != null ? clamp01(1 - survival) : null;
       const name = (hb?.display_name ?? id) as string;
@@ -138,6 +142,7 @@ export default function Instances() {
         streamUrl,
         hb,
         reason,
+        schemaMismatch,
         survival,
         danger,
         cfg: v.config ?? null,
@@ -178,6 +183,8 @@ export default function Instances() {
   }, [rows]);
 
   const selectedRow = useMemo(() => rows.find((r) => String(r.id) === String(selected)) ?? null, [rows, selected]);
+  const newestTs = useMemo(() => (rows.length ? rows.reduce((m, r) => Math.max(m, Number(r.ts ?? 0)), 0) : null), [rows]);
+  const dataAge = newestTs != null ? Date.now() / 1000 - newestTs : null;
   const selectedEvents = useMemo(() => {
     if (!selectedRow) return [];
     return events.filter((e) => String(e.instance_id ?? "") === String(selectedRow.id)).slice(-12).reverse();
@@ -191,6 +198,62 @@ export default function Instances() {
     if (timelineQ.data?.points?.length) return timelineQ.data.points;
     return selectedRow?.history ?? [];
   }, [timelineQ.data, selectedRow]);
+
+  const InstanceRow = ({ index, style }: ListChildComponentProps) => {
+    const r = rows[index];
+    const isSelected = String(selectedRow?.id) === String(r.id);
+    return (
+      <div style={style} className={`v-row ${isSelected ? "active" : ""}`} onClick={() => setSelected(r.id)}>
+        <div className="v-cell" style={{ flex: 1.5 }}>
+          <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</div>
+          <div className="muted mono" style={{ fontSize: "0.85em" }}>
+            {r.id}
+          </div>
+        </div>
+        <div className="v-cell" style={{ flex: 1 }} title={r.policy}>
+          {r.policy}
+        </div>
+        <div className="v-cell muted" style={{ width: 100 }} title={r.device}>
+          {r.device}
+        </div>
+        <div className="v-cell" style={{ width: 80 }}>
+          <span className={`pill ${r.streamState === "ok" ? "pill-ok" : "pill-missing"}`}>{r.streamState}</span>
+        </div>
+        <div className="v-cell muted mono" style={{ width: 80 }} title={r.reason ?? ""}>
+          {r.reason ?? "—"}
+        </div>
+        <div className="v-cell" style={{ width: 80 }}>
+          <div>{fmtFixed(r.score, 2)}</div>
+          <div className="muted" style={{ fontSize: "0.8em" }}>
+            best {r.best_score == null ? "—" : fmtFixed(r.best_score, 2)}
+          </div>
+        </div>
+        <div className="v-cell" style={{ width: 100 }}>
+          <div className="sparks">
+            <Sparkline values={r.sparks?.score} color="var(--blue)" />
+            <Sparkline values={r.sparks?.reward} color="var(--yellow)" />
+            <Sparkline values={r.sparks?.entropy} color="var(--pink)" />
+            <Sparkline values={r.sparks?.stream_fps} color="rgba(0,255,136,.9)" />
+          </div>
+        </div>
+        <div className="v-cell" style={{ width: 80 }}>
+          <div>{fmtNum(r.step)}</div>
+          <div className="muted" style={{ fontSize: "0.8em" }}>
+            peak {r.best_step == null ? "—" : fmtNum(r.best_step)}
+          </div>
+        </div>
+        <div className="v-cell" style={{ width: 60 }}>
+          {r.survival == null ? "—" : fmtPct01(r.survival, 0)}
+        </div>
+        <div className="v-cell" style={{ width: 60 }}>
+          {r.danger == null ? "—" : fmtPct01(r.danger, 0)}
+        </div>
+        <div className="v-cell muted" style={{ width: 80, fontSize: "0.9em" }}>
+          {timeAgo(r.ts)}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="grid instances-grid" style={{ gridTemplateColumns: "1.3fr 0.7fr" }}>
@@ -220,7 +283,7 @@ export default function Instances() {
           <InstanceLatticeViz />
         </div>
       </section>
-      <section className="card">
+      <section className="card flex-card">
         <div className="row-between">
           <h2>Instances</h2>
           <span className="badge">{fmtNum(rows.length)} online</span>
@@ -242,6 +305,9 @@ export default function Instances() {
             </select>
           </div>
           <div className="toolbar-right">
+            <span className={`pill ${dataAge != null && dataAge > 20 ? "pill-missing" : "pill-ok"}`}>
+              data age {dataAge == null || newestTs == null ? "—" : timeAgo(newestTs)}
+            </span>
             <Link className="btn btn-ghost" to="/stream">
               open stream HUD
             </Link>
@@ -258,70 +324,35 @@ export default function Instances() {
           </div>
         </div>
 
-        <table className="table table-hover" style={{ marginTop: 10 }}>
-          <thead>
-            <tr>
-              <th>Agent</th>
-              <th>Policy</th>
-              <th>Device</th>
-              <th>Stream</th>
-              <th>Reason</th>
-              <th>Score</th>
-              <th>Trends</th>
-              <th>Step</th>
-              <th>Survival</th>
-              <th>Danger</th>
-              <th>Seen</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((r) => (
-              <tr
-                key={r.id}
-                className={String(selectedRow?.id) === String(r.id) ? "active" : ""}
-                onClick={() => setSelected(r.id)}
-                style={{ cursor: "pointer" }}
-              >
-                <td>
-                  <div style={{ fontWeight: 800 }}>{r.name}</div>
-                  <div className="muted mono">{r.id}</div>
-                </td>
-                <td>{r.policy}</td>
-                <td className="muted">{r.device}</td>
-                <td>
-                  <span className={`pill ${r.streamState === "ok" ? "pill-ok" : "pill-missing"}`}>{r.streamState}</span>
-                </td>
-                <td className="muted mono">{r.reason ?? "—"}</td>
-                <td>
-                  <div>{fmtFixed(r.score, 2)}</div>
-                  <div className="muted">best {r.best_score == null ? "—" : fmtFixed(r.best_score, 2)}</div>
-                </td>
-                <td>
-                  <div className="sparks">
-                    <Sparkline values={r.sparks?.score} color="var(--blue)" />
-                    <Sparkline values={r.sparks?.reward} color="var(--yellow)" />
-                    <Sparkline values={r.sparks?.entropy} color="var(--pink)" />
-                    <Sparkline values={r.sparks?.stream_fps} color="rgba(0,255,136,.9)" />
-                  </div>
-                </td>
-                <td>
-                  <div>{fmtNum(r.step)}</div>
-                  <div className="muted">peak {r.best_step == null ? "—" : fmtNum(r.best_step)}</div>
-                </td>
-                <td>{r.survival == null ? "—" : fmtPct01(r.survival, 0)}</td>
-                <td>{r.danger == null ? "—" : fmtPct01(r.danger, 0)}</td>
-                <td className="muted">{timeAgo(r.ts)}</td>
-              </tr>
-            ))}
-            {!rows.length && (
-              <tr>
-                <td colSpan={11} className="muted">
-                  no instances yet
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <div className="v-table-header" style={{ marginTop: 10 }}>
+          <div style={{ flex: 1.5 }}>Agent</div>
+          <div style={{ flex: 1 }}>Policy</div>
+          <div style={{ width: 100 }}>Device</div>
+          <div style={{ width: 80 }}>Stream</div>
+          <div style={{ width: 80 }}>Reason</div>
+          <div style={{ width: 80 }}>Score</div>
+          <div style={{ width: 100 }}>Trends</div>
+          <div style={{ width: 80 }}>Step</div>
+          <div style={{ width: 60 }}>Surv</div>
+          <div style={{ width: 60 }}>Dngr</div>
+          <div style={{ width: 80 }}>Seen</div>
+        </div>
+
+        <div className="v-table-body" style={{ flex: 1, minHeight: 0 }}>
+          {rows.length ? (
+            <AutoSizer>
+              {({ height, width }) => (
+                <List height={height} width={width} itemCount={rows.length} itemSize={72}>
+                  {InstanceRow}
+                </List>
+              )}
+            </AutoSizer>
+          ) : (
+            <div className="muted" style={{ marginTop: 8 }}>
+              no instances yet
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="card">
