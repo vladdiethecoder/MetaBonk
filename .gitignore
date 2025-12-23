@@ -45,6 +45,7 @@ node_modules/
 /skill_vectors/
 /temp/
 /tmp/
+/runs/
 
 # === Models / datasets ===
 *.pt

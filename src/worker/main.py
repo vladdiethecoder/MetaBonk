@@ -191,6 +191,7 @@ class WorkerService:
         self._last_step_ts: float = 0.0
         self._last_menu_mode: Optional[bool] = None
         self._last_menu_mode_log: Optional[bool] = None
+        self._last_menu_name: Optional[str] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
         self._action_source = self._normalize_action_source(
@@ -230,7 +231,7 @@ class WorkerService:
             self._input_scroll_scale = float(os.environ.get("METABONK_INPUT_SCROLL_SCALE", "3.0"))
         except Exception:
             self._input_scroll_scale = 3.0
-        self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "1") in ("1", "true", "True")
+        self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "0") in ("1", "true", "True")
         self._menu_bootstrap_step = 0
         self._menu_bootstrap_next_ts = 0.0
         self._menu_bootstrap_last_menu: Optional[str] = None
@@ -2724,6 +2725,21 @@ class WorkerService:
                 if (not menu_hint) and (self._last_menu_mode is True) and menu_exit_bonus:
                     reward += menu_exit_bonus
                 self._last_menu_mode = bool(menu_hint)
+            # Optional menu transition bonus (e.g., MainMenu -> GeneratedMap).
+            try:
+                menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
+            except Exception:
+                menu_start_bonus = 0.0
+            try:
+                cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
+            except Exception:
+                cur_menu = ""
+            prev_menu = self._last_menu_name
+            if cur_menu:
+                if menu_start_bonus and prev_menu and prev_menu != cur_menu:
+                    if prev_menu == "mainmenu" and cur_menu == "generatedmap":
+                        reward += menu_start_bonus
+                self._last_menu_name = cur_menu
             # Episode done: when METABONK_VISUAL_ONLY=1, never use SHM/memory flags.
             # If the vision model exports a boolean done signal, consume it here.
             if self._visual_only and isinstance(vision_metrics, dict):
