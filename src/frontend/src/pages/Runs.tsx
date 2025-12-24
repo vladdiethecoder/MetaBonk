@@ -3,13 +3,24 @@ import { useMemo, useState, useRef, useEffect } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
-import AutoSizer from "react-virtualized-auto-sizer";
 import { fetchRuns, fetchRunsCompare, Run, RunCompareResponse, RunMetricSeries } from "../api";
 import useContextFilters from "../hooks/useContextFilters";
 import { copyToClipboard, fmtFixed, fmtNum, timeAgo } from "../lib/format";
+import PageShell from "../components/PageShell";
+import ElementSizer from "../components/ElementSizer";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 import { useLocation, useNavigate } from "react-router-dom";
 
 function RunsCoreViz() {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const CoreMesh = () => {
     const ref = useRef<THREE.Mesh | null>(null);
     useFrame((state) => {
@@ -25,8 +36,24 @@ function RunsCoreViz() {
       </mesh>
     );
   };
+  if (lost) return <div className="canvas-placeholder">WebGL context lost</div>;
   return (
-    <Canvas className="runs-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
+    <Canvas
+      className="runs-core-canvas"
+      key={`runs-core-${resetNonce}`}
+      dpr={[1, 2]}
+      camera={{ position: [0, 0, 3], fov: 50 }}
+      onCreated={({ gl }) => {
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
+      }}
+    >
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.8} />
       <CoreMesh />
@@ -35,6 +62,13 @@ function RunsCoreViz() {
 }
 
 export default function Runs() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/runs";
+  useActivationResizeKick(isActive);
+  const [kickKey, setKickKey] = useState(0);
+  useEffect(() => {
+    if (isActive) setKickKey((k) => k + 1);
+  }, [isActive]);
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: fetchRuns, refetchInterval: 5000 });
   const runs = (runsQ.data ?? []) as Run[];
   const { ctx, windowSeconds } = useContextFilters();
@@ -44,7 +78,6 @@ export default function Runs() {
   const [selected, setSelected] = useState<string | null>(null);
   const [compareMode, setCompareMode] = useState(false);
   const [compareSelection, setCompareSelection] = useState<string[]>([]);
-  const loc = useLocation();
   const nav = useNavigate();
 
   const compareQ = useQuery<RunCompareResponse>({
@@ -198,7 +231,8 @@ export default function Runs() {
   };
 
   return (
-    <div className="grid page-grid runs-grid" style={{ gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr)" }}>
+    <QueryStateGate label="Runs" queries={[runsQ]}>
+      <PageShell className="grid page-grid runs-grid" style={{ gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr)" }}>
       <section className="card runs-core-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Run Constellation</h2>
@@ -222,7 +256,7 @@ export default function Runs() {
               </div>
             </div>
           </div>
-          <RunsCoreViz />
+          {isActive ? <RunsCoreViz /> : <div className="canvas-placeholder" />}
         </div>
       </section>
       <section className="card flex-card">
@@ -294,13 +328,13 @@ export default function Runs() {
 
         <div className="v-table-body" style={{ flex: 1, minHeight: 0 }}>
           {filtered.length ? (
-            <AutoSizer>
+            <ElementSizer key={kickKey}>
               {({ height, width }) => (
                 <VirtualList height={height} width={width} itemCount={filtered.length} itemSize={42}>
                   {RunRow}
                 </VirtualList>
               )}
-            </AutoSizer>
+            </ElementSizer>
           ) : (
             <div className="muted" style={{ marginTop: 8 }}>
               no runs yet
@@ -402,6 +436,7 @@ export default function Runs() {
           </>
         )}
       </section>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }

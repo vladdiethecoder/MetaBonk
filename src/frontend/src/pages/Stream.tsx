@@ -26,6 +26,9 @@ import { UI_TOKENS } from "../lib/ui_tokens";
 import { timeAgo } from "../lib/format";
 import MseMp4Video from "../components/MseMp4Video";
 import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
+import RouteScope from "../components/RouteScope";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
@@ -103,6 +106,12 @@ function HoloStreamCanvas({
   glitch: boolean;
 }) {
   const [texture, setTexture] = useState<THREE.Texture | null>(null);
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
 
   useEffect(() => {
     if (!videoEl) return;
@@ -127,14 +136,26 @@ function HoloStreamCanvas({
 
   const chromaOffset = 0.001 + surprise * 0.004;
 
+  if (lost) {
+    return <div className="canvas-placeholder">WebGL context lost</div>;
+  }
   return (
     <Canvas
       className="holo-r3f-canvas"
+      key={`stream-holo-${resetNonce}`}
       dpr={[1, 2]}
       gl={{ antialias: true, alpha: true }}
       camera={{ position: [0, 0, 2.2], fov: 45 }}
       onCreated={({ gl }) => {
         gl.outputColorSpace = THREE.SRGBColorSpace;
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
       }}
     >
       <color attach="background" args={["#020405"]} />
@@ -218,7 +239,7 @@ function SafeGuides() {
         <span>0</span>
         <span>{UI_TOKENS.resolution.h}</span>
       </div>
-    </div>
+    </RouteScope>
   );
 }
 
@@ -1255,6 +1276,9 @@ export default function Stream() {
   const safeY = Math.round(HUD_H * 0.05);
   const actionSafeX = Math.round(HUD_W * 0.035);
   const actionSafeY = Math.round(HUD_H * 0.035);
+  const scopeRef = useRef<HTMLDivElement | null>(null);
+  const [uiScale, setUiScale] = useState(1);
+  const [uiTier, setUiTier] = useState("720");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1270,22 +1294,22 @@ export default function Stream() {
   }, []);
 
   useEffect(() => {
+    const scope = scopeRef.current;
+    if (!scope) return;
     let raf = 0;
-    const apply = () => {
-      const root = document.documentElement;
-      const w = window.innerWidth;
-      const h = window.innerHeight;
-      root.style.setProperty("--ui", String(computeUiScale(w, h)));
-      root.dataset.tier = computeTier(w);
-    };
-    const onResize = () => {
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const { width, height } = entry.contentRect;
       if (raf) cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(apply);
-    };
-    apply();
-    window.addEventListener("resize", onResize);
+      raf = requestAnimationFrame(() => {
+        setUiScale(computeUiScale(width, height));
+        setUiTier(computeTier(width));
+      });
+    });
+    ro.observe(scope);
     return () => {
-      window.removeEventListener("resize", onResize);
+      ro.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
   }, []);
@@ -1914,20 +1938,21 @@ export default function Stream() {
   }, [overtakeActiveUntil, directorOn, focusId, applyDirectorCut]);
 
   return (
-    <div
-      className="hud"
-      style={
-        {
-          ["--mb-sprite-url" as any]: `url(${iconSheetUrl})`,
-          ["--hud-w" as any]: `${HUD_W}px`,
-          ["--hud-h" as any]: `${HUD_H}px`,
-          ["--safe-x-base" as any]: `${safeX}px`,
-          ["--safe-y-base" as any]: `${safeY}px`,
-          ["--action-safe-x-base" as any]: `${actionSafeX}px`,
-          ["--action-safe-y-base" as any]: `${actionSafeY}px`,
-        } as any
-      }
-    >
+    <RouteScope ref={scopeRef} className="route-scope stream-scope" uiScale={uiScale} tier={uiTier}>
+      <div
+        className="hud"
+        style={
+          {
+            ["--mb-sprite-url" as any]: `url(${iconSheetUrl})`,
+            ["--hud-w" as any]: `${HUD_W}px`,
+            ["--hud-h" as any]: `${HUD_H}px`,
+            ["--safe-x-base" as any]: `${safeX}px`,
+            ["--safe-y-base" as any]: `${safeY}px`,
+            ["--action-safe-x-base" as any]: `${actionSafeX}px`,
+            ["--action-safe-y-base" as any]: `${actionSafeY}px`,
+          } as any
+        }
+      >
       <div className="hud-fx">
         <div className="hud-chroma" />
         <div className="hud-vignette" />

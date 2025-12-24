@@ -1,9 +1,11 @@
-import { Suspense, lazy, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import ContextBar from "./components/ContextBar";
 import CommandPalette from "./components/CommandPalette";
 import ContextDrawer from "./components/ContextDrawer";
 import IssuesDrawer from "./components/IssuesDrawer";
+import ErrorBoundary from "./components/ErrorBoundary";
+import FrontendHealthOverlay from "./components/FrontendHealthOverlay";
 import Overview from "./pages/Overview";
 import NeuroSynaptic from "./pages/NeuroSynaptic";
 import Runs from "./pages/Runs";
@@ -18,19 +20,42 @@ const CCTV3D = lazy(() => import("./pages/CCTV3D"));
 export default function App() {
   const loc = useLocation();
   const [issuesOpen, setIssuesOpen] = useState(false);
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const resetScrollLock = () => {
+      document.body.style.overflow = "";
+      document.body.style.paddingRight = "";
+      document.body.style.touchAction = "";
+      document.documentElement.style.overflow = "";
+    };
+    (window as any).__mbResetScrollLock = resetScrollLock;
+    return () => {
+      delete (window as any).__mbResetScrollLock;
+    };
+  }, []);
   // Stream overlay wants a clean fullscreen surface (OBS browser source).
-  if (loc.pathname.startsWith("/stream")) {
-    return <Stream />;
+  if (loc.pathname.startsWith("/stream") || loc.pathname.startsWith("/broadcast")) {
+    return (
+      <ErrorBoundary label="Stream">
+        <Stream />
+      </ErrorBoundary>
+    );
   }
   if (loc.pathname.startsWith("/cctv")) {
     return (
       <Suspense fallback={<div className="card">Booting System...</div>}>
-        <CCTV3D />
+        <ErrorBoundary label="CCTV">
+          <CCTV3D />
+        </ErrorBoundary>
       </Suspense>
     );
   }
   if (loc.pathname === "/") {
-    return <NeuroSynaptic />;
+    return (
+      <ErrorBoundary label="NeuroSynaptic">
+        <NeuroSynaptic />
+      </ErrorBoundary>
+    );
   }
   const nav = [
     { to: "/", label: "Neuro" },
@@ -65,14 +90,15 @@ export default function App() {
         <div className="page-scroll">
           <Suspense fallback={<div className="card">loading…</div>}>
             <Routes>
-              <Route path="/overview" element={<Overview />} />
-              <Route path="/runs" element={<Runs />} />
-              <Route path="/instances" element={<Instances />} />
-              <Route path="/build" element={<BuildLab />} />
-              <Route path="/skills" element={<Skills />} />
-              <Route path="/spy" element={<Spy />} />
-              <Route path="/stream" element={<Stream />} />
-              <Route path="/cctv" element={<CCTV3D />} />
+              <Route path="/overview" element={<ErrorBoundary label="Overview"><Overview /></ErrorBoundary>} />
+              <Route path="/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />
+              <Route path="/instances" element={<ErrorBoundary label="Instances"><Instances /></ErrorBoundary>} />
+              <Route path="/build" element={<ErrorBoundary label="Build Lab"><BuildLab /></ErrorBoundary>} />
+              <Route path="/skills" element={<ErrorBoundary label="Skills"><Skills /></ErrorBoundary>} />
+              <Route path="/spy" element={<ErrorBoundary label="Spy"><Spy /></ErrorBoundary>} />
+              <Route path="/stream" element={<ErrorBoundary label="Stream"><Stream /></ErrorBoundary>} />
+              <Route path="/broadcast" element={<ErrorBoundary label="Broadcast"><Stream /></ErrorBoundary>} />
+              <Route path="/cctv" element={<ErrorBoundary label="CCTV"><CCTV3D /></ErrorBoundary>} />
             </Routes>
           </Suspense>
         </div>
@@ -80,6 +106,7 @@ export default function App() {
       <IssuesDrawer open={issuesOpen} onClose={() => setIssuesOpen(false)} />
       <ContextDrawer />
       <CommandPalette />
+      <FrontendHealthOverlay />
     </div>
   );
 }

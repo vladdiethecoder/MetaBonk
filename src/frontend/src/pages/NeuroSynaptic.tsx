@@ -1,10 +1,14 @@
-import { useMemo, useRef, useEffect } from "react";
+import { useMemo, useRef, useEffect, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchStatus, fetchWorkers } from "../api";
 import { fmtFixed, timeAgo } from "../lib/format";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import QueryStateGate from "../components/QueryStateGate";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 const NAV = [
   { to: "/", label: "Neuro" },
@@ -171,6 +175,12 @@ function LatentField({ className, drift = 0.2 }: { className?: string; drift?: n
 }
 
 function NeuroNebula() {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const geo = useMemo(() => {
     const count = 800;
     const arr = new Float32Array(count * 3);
@@ -196,8 +206,24 @@ function NeuroNebula() {
       </points>
     );
   };
+  if (lost) return <div className="canvas-placeholder">WebGL context lost</div>;
   return (
-    <Canvas className="syn-r3f" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 60 }}>
+    <Canvas
+      className="syn-r3f"
+      key={`neuro-nebula-${resetNonce}`}
+      dpr={[1, 2]}
+      camera={{ position: [0, 0, 3.2], fov: 60 }}
+      onCreated={({ gl }) => {
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
+      }}
+    >
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.6} />
       <NebulaPoints geometry={geo} />
@@ -426,6 +452,9 @@ function SpecStream({ lines }: { lines: string[] }) {
 }
 
 export default function NeuroSynaptic() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/";
+  useActivationResizeKick(isActive);
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 3000 });
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 3000 });
   const healthQ = useQuery({
@@ -509,11 +538,12 @@ export default function NeuroSynaptic() {
   }, [issues, divergenceLevel]);
 
   return (
-    <div className="syn-shell">
-      <div className="syn-noise" />
-      <NeuroNebula />
-      <div className="syn-scroll">
-        <div className="syn-grid">
+    <QueryStateGate label="NeuroSynaptic" queries={[statusQ, workersQ, healthQ, issuesQ]}>
+      <div className="syn-shell">
+        <div className="syn-noise" />
+        {isActive ? <NeuroNebula /> : <div className="canvas-placeholder" />}
+        <div className="syn-scroll">
+          <div className="syn-grid">
         <header className="syn-head">
           <div className="syn-brand">
             <span className="syn-brand-title">MetaBonk</span>
@@ -873,8 +903,9 @@ export default function NeuroSynaptic() {
             <strong>{health ? `${(health.api.error_rate * 100).toFixed(1)}%` : "--"}</strong>
           </div>
         </footer>
+          </div>
         </div>
       </div>
-    </div>
+    </QueryStateGate>
   );
 }

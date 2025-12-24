@@ -4,13 +4,19 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { EffectComposer, Bloom, Scanline } from "@react-three/postprocessing";
 import * as THREE from "three";
 import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
-import AutoSizer from "react-virtualized-auto-sizer";
+import { useLocation } from "react-router-dom";
+import ElementSizer from "../components/ElementSizer";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import PageShell from "../components/PageShell";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchPbtMute, fetchPolicies, fetchStatus, fetchWorkers, setPbtMute } from "../api";
 import { useEventStream } from "../hooks";
 import useIssues from "../hooks/useIssues";
 import { useContextDrawer } from "../hooks/useContextDrawer";
 import useContextFilters from "../hooks/useContextFilters";
 import { fmtFixed, fmtNum, timeAgo } from "../lib/format";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 const hashString = (input: string) => {
   let h = 2166136261;
@@ -28,6 +34,12 @@ function HoloGlobe({
   nodes: Array<{ id: string; health: number; active: boolean }>;
   errorRate?: number;
 }) {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const points = useMemo(() => {
     return nodes.map((n) => {
       const seed = hashString(n.id);
@@ -86,8 +98,24 @@ function HoloGlobe({
     );
   };
 
+  if (lost) return <div className="canvas-placeholder">WebGL context lost</div>;
   return (
-    <Canvas className="holo-globe-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
+    <Canvas
+      className="holo-globe-canvas"
+      key={`overview-globe-${resetNonce}`}
+      dpr={[1, 2]}
+      camera={{ position: [0, 0, 3.2], fov: 50 }}
+      onCreated={({ gl }) => {
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
+      }}
+    >
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.8} />
       <GlobeGroup />
@@ -100,6 +128,13 @@ function HoloGlobe({
 }
 
 export default function Overview() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/overview";
+  useActivationResizeKick(isActive);
+  const [kickKey, setKickKey] = useState(0);
+  useEffect(() => {
+    if (isActive) setKickKey((k) => k + 1);
+  }, [isActive]);
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 2000 });
   const status = statusQ.data;
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 2000 });
@@ -323,10 +358,11 @@ export default function Overview() {
   );
 
   return (
-    <div
-      className="grid page-grid overview-grid"
-      style={{ gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 0.85fr)" }}
-    >
+    <QueryStateGate label="Overview" queries={[statusQ, workersQ, healthQ, issuesQ, policiesQ, pbtMuteQ]}>
+      <PageShell
+        className="grid page-grid overview-grid"
+        style={{ gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 0.85fr)" }}
+      >
       <section className="card warroom-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Global Hologram</h2>
@@ -350,7 +386,7 @@ export default function Overview() {
               </div>
             </div>
           </div>
-          <HoloGlobe nodes={globeNodes} errorRate={health?.api.error_rate ?? 0} />
+          {isActive ? <HoloGlobe nodes={globeNodes} errorRate={health?.api.error_rate ?? 0} /> : <div className="canvas-placeholder" />}
         </div>
       </section>
       <section className="card">
@@ -676,15 +712,16 @@ export default function Overview() {
           </div>
         </div>
         <div className="events" style={{ marginTop: 10, height: 360 }}>
-          <AutoSizer>
+          <ElementSizer key={kickKey}>
             {({ height, width }) => (
               <VirtualList height={height} width={width} itemCount={filtered.length || 1} itemSize={32}>
                 {EventRow}
               </VirtualList>
             )}
-          </AutoSizer>
+          </ElementSizer>
         </div>
       </section>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }

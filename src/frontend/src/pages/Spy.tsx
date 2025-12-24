@@ -3,7 +3,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
-import AutoSizer from "react-virtualized-auto-sizer";
 import {
   buildDreamPolicy,
   buildWorldModel,
@@ -21,10 +20,22 @@ import {
   SkillTokenDetail,
 } from "../api";
 import { useEventStream } from "../hooks";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { fmtFixed, timeAgo } from "../lib/format";
+import PageShell from "../components/PageShell";
+import ElementSizer from "../components/ElementSizer";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 function Swarm3D({ workers }: { workers: any[] }) {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const boids = useRef(
     Array.from({ length: Math.max(10, Math.min(40, workers.length || 0)) }, (_, i) => ({
       pos: new THREE.Vector3((Math.random() - 0.5) * 2.2, (Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2),
@@ -70,8 +81,24 @@ function Swarm3D({ workers }: { workers: any[] }) {
     );
   };
 
+  if (lost) return <div className="canvas-placeholder">WebGL context lost</div>;
   return (
-    <Canvas className="swarm-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 4.2], fov: 50 }}>
+    <Canvas
+      className="swarm-canvas"
+      key={`spy-swarm-${resetNonce}`}
+      dpr={[1, 2]}
+      camera={{ position: [0, 0, 4.2], fov: 50 }}
+      onCreated={({ gl }) => {
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
+      }}
+    >
       <ambientLight intensity={0.6} />
       <SwarmField />
       <mesh>
@@ -196,6 +223,13 @@ function JobRow({ j, onSelect }: { j: PretrainJob; onSelect: (id: string) => voi
 }
 
 export default function Spy() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/spy";
+  useActivationResizeKick(isActive);
+  const [kickKey, setKickKey] = useState(0);
+  useEffect(() => {
+    if (isActive) setKickKey((k) => k + 1);
+  }, [isActive]);
   const qc = useQueryClient();
   const [selectedToken, setSelectedToken] = useState<number | null>(null);
   const [selectionLocked, setSelectionLocked] = useState(false);
@@ -311,7 +345,8 @@ export default function Spy() {
   const tokenFeat = useMemo(() => (tokenDetail ? seqFeatures(tokenDetail.decoded_action_seq ?? []) : null), [tokenDetail]);
 
   return (
-    <div className="grid page-grid spy-grid">
+    <QueryStateGate label="Spy" queries={[workersQ, histQ, pretrainQ, pretrainJobsQ, skillsQ]}>
+      <PageShell className="grid page-grid spy-grid">
       <section className="card spy-swarm" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Swarm Surveillance</h2>
@@ -335,7 +370,7 @@ export default function Spy() {
               </div>
             </div>
           </div>
-          <Swarm3D workers={workers} />
+          {isActive ? <Swarm3D workers={workers} /> : <div className="canvas-placeholder" />}
         </div>
       </section>
       <section className="card">
@@ -737,15 +772,16 @@ export default function Spy() {
       <section className="card">
         <h2>Events</h2>
         <div className="events" style={{ height: 360 }}>
-          <AutoSizer>
+          <ElementSizer key={kickKey}>
             {({ height, width }) => (
               <VirtualList height={height} width={width} itemCount={events.length || 1} itemSize={32}>
                 {EventRow}
               </VirtualList>
             )}
-          </AutoSizer>
+          </ElementSizer>
         </div>
       </section>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }

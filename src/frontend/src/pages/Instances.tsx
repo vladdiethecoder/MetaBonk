@@ -3,7 +3,6 @@ import { useEffect, useMemo, useState, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import * as THREE from "three";
 import VirtualList, { type ListChildComponentProps } from "../components/VirtualList";
-import AutoSizer from "react-virtualized-auto-sizer";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { fetchHistoricLeaderboard, fetchInstanceTimeline, fetchInstances, HistoricLeaderboardEntry, InstanceTimelineResponse, InstanceView } from "../api";
 import { useEventStream } from "../hooks/useEventStream";
@@ -12,8 +11,20 @@ import { useContextDrawer } from "../hooks/useContextDrawer";
 import { deriveReasonCode } from "../hooks/useIssues";
 import { clamp01, copyToClipboard, fmtFixed, fmtNum, fmtPct01, timeAgo } from "../lib/format";
 import { HEARTBEAT_SCHEMA_VERSION, schemaMismatchLabel } from "../lib/schema";
+import PageShell from "../components/PageShell";
+import ElementSizer from "../components/ElementSizer";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 function InstanceLatticeViz() {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const LatticeMesh = () => {
     const ref = useRef<THREE.Mesh | null>(null);
     useFrame((state) => {
@@ -29,8 +40,24 @@ function InstanceLatticeViz() {
       </mesh>
     );
   };
+  if (lost) return <div className="canvas-placeholder">WebGL context lost</div>;
   return (
-    <Canvas className="instances-core-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3.2], fov: 50 }}>
+    <Canvas
+      className="instances-core-canvas"
+      key={`instances-core-${resetNonce}`}
+      dpr={[1, 2]}
+      camera={{ position: [0, 0, 3.2], fov: 50 }}
+      onCreated={({ gl }) => {
+        const onLost = (evt: Event) => {
+          evt.preventDefault();
+          setLost(true);
+          reportWebglLost();
+        };
+        const onRestore = () => setLost(false);
+        gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+        gl.domElement.addEventListener("webglcontextrestored", onRestore);
+      }}
+    >
       <color attach="background" args={["#020405"]} />
       <ambientLight intensity={0.8} />
       <LatticeMesh />
@@ -86,10 +113,16 @@ function TelemetryChart({ points }: { points: Array<{ score?: number; reward?: n
 }
 
 export default function Instances() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/instances";
+  useActivationResizeKick(isActive);
+  const [kickKey, setKickKey] = useState(0);
+  useEffect(() => {
+    if (isActive) setKickKey((k) => k + 1);
+  }, [isActive]);
   const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 2000 });
   const histQ = useQuery({ queryKey: ["historicLeaderboard"], queryFn: () => fetchHistoricLeaderboard(200, "best_score"), refetchInterval: 5000 });
   const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
-  const loc = useLocation();
   const nav = useNavigate();
   const { ctx, windowSeconds } = useContextFilters();
   const events = useEventStream(220);
@@ -275,7 +308,8 @@ export default function Instances() {
   };
 
   return (
-    <div className="grid page-grid instances-grid" style={{ gridTemplateColumns: "minmax(0, 1.3fr) minmax(0, 0.7fr)" }}>
+    <QueryStateGate label="Instances" queries={[instQ, histQ, timelineQ]}>
+      <PageShell className="grid page-grid instances-grid" style={{ gridTemplateColumns: "minmax(0, 1.3fr) minmax(0, 0.7fr)" }}>
       <section className="card instances-core-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Instance Lattice</h2>
@@ -299,7 +333,7 @@ export default function Instances() {
               </div>
             </div>
           </div>
-          <InstanceLatticeViz />
+          {isActive ? <InstanceLatticeViz /> : <div className="canvas-placeholder" />}
         </div>
       </section>
       <section className="card flex-card">
@@ -359,13 +393,13 @@ export default function Instances() {
 
         <div className="v-table-body" style={{ flex: 1, minHeight: 0 }}>
           {rows.length ? (
-            <AutoSizer>
+            <ElementSizer key={kickKey}>
               {({ height, width }) => (
                 <VirtualList height={height} width={width} itemCount={rows.length} itemSize={72}>
                   {InstanceRow}
                 </VirtualList>
               )}
-            </AutoSizer>
+            </ElementSizer>
           ) : (
             <div className="muted" style={{ marginTop: 8 }}>
               no instances yet
@@ -503,6 +537,7 @@ export default function Instances() {
           </>
         )}
       </section>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }

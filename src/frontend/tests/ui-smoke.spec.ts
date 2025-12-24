@@ -1,5 +1,11 @@
 import { test, expect } from "@playwright/test";
 
+async function expectNotBlank(page: any) {
+  await page.waitForTimeout(250);
+  const bodyText = await page.locator("body").innerText();
+  expect(bodyText.trim().length).toBeGreaterThan(20);
+}
+
 const routes = [
   { path: "/", text: "Neuro-Synaptic Interface" },
   { path: "/overview", text: "Cluster Health" },
@@ -17,4 +23,9 @@ test.describe("UI smoke", () => {
       await expect(page.getByText(route.text, { exact: false })).toBeVisible();
     });
   }
+
+  test("broadcast route renders", async ({ page }) => {
+    await page.goto("/broadcast");
+    await expectNotBlank(page);
+  });
 });

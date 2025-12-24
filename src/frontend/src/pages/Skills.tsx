@@ -23,6 +23,12 @@ import {
   SkillsSummary,
 } from "../api";
 import { copyToClipboard } from "../lib/format";
+import PageShell from "../components/PageShell";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import { useLocation } from "react-router-dom";
+import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 function fmtPct(v: number | null | undefined, digits = 1) {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
@@ -56,6 +62,12 @@ function AtlasStarfield({
   selectedToken: number | null;
   onSelect: (tok: number) => void;
 }) {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const points = useMemo(() => {
     const pts = atlas?.points ?? [];
     return pts.map((p) => {
@@ -90,9 +102,27 @@ function AtlasStarfield({
     );
   };
 
+  if (lost) {
+    return <div className="canvas-placeholder">WebGL context lost</div>;
+  }
   return (
     <div className="atlas-starfield">
-      <Canvas className="atlas-r3f-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 2.6], fov: 50 }}>
+      <Canvas
+        className="atlas-r3f-canvas"
+        key={`skills-atlas-${resetNonce}`}
+        dpr={[1, 2]}
+        camera={{ position: [0, 0, 2.6], fov: 50 }}
+        onCreated={({ gl }) => {
+          const onLost = (evt: Event) => {
+            evt.preventDefault();
+            setLost(true);
+            reportWebglLost();
+          };
+          const onRestore = () => setLost(false);
+          gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+          gl.domElement.addEventListener("webglcontextrestored", onRestore);
+        }}
+      >
         <color attach="background" args={["#020405"]} />
         <ambientLight intensity={0.8} />
         <RotatingField />
@@ -104,6 +134,12 @@ function AtlasStarfield({
 }
 
 function TokenHelix({ detail }: { detail: SkillTokenDetail }) {
+  const [lost, setLost] = useState(false);
+  const resetNonce = useWebglResetNonce();
+  useEffect(() => {
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, []);
   const seq = detail.decoded_action_seq ?? [];
   const Helix = () => {
     const groupRef = useRef<THREE.Group | null>(null);
@@ -140,9 +176,27 @@ function TokenHelix({ detail }: { detail: SkillTokenDetail }) {
     );
   };
 
+  if (lost) {
+    return <div className="canvas-placeholder">WebGL context lost</div>;
+  }
   return (
     <div className="token-helix">
-      <Canvas className="token-helix-canvas" dpr={[1, 2]} camera={{ position: [0, 0, 3], fov: 50 }}>
+      <Canvas
+        className="token-helix-canvas"
+        key={`skills-helix-${resetNonce}`}
+        dpr={[1, 2]}
+        camera={{ position: [0, 0, 3], fov: 50 }}
+        onCreated={({ gl }) => {
+          const onLost = (evt: Event) => {
+            evt.preventDefault();
+            setLost(true);
+            reportWebglLost();
+          };
+          const onRestore = () => setLost(false);
+          gl.domElement.addEventListener("webglcontextlost", onLost, { passive: false });
+          gl.domElement.addEventListener("webglcontextrestored", onRestore);
+        }}
+      >
         <color attach="background" args={["#020405"]} />
         <ambientLight intensity={0.8} />
         <Helix />
@@ -544,6 +598,9 @@ function PrototypeGallery({ protos }: { protos: SkillPrototypesResponse | null }
 }
 
 export default function Skills() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/skills";
+  useActivationResizeKick(isActive);
   const qc = useQueryClient();
   const summaryQ = useQuery({ queryKey: ["skills", "summary"], queryFn: fetchSkillsSummary, refetchInterval: 3000 });
   const summary = summaryQ.data;
@@ -698,7 +755,8 @@ export default function Skills() {
   const tokenTags = detail?.tags ?? tokens.find((t) => t.token === selectedToken)?.tags ?? null;
 
   return (
-    <div className="grid page-grid skills-grid">
+    <QueryStateGate label="Skills" queries={[summaryQ, filesQ, atlasQ, timelineQ, tokenQ, effectsQ, protosQ]}>
+      <PageShell className="grid page-grid skills-grid">
       <section className="card">
         <div className="row-between">
           <h2>Skill Spy</h2>
@@ -861,7 +919,11 @@ export default function Skills() {
             </select>
           </div>
         </div>
-        <AtlasStarfield atlas={atlas ?? null} selectedToken={selectedToken} onSelect={(tok) => setSelectedToken(tok)} />
+        {isActive ? (
+          <AtlasStarfield atlas={atlas ?? null} selectedToken={selectedToken} onSelect={(tok) => setSelectedToken(tok)} />
+        ) : (
+          <div className="canvas-placeholder" />
+        )}
         <div className="split" style={{ marginTop: 10 }}>
           <div>
             <SkillAtlas
@@ -975,6 +1037,7 @@ export default function Skills() {
           </table>
         </div>
       </section>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }
