@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import cytoscape, { Core } from "cytoscape";
 import { BuildLabExamplesResponse, Heartbeat, fetchBuildLabExamples, fetchWorkers } from "../api";
 import ForceGraph3D from "react-force-graph-3d";
 import * as THREE from "three";
+import PageShell from "../components/PageShell";
+import QueryStateGate from "../components/QueryStateGate";
+import useActivationResizeKick from "../hooks/useActivationResizeKick";
+import { bumpWebglCount } from "../hooks/useWebglCounter";
+import { useWebglResetNonce } from "../hooks/useWebglReset";
 
 type Metric = "lift" | "deltaScore" | "pTop";
 type ViewMode = "web" | "tree" | "forge3d";
@@ -395,6 +400,10 @@ function layoutRadialTree(root: TreeNode, w: number, h: number, ringGap: number)
 }
 
 export default function BuildLab() {
+  const loc = useLocation();
+  const isActive = loc.pathname === "/build";
+  useActivationResizeKick(isActive);
+  const resetNonce = useWebglResetNonce();
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 1500 });
   const [metric, setMetric] = useState<Metric>("lift");
   const [viewMode, setViewMode] = useState<ViewMode>("web");
@@ -413,6 +422,12 @@ export default function BuildLab() {
   const pinnedRef = useRef<Set<string>>(new Set());
   const treeWrapRef = useRef<HTMLDivElement | null>(null);
   const [treeSize, setTreeSize] = useState({ w: 900, h: 680 });
+
+  useEffect(() => {
+    if (viewMode !== "forge3d") return;
+    bumpWebglCount(1);
+    return () => bumpWebglCount(-1);
+  }, [viewMode]);
 
   const allWorkers = useMemo(() => Object.values(workersQ.data ?? {}), [workersQ.data]);
   const policies = useMemo(() => {
@@ -920,7 +935,8 @@ export default function BuildLab() {
   const noCombos = !hasAnyItems && filteredWorkers.length > 0;
 
   return (
-    <div className="page buildlab">
+    <QueryStateGate label="Build Lab" queries={[workersQ, examplesQ]}>
+      <PageShell className="buildlab">
       <section className="forge-hero">
         <div>
           <div className="forge-title">Synergy Forge</div>
@@ -1143,6 +1159,7 @@ export default function BuildLab() {
           ) : viewMode === "forge3d" ? (
             <div className="forge3d-wrap">
               <ForceGraph3D
+                key={`buildlab-forge3d-${resetNonce}`}
                 graphData={forceGraphData}
                 backgroundColor="#050709"
                 nodeRelSize={4}
@@ -1536,6 +1553,7 @@ export default function BuildLab() {
           {!topPairsForTable.length ? <div className="muted">No combos yet — waiting for build data and more workers.</div> : null}
         </div>
       </div>
-    </div>
+      </PageShell>
+    </QueryStateGate>
   );
 }
