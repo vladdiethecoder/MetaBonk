@@ -229,14 +229,20 @@ class WorkerService:
         self.host = host
         self.port = port
         self.launcher = GameLauncher(instance_id=instance_id, display=display)
-        from src.common.device import require_cuda
-
-        use_dmabuf = os.environ.get("METABONK_CAPTURE_CPU", "0") not in ("1", "true", "True")
-        if require_cuda():
-            use_dmabuf = True
+        use_dmabuf = True
+        audit_log_path = os.environ.get("METABONK_DMABUF_AUDIT_LOG")
+        if not audit_log_path:
+            run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+            if run_dir:
+                try:
+                    worker_id = os.environ.get("METABONK_WORKER_ID", "0")
+                except Exception:
+                    worker_id = "0"
+                audit_log_path = str(Path(run_dir) / "logs" / f"worker_{worker_id}_dmabuf.log")
         self.stream = CaptureStream(
             pipewire_node=os.environ.get("PIPEWIRE_NODE"),
             use_dmabuf=use_dmabuf,
+            audit_log_path=audit_log_path,
         )
         # Starting a GStreamer PipeWire capture pipeline can be fragile on some systems
         # (driver/gi/gstreamer mismatches). For stream HUD purposes we only need NVENC,
@@ -5510,6 +5516,11 @@ class WorkerService:
             "launcher_last_pipewire_node": launcher_last_node,
             **self.trainer.metrics(),
         }
+        if self.stream is not None:
+            try:
+                out.update(self.stream.dmabuf_stats())
+            except Exception:
+                pass
         # Always include these keys so UIs can rely on them (None when streamer is not initialized).
         out.setdefault("stream_backend", None)
         out.setdefault("streamer_last_error", None)
