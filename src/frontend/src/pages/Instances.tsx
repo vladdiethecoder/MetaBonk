@@ -275,7 +275,7 @@ export default function Instances() {
   };
 
   return (
-    <div className="grid instances-grid" style={{ gridTemplateColumns: "1.3fr 0.7fr" }}>
+    <div className="grid page-grid instances-grid" style={{ gridTemplateColumns: "minmax(0, 1.3fr) minmax(0, 0.7fr)" }}>
       <section className="card instances-core-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Instance Lattice</h2>

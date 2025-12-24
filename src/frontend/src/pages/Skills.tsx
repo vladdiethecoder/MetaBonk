@@ -698,7 +698,7 @@ export default function Skills() {
   const tokenTags = detail?.tags ?? tokens.find((t) => t.token === selectedToken)?.tags ?? null;
 
   return (
-    <div className="grid skills-grid">
+    <div className="grid page-grid skills-grid">
       <section className="card">
         <div className="row-between">
           <h2>Skill Spy</h2>
@@ -931,47 +931,49 @@ export default function Skills() {
         <div className="muted" style={{ marginTop: 6 }}>
           click a row to inspect
         </div>
-        <table className="table table-hover" style={{ marginTop: 10 }}>
-          <thead>
-            <tr>
-              <th>Token</th>
-              <th>Name</th>
-              <th>Tags</th>
-              <th>Count</th>
-              <th>Count %</th>
-              <th>Usage %</th>
-              <th>Avg Reward</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredTokens.map((t) => {
-              const active = selectedToken === t.token;
-              return (
-                <tr
-                  key={t.token}
-                  className={active ? "active" : ""}
-                  onClick={() => setSelectedToken(t.token)}
-                  style={{ cursor: "pointer" }}
-                >
-                  <td>{t.token}</td>
-                  <td>{t.name ?? "—"}</td>
-                  <td className="muted">{t.tags?.slice?.(0, 2)?.join?.(", ") ?? "—"}</td>
-                  <td>{fmtNum(t.count)}</td>
-                  <td>{fmtPct(t.count_pct, 2)}</td>
-                  <td>{fmtPct(t.usage ?? null, 2)}</td>
-                  <td>{t.avg_reward.toFixed(3)}</td>
-                </tr>
-              );
-            })}
-            {!filteredTokens.length && (
+        <div className="table-viewport" style={{ marginTop: 10 }}>
+          <table className="table table-hover">
+            <thead>
               <tr>
-                <td colSpan={7} className="muted">
-                  no labeled skill tokens found
-                </td>
+                <th>Token</th>
+                <th>Name</th>
+                <th>Tags</th>
+                <th>Count</th>
+                <th>Count %</th>
+                <th>Usage %</th>
+                <th>Avg Reward</th>
               </tr>
-            )}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {filteredTokens.map((t) => {
+                const active = selectedToken === t.token;
+                return (
+                  <tr
+                    key={t.token}
+                    className={active ? "active" : ""}
+                    onClick={() => setSelectedToken(t.token)}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <td>{t.token}</td>
+                    <td>{t.name ?? "—"}</td>
+                    <td className="muted">{t.tags?.slice?.(0, 2)?.join?.(", ") ?? "—"}</td>
+                    <td>{fmtNum(t.count)}</td>
+                    <td>{fmtPct(t.count_pct, 2)}</td>
+                    <td>{fmtPct(t.usage ?? null, 2)}</td>
+                    <td>{t.avg_reward.toFixed(3)}</td>
+                  </tr>
+                );
+              })}
+              {!filteredTokens.length && (
+                <tr>
+                  <td colSpan={7} className="muted">
+                    no labeled skill tokens found
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
   );

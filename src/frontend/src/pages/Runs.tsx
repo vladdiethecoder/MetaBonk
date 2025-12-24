@@ -198,7 +198,7 @@ export default function Runs() {
   };
 
   return (
-    <div className="grid runs-grid" style={{ gridTemplateColumns: "1.2fr 0.8fr" }}>
+    <div className="grid page-grid runs-grid" style={{ gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr)" }}>
       <section className="card runs-core-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Run Constellation</h2>

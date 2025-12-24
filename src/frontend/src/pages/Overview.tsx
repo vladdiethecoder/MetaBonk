@@ -323,7 +323,10 @@ export default function Overview() {
   );
 
   return (
-    <div className="grid overview-grid" style={{ gridTemplateColumns: "1fr 1.35fr 0.85fr" }}>
+    <div
+      className="grid page-grid overview-grid"
+      style={{ gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.35fr) minmax(0, 0.85fr)" }}
+    >
       <section className="card warroom-card" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Global Hologram</h2>

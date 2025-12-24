@@ -62,18 +62,20 @@ export default function App() {
       </header>
       <ContextBar />
       <main className="main">
-        <Suspense fallback={<div className="card">loading…</div>}>
-          <Routes>
-            <Route path="/overview" element={<Overview />} />
-            <Route path="/runs" element={<Runs />} />
-            <Route path="/instances" element={<Instances />} />
-            <Route path="/build" element={<BuildLab />} />
-            <Route path="/skills" element={<Skills />} />
-            <Route path="/spy" element={<Spy />} />
-            <Route path="/stream" element={<Stream />} />
-            <Route path="/cctv" element={<CCTV3D />} />
-          </Routes>
-        </Suspense>
+        <div className="page-scroll">
+          <Suspense fallback={<div className="card">loading…</div>}>
+            <Routes>
+              <Route path="/overview" element={<Overview />} />
+              <Route path="/runs" element={<Runs />} />
+              <Route path="/instances" element={<Instances />} />
+              <Route path="/build" element={<BuildLab />} />
+              <Route path="/skills" element={<Skills />} />
+              <Route path="/spy" element={<Spy />} />
+              <Route path="/stream" element={<Stream />} />
+              <Route path="/cctv" element={<CCTV3D />} />
+            </Routes>
+          </Suspense>
+        </div>
       </main>
       <IssuesDrawer open={issuesOpen} onClose={() => setIssuesOpen(false)} />
       <ContextDrawer />

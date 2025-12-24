@@ -311,7 +311,7 @@ export default function Spy() {
   const tokenFeat = useMemo(() => (tokenDetail ? seqFeatures(tokenDetail.decoded_action_seq ?? []) : null), [tokenDetail]);
 
   return (
-    <div className="grid spy-grid">
+    <div className="grid page-grid spy-grid">
       <section className="card spy-swarm" style={{ gridColumn: "1 / -1" }}>
         <div className="row-between">
           <h2>Swarm Surveillance</h2>
