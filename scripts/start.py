@@ -35,6 +35,12 @@ import glob
 
 from stack_banner import print_stack_banner
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.common.gpu_contract import enforce_gpu_contract
+
 
 def _spawn(
     name: str,
@@ -431,6 +437,7 @@ def main() -> int:
         env["MEGABONK_GAME_DIR"] = game_dir
 
     print_stack_banner(repo_root, game_dir=game_dir)
+    enforce_gpu_contract(context="start")
     env["METABONK_BANNER_PRINTED"] = os.environ.get("METABONK_BANNER_PRINTED", "1")
 
     procs: List[subprocess.Popen] = []

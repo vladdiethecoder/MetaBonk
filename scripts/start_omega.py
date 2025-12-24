@@ -34,6 +34,12 @@ from typing import Dict, List, Optional, Tuple
 
 from stack_banner import print_stack_banner
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.common.gpu_contract import enforce_gpu_contract
+
 
 @dataclass
 class Proc:
@@ -432,6 +438,7 @@ def main() -> int:
     py = sys.executable
 
     print_stack_banner(repo_root, game_dir=args.game_dir)
+    enforce_gpu_contract(context="start_omega")
 
     # Dream mode is an offline pipeline: run as a single subprocess and return its exit code.
     if args.mode == "dream":

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import platform
+import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -18,6 +20,26 @@ def _run(cmd: list[str], timeout: float = 2.0) -> Optional[str]:
         return out.decode("utf-8", "replace").strip()
     except Exception:
         return None
+
+
+def _find_nvidia_smi() -> Optional[str]:
+    override = os.environ.get("METABONK_NVIDIA_SMI") or os.environ.get("NVIDIA_SMI_PATH")
+    if override and Path(override).exists():
+        return str(override)
+    cmd = shutil.which("nvidia-smi")
+    if cmd:
+        return cmd
+    for candidate in (
+        "/usr/bin/nvidia-smi",
+        "/usr/sbin/nvidia-smi",
+        "/usr/local/bin/nvidia-smi",
+        "/usr/local/sbin/nvidia-smi",
+        "/bin/nvidia-smi",
+        "/sbin/nvidia-smi",
+    ):
+        if Path(candidate).exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 def _os_release() -> str:
@@ -47,14 +69,19 @@ def _git_sha(repo_root: Path) -> str:
 
 
 def _nvidia_versions() -> tuple[str, str]:
-    smi = _run(["nvidia-smi", "--query-gpu=driver_version,cuda_version", "--format=csv,noheader"], timeout=1.5)
-    if not smi:
+    smi_cmd = _find_nvidia_smi()
+    if not smi_cmd:
         return "missing", "missing"
-    line = smi.splitlines()[0]
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return parts[0] if parts else "unknown", "unknown"
+    driver = _run([smi_cmd, "--query-gpu=driver_version", "--format=csv,noheader"], timeout=4.0)
+    if not driver:
+        return "missing", "missing"
+    cuda = "unknown"
+    smi = _run([smi_cmd], timeout=4.0)
+    if smi:
+        match = re.search(r"CUDA Version:\s*([0-9.]+)", smi)
+        if match:
+            cuda = match.group(1)
+    return driver.splitlines()[0].strip(), cuda
 
 
 def _ffmpeg_version() -> str:
