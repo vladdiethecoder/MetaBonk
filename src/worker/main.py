@@ -297,6 +297,11 @@ class WorkerService:
         self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
         self._menu_log = os.environ.get("METABONK_MENU_LOG", "0") in ("1", "true", "True")
         try:
+            self._action_log_freq = int(os.environ.get("METABONK_ACTION_LOG_FREQ", "0"))
+        except Exception:
+            self._action_log_freq = 0
+        self._last_action_log_step = -1
+        try:
             self._menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
         except Exception:
             self._menu_start_bonus = 0.0
@@ -3993,6 +3998,21 @@ class WorkerService:
                     action_label = "cont"
                 entropy = getattr(self.trainer, "last_entropy", None)
                 input_vec = [float(x) for x in (a_cont or [])] + [float(x) for x in (a_disc or [])]
+                if self._action_log_freq > 0:
+                    step_now = int(getattr(self.trainer, "step_count", 0) or 0)
+                    if step_now != self._last_action_log_step and (step_now % self._action_log_freq) == 0:
+                        self._last_action_log_step = step_now
+                        disc_on = [i for i, v in enumerate(a_disc or []) if int(v) == 1]
+                        disc_preview = disc_on[:8]
+                        disc_suffix = f"+{len(disc_on) - len(disc_preview)}" if len(disc_on) > len(disc_preview) else ""
+                        cont_preview = [round(float(x), 3) for x in (a_cont or [])[:3]]
+                        menu_name = cur_menu or str(game_state.get("currentMenu") or "")
+                        print(
+                            f"[worker:{self.instance_id}] action step={step_now} src={action_source} "
+                            f"label={action_label} menu={menu_name or 'none'} playing={playing_flag} "
+                            f"bootstrap={input_bootstrap} cont={cont_preview} disc={disc_preview}{disc_suffix}",
+                            flush=True,
+                        )
                 self._record_flight_frame(
                     action_label=action_label,
                     input_vector=input_vec,
