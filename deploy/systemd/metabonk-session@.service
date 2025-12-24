@@ -1,0 +1,22 @@
+[Unit]
+Description=MetaBonk Gamescope Session %i
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/metabonk
+Environment=METABONK_SESSION_ID=%i
+EnvironmentFile=-/etc/metabonk/session.env
+ExecStart=/opt/metabonk/scripts/launch_gamescope.sh %i -- /opt/metabonk/scripts/launch_game.sh %i
+Restart=on-failure
+RestartSec=2
+WatchdogSec=5s
+KillMode=control-group
+TimeoutStopSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target
