@@ -1,12 +1,9 @@
-"""X11 input backend using xdotool.
-
-Targets the current X11 DISPLAY (per-worker when using Xvfb) and injects
-keyboard/mouse events via xdotool. This provides per-instance input isolation
-without requiring /dev/uinput access.
-"""
+"""X11 input backend using libxdo (direct, low-latency)."""
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import os
 import shutil
 import subprocess
@@ -14,82 +11,64 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from .xdotool_backend import _normalize_button, _normalize_key
 
-class XDoToolError(RuntimeError):
+
+class LibXDoError(RuntimeError):
     pass
 
 
-_KEY_MAP = {
-    "SPACE": "space",
-    "ENTER": "Return",
-    "RETURN": "Return",
-    "ESC": "Escape",
-    "ESCAPE": "Escape",
-    "TAB": "Tab",
-    "BACKSPACE": "BackSpace",
-    "SHIFT": "Shift_L",
-    "LSHIFT": "Shift_L",
-    "RSHIFT": "Shift_R",
-    "CTRL": "Control_L",
-    "CONTROL": "Control_L",
-    "LCTRL": "Control_L",
-    "RCTRL": "Control_R",
-    "ALT": "Alt_L",
-    "LALT": "Alt_L",
-    "RALT": "Alt_R",
-    "SUPER": "Super_L",
-    "META": "Super_L",
-    "WIN": "Super_L",
-    "UP": "Up",
-    "DOWN": "Down",
-    "LEFT": "Left",
-    "RIGHT": "Right",
-    "PGUP": "Page_Up",
-    "PAGEUP": "Page_Up",
-    "PGDN": "Page_Down",
-    "PAGEDOWN": "Page_Down",
-}
-
-_MOUSE_BTN_MAP = {
-    "LEFT": 1,
-    "RIGHT": 3,
-    "MIDDLE": 2,
-    "BTN_LEFT": 1,
-    "BTN_RIGHT": 3,
-    "BTN_MIDDLE": 2,
-    "MOUSE_LEFT": 1,
-    "MOUSE_RIGHT": 3,
-    "MOUSE_MIDDLE": 2,
-}
+def _load_libxdo() -> ctypes.CDLL:
+    path = ctypes.util.find_library("xdo")
+    if not path:
+        raise LibXDoError("libxdo not found (install libxdo-devel/libxdo-dev)")
+    return ctypes.CDLL(path)
 
 
-def _normalize_key(name: str) -> str:
-    key = (name or "").strip()
-    if not key:
-        return ""
-    if key.upper().startswith("KEY_"):
-        key = key.upper()[4:]
-    up = key.upper()
-    if up in _KEY_MAP:
-        return _KEY_MAP[up]
-    if len(key) == 1:
-        return key.lower()
-    if up.startswith("F") and up[1:].isdigit():
-        return up
-    return key
+_libxdo = _load_libxdo()
 
 
-def _normalize_button(name: str | int) -> int:
-    if isinstance(name, int):
-        return name
-    key = (name or "").strip().upper()
-    if not key:
-        return 1
-    return _MOUSE_BTN_MAP.get(key, 1)
+class _XDO(ctypes.Structure):
+    pass
+
+
+_libxdo.xdo_new.argtypes = [ctypes.c_char_p]
+_libxdo.xdo_new.restype = ctypes.POINTER(_XDO)
+_libxdo.xdo_free.argtypes = [ctypes.POINTER(_XDO)]
+_libxdo.xdo_free.restype = None
+_libxdo.xdo_move_mouse_relative.argtypes = [ctypes.POINTER(_XDO), ctypes.c_int, ctypes.c_int]
+_libxdo.xdo_move_mouse_relative.restype = ctypes.c_int
+_libxdo.xdo_click_window.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
+_libxdo.xdo_click_window.restype = ctypes.c_int
+_libxdo.xdo_send_keysequence_window.argtypes = [
+    ctypes.POINTER(_XDO),
+    ctypes.c_ulong,
+    ctypes.c_char_p,
+    ctypes.c_int,
+]
+_libxdo.xdo_send_keysequence_window.restype = ctypes.c_int
+_libxdo.xdo_send_keysequence_window_down.argtypes = [
+    ctypes.POINTER(_XDO),
+    ctypes.c_ulong,
+    ctypes.c_char_p,
+    ctypes.c_int,
+]
+_libxdo.xdo_send_keysequence_window_down.restype = ctypes.c_int
+_libxdo.xdo_send_keysequence_window_up.argtypes = [
+    ctypes.POINTER(_XDO),
+    ctypes.c_ulong,
+    ctypes.c_char_p,
+    ctypes.c_int,
+]
+_libxdo.xdo_send_keysequence_window_up.restype = ctypes.c_int
+_libxdo.xdo_mouse_down.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
+_libxdo.xdo_mouse_down.restype = ctypes.c_int
+_libxdo.xdo_mouse_up.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
+_libxdo.xdo_mouse_up.restype = ctypes.c_int
 
 
 @dataclass
-class XDoToolBackend:
+class LibXDoBackend:
     display: Optional[str] = None
     xauth: Optional[str] = None
     window_name: Optional[str] = None
@@ -100,12 +79,10 @@ class XDoToolBackend:
     allow_any_fallback: bool = False
 
     def __post_init__(self) -> None:
-        if not shutil.which("xdotool"):
-            raise XDoToolError("xdotool not found in PATH")
         self._env = os.environ.copy()
         disp = self.display or self._env.get("DISPLAY")
         if not disp:
-            raise XDoToolError("DISPLAY not set for xdotool backend")
+            raise LibXDoError("DISPLAY not set for libxdo backend")
         self._env["DISPLAY"] = disp
         if self.xauth:
             self._env["XAUTHORITY"] = self.xauth
@@ -131,13 +108,19 @@ class XDoToolBackend:
             self._search_maxdepth = max(0, int(os.environ.get("METABONK_INPUT_XDO_MAXDEPTH", "2")))
         except Exception:
             self._search_maxdepth = 2
-        geom_fallback_env = str(os.environ.get("METABONK_INPUT_XDO_GEOMETRY_FALLBACK", "1") or "1").strip().lower()
-        self._geometry_fallback = geom_fallback_env not in ("0", "false", "no", "off")
         self._window_id: Optional[str] = None
         self._last_focus_ts = 0.0
+        self._xdo = _libxdo.xdo_new(disp.encode("utf-8"))
+        if not self._xdo:
+            raise LibXDoError(f"failed to open X display {disp!r}")
 
     def close(self) -> None:
-        return
+        if getattr(self, "_xdo", None):
+            try:
+                _libxdo.xdo_free(self._xdo)
+            except Exception:
+                pass
+            self._xdo = None
 
     def get_window_id(self) -> Optional[str]:
         return self._resolve_window_id()
@@ -159,65 +142,44 @@ class XDoToolBackend:
         k = _normalize_key(key)
         if not k:
             return
-        if not self._ensure_focus():
-            return
         wid = self._resolve_window_id()
-        cmd = ["xdotool", "keydown", "--clearmodifiers"]
-        if wid:
-            cmd += ["--window", wid]
-        cmd.append(k)
-        self._run(cmd)
+        if not wid:
+            return
+        _libxdo.xdo_send_keysequence_window_down(self._xdo, int(wid), k.encode("utf-8"), 0)
 
     def key_up(self, key: str) -> None:
         k = _normalize_key(key)
         if not k:
             return
-        if not self._ensure_focus():
-            return
         wid = self._resolve_window_id()
-        cmd = ["xdotool", "keyup", "--clearmodifiers"]
-        if wid:
-            cmd += ["--window", wid]
-        cmd.append(k)
-        self._run(cmd)
+        if not wid:
+            return
+        _libxdo.xdo_send_keysequence_window_up(self._xdo, int(wid), k.encode("utf-8"), 0)
 
     def mouse_move(self, dx: int, dy: int) -> None:
         if not dx and not dy:
             return
-        if not self._ensure_focus():
-            return
-        wid = self._resolve_window_id()
-        cmd = ["xdotool", "mousemove_relative"]
-        if wid:
-            cmd += ["--window", wid]
-        cmd += ["--", str(int(dx)), str(int(dy))]
-        self._run(cmd)
+        _libxdo.xdo_move_mouse_relative(self._xdo, int(dx), int(dy))
 
     def mouse_button(self, button: str | int, pressed: bool) -> None:
         btn = _normalize_button(button)
-        if not self._ensure_focus():
-            return
-        cmd = "mousedown" if pressed else "mouseup"
         wid = self._resolve_window_id()
-        args = ["xdotool", cmd]
-        if wid:
-            args += ["--window", wid]
-        args.append(str(int(btn)))
-        self._run(args)
+        if not wid:
+            return
+        if pressed:
+            _libxdo.xdo_mouse_down(self._xdo, int(wid), int(btn))
+        else:
+            _libxdo.xdo_mouse_up(self._xdo, int(wid), int(btn))
 
     def mouse_scroll(self, steps: int) -> None:
         if not steps:
             return
-        if not self._ensure_focus():
-            return
         wid = self._resolve_window_id()
+        if not wid:
+            return
         btn = 4 if steps > 0 else 5
         for _ in range(abs(int(steps))):
-            args = ["xdotool", "click"]
-            if wid:
-                args += ["--window", wid]
-            args.append(str(btn))
-            self._run(args)
+            _libxdo.xdo_click_window(self._xdo, int(wid), int(btn))
 
     def click_center(self) -> None:
         self.click_at(0.5, 0.5)
@@ -226,7 +188,7 @@ class XDoToolBackend:
         wid = self._resolve_window_id()
         if not wid:
             return
-        if not self._ensure_focus():
+        if not shutil.which("xdotool"):
             return
         geom = self._capture_output(["xdotool", "getwindowgeometry", "--shell", wid])
         if not geom:
@@ -254,36 +216,20 @@ class XDoToolBackend:
         yf = min(max(yf, 0.0), 1.0)
         x = int(width * xf)
         y = int(height * yf)
-        self._run(["xdotool", "mousemove", "--window", wid, str(x), str(y)])
-        # Use explicit press/release on the target window to reduce flakiness with synthetic events.
-        self._run(["xdotool", "mousedown", "--window", wid, "1"])
-        time.sleep(0.12)
-        self._run(["xdotool", "mouseup", "--window", wid, "1"])
-
-    def _run(self, cmd: list[str]) -> None:
-        subprocess.run(
-            cmd,
-            env=self._env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-
-    def _ensure_focus(self) -> bool:
-        wid = self._resolve_window_id()
-        if not wid:
-            return False
-        now = time.time()
-        if (now - self._last_focus_ts) >= self.focus_cooldown_s:
-            # gamescope/Xwayland sometimes doesn't support _NET_ACTIVE_WINDOW; windowfocus still works.
-            self._run(["xdotool", "windowactivate", "--sync", wid])
-            self._run(["xdotool", "windowfocus", "--sync", wid])
-            self._last_focus_ts = now
-        return True
+        subprocess.run(["xdotool", "mousemove", "--window", wid, str(x), str(y)], env=self._env, check=False)
+        subprocess.run(["xdotool", "mousedown", "--window", wid, "1"], env=self._env, check=False)
+        time.sleep(0.08)
+        subprocess.run(["xdotool", "mouseup", "--window", wid, "1"], env=self._env, check=False)
 
     def _resolve_window_id(self) -> Optional[str]:
         if self._window_id:
             return self._window_id
+        wid_env = os.environ.get("METABONK_INPUT_XDO_WID")
+        if wid_env and str(wid_env).isdigit():
+            self._window_id = str(int(wid_env))
+            return self._window_id
+        if not shutil.which("xdotool"):
+            return None
         flags = []
         if self._search_onlyvisible:
             flags.append("--onlyvisible")
@@ -295,7 +241,6 @@ class XDoToolBackend:
             if wid:
                 self._window_id = wid
                 return wid
-        # Prefer explicit window name/class from env.
         name = self.window_name or os.environ.get("METABONK_INPUT_XDO_WINDOW", "")
         wclass = self.window_class or os.environ.get("METABONK_INPUT_XDO_CLASS", "")
         if wclass:
@@ -308,60 +253,21 @@ class XDoToolBackend:
             if wid:
                 self._window_id = wid
                 return wid
-        # Fallback to active window if any.
         if self.allow_active_fallback:
             wid = self._capture_output(["xdotool", "getactivewindow"])
             if wid:
                 self._window_id = wid
                 return wid
-        # Final fallback: pick the largest visible window on this DISPLAY (safer than "first").
-        if self.allow_any_fallback and self._geometry_fallback:
-            wid = self._largest_window_id(flags)
-            if wid:
-                self._window_id = wid
-                return wid
-        # Last resort: first matching window.
         if self.allow_any_fallback:
             wid = self._search_window(["xdotool", "search", *flags, "--name", ".*"])
             if wid:
                 self._window_id = wid
         return self._window_id
 
-    def _largest_window_id(self, flags: list[str]) -> Optional[str]:
-        out = self._capture_output(["xdotool", "search", *flags, "--name", ".*"])
-        if not out:
-            return None
-        best_area = -1
-        best_wid: Optional[str] = None
-        for wid in [w.strip() for w in out.splitlines() if w.strip()]:
-            geom = self._capture_output(["xdotool", "getwindowgeometry", "--shell", wid])
-            if not geom:
-                continue
-            width = height = None
-            for line in geom.splitlines():
-                if line.startswith("WIDTH="):
-                    try:
-                        width = int(line.split("=", 1)[1])
-                    except Exception:
-                        width = None
-                elif line.startswith("HEIGHT="):
-                    try:
-                        height = int(line.split("=", 1)[1])
-                    except Exception:
-                        height = None
-            if not width or not height:
-                continue
-            area = int(width) * int(height)
-            if area > best_area:
-                best_area = area
-                best_wid = wid
-        return best_wid
-
     def _search_window(self, cmd: list[str]) -> Optional[str]:
         out = self._capture_output(cmd)
         if not out:
             return None
-        # xdotool can return multiple IDs; take the first.
         return out.splitlines()[0].strip()
 
     def _capture_output(self, cmd: list[str]) -> Optional[str]:
@@ -373,4 +279,4 @@ class XDoToolBackend:
         return txt or None
 
 
-__all__ = ["XDoToolBackend", "XDoToolError"]
+__all__ = ["LibXDoBackend", "LibXDoError"]

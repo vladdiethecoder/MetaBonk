@@ -72,6 +72,11 @@ try:
 except Exception:  # pragma: no cover
     XDoToolBackend = None  # type: ignore
     XDoToolError = Exception  # type: ignore
+try:
+    from src.input.libxdo_backend import LibXDoBackend, LibXDoError
+except Exception:  # pragma: no cover
+    LibXDoBackend = None  # type: ignore
+    LibXDoError = Exception  # type: ignore
 
 
 app: Optional["FastAPI"] = FastAPI(title="MetaBonk Worker") if FastAPI else None
@@ -1264,8 +1269,38 @@ class WorkerService:
         try:
             if hasattr(self._input_backend, "set_window_pid"):
                 self._input_backend.set_window_pid(int(pid))
+                os.environ["METABONK_INPUT_XDO_PID"] = str(int(pid))
+                print(f"[worker:{self.instance_id}] bound input to pid {int(pid)}", flush=True)
+                self._log_input_binding(int(pid))
         except Exception:
             pass
+
+    def _log_input_binding(self, pid: Optional[int]) -> None:
+        try:
+            wid = None
+            if hasattr(self._input_backend, "get_window_id"):
+                wid = self._input_backend.get_window_id()
+            if wid:
+                os.environ["METABONK_INPUT_XDO_WID"] = str(wid)
+            run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+            if not run_dir:
+                return
+            worker_id = os.environ.get("METABONK_WORKER_ID")
+            if not worker_id:
+                try:
+                    worker_id = str(int(str(self.instance_id).rsplit("-", 1)[-1]))
+                except Exception:
+                    worker_id = None
+            if not worker_id:
+                return
+            log_path = os.path.join(run_dir, "logs", f"worker_{worker_id}_isolation.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                if pid:
+                    f.write(f"GAME_PID={int(pid)}\n")
+                if wid:
+                    f.write(f"WINDOW_ID={wid}\n")
+        except Exception:
+            return
 
     def _set_latest_jpeg(self, data: Optional[bytes]) -> None:
         if not data:
@@ -2269,7 +2304,7 @@ class WorkerService:
 
     def _init_input_backend(self) -> None:
         name = self._input_backend_name
-        if name not in ("uinput", "xdotool", "xdo"):
+        if name not in ("uinput", "xdotool", "xdo", "libxdo"):
             return
         self._input_buttons = self._parse_input_buttons()
         self._menu_bias_indices = self._resolve_menu_bias_indices()
@@ -2289,6 +2324,29 @@ class WorkerService:
                 print(f"[worker:{self.instance_id}] uinput backend enabled (focused window receives input)")
             except UInputError as e:
                 print(f"[worker:{self.instance_id}] uinput backend failed: {e}")
+                self._input_backend = None
+                self._input_menu_bootstrap = False
+            return
+        # libxdo backend (direct X11 input)
+        if name == "libxdo":
+            if LibXDoBackend is None:
+                print(f"[worker:{self.instance_id}] libxdo backend unavailable (missing dependency)")
+                self._input_menu_bootstrap = False
+                return
+            try:
+                display = os.environ.get("METABONK_INPUT_DISPLAY") or self.display
+                xauth = os.environ.get("METABONK_INPUT_XAUTHORITY") or os.environ.get("XAUTHORITY")
+                window_name = os.environ.get("METABONK_INPUT_XDO_WINDOW")
+                window_class = os.environ.get("METABONK_INPUT_XDO_CLASS")
+                self._input_backend = LibXDoBackend(
+                    display=display,
+                    xauth=xauth,
+                    window_name=window_name,
+                    window_class=window_class,
+                )
+                print(f"[worker:{self.instance_id}] libxdo backend enabled (DISPLAY={display})")
+            except LibXDoError as e:
+                print(f"[worker:{self.instance_id}] libxdo backend failed: {e}")
                 self._input_backend = None
                 self._input_menu_bootstrap = False
             return

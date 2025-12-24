@@ -27,6 +27,7 @@ import sys
 import time
 import shutil
 import json
+import ctypes.util
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,52 @@ class Proc:
     stdout_path: Optional[str] = None
     restart_count: int = 0
     last_start_ts: float = 0.0
+
+
+def _parse_env_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    val = str(value).strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _parse_gpu_list(raw: str) -> List[str]:
+    items: List[str] = []
+    if not raw:
+        return items
+    for chunk in str(raw).replace(";", ",").replace(" ", ",").split(","):
+        token = chunk.strip()
+        if token:
+            items.append(token)
+    return items
+
+
+def _libxdo_available() -> bool:
+    try:
+        return bool(ctypes.util.find_library("xdo"))
+    except Exception:
+        return False
+
+
+def _gpu_preflight(env: Dict[str, str]) -> Optional[str]:
+    if shutil.which("nvidia-smi") is None:
+        return "nvidia-smi not found (GPU render required)"
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"], stderr=subprocess.STDOUT, timeout=2.0)
+        if not out or not out.decode("utf-8", "replace").strip():
+            return "nvidia-smi returned no GPUs (GPU render required)"
+    except Exception as e:
+        return f"nvidia-smi failed: {e}"
+    vk_icd = env.get("VK_ICD_FILENAMES")
+    if vk_icd and Path(vk_icd).exists():
+        return None
+    if Path("/usr/share/vulkan/icd.d/nvidia_icd.json").exists():
+        return None
+    return "NVIDIA Vulkan ICD not found (set VK_ICD_FILENAMES or install nvidia icd)"
 
 
 def _spawn(
@@ -955,10 +1002,11 @@ def main() -> int:
         n_workers = 1 if args.mode == "play" else int(args.workers)
         if n_workers > 0:
             _prepare_instance_game_dirs(int(n_workers))
-        use_xvfb = env.get("MEGABONK_USE_XVFB", "0") in ("1", "true", "True")
+        use_xvfb_flag = _parse_env_bool(env.get("MEGABONK_USE_XVFB"))
+        use_xvfb = use_xvfb_flag if use_xvfb_flag is not None else (n_workers > 1)
         xvfb_ok = use_xvfb and shutil.which("Xvfb") is not None
         if use_xvfb and not xvfb_ok:
-            print("[start_omega] WARN: MEGABONK_USE_XVFB=1 but Xvfb not found; instances may appear on your desktop.")
+            print("[start_omega] WARN: Xvfb requested but not found; instances may appear on your desktop.")
         if n_workers > 1 and not xvfb_ok:
             print(
                 "[start_omega] WARN: multi-worker without Xvfb; input isolation may be incomplete. "
@@ -966,10 +1014,46 @@ def main() -> int:
             )
         xvfb_base = int(env.get("MEGABONK_XVFB_BASE", "90"))
         xvfb_size = env.get("MEGABONK_XVFB_SIZE", "1280x720x24")
+        worker_gpu_map = _parse_gpu_list(str(env.get("METABONK_WORKER_GPU_MAP", "") or "").strip())
+        gpu_auto_flag = _parse_env_bool(env.get("METABONK_WORKER_GPU_AUTO"))
+        gpu_auto = gpu_auto_flag if gpu_auto_flag is not None else (n_workers > 1)
+        force_gpu_env = _parse_env_bool(env.get("METABONK_REQUIRE_GPU_RENDER"))
+        if force_gpu_env is None:
+            force_gpu_env = _parse_env_bool(env.get("METABONK_REQUIRE_GPU"))
+        if force_gpu_env is None:
+            force_gpu_env = str(env.get("METABONK_REQUIRE_CUDA", "") or "").strip().lower() in ("1", "true", "yes", "on")
+        nvidia_icd = Path("/usr/share/vulkan/icd.d/nvidia_icd.json")
+        if force_gpu_env:
+            preflight_err = _gpu_preflight(env)
+            if preflight_err:
+                raise SystemExit(f"[start_omega] ERROR: {preflight_err}")
+        libxdo_ok = _libxdo_available()
+        candidate_gpus: List[str] = []
+        if not worker_gpu_map and gpu_auto:
+            cvd_raw = env.get("CUDA_VISIBLE_DEVICES")
+            cvd = str(cvd_raw or "").strip()
+            explicit_cvd = cvd_raw is not None
+            if explicit_cvd and gpu_auto_flag is not True:
+                candidate_gpus = []
+            elif cvd:
+                candidate_gpus = _parse_gpu_list(cvd)
+            else:
+                try:
+                    import torch  # type: ignore
+
+                    if torch.cuda.is_available():
+                        count = int(torch.cuda.device_count())
+                        candidate_gpus = [str(i) for i in range(max(0, count))]
+                except Exception:
+                    candidate_gpus = []
         run_dir = env.get("METABONK_RUN_DIR") or env.get("MEGABONK_LOG_DIR") or ""
         logs_dir = Path(run_dir) / "logs" if run_dir else None
         if logs_dir:
             logs_dir.mkdir(parents=True, exist_ok=True)
+        seen_displays: set[str] = set()
+        seen_worker_ports: set[str] = set()
+        seen_sidecar_ports: set[str] = set()
+        seen_bonklink_ports: set[str] = set()
         for i in range(max(0, n_workers)):
             iid = f"{args.instance_prefix}-{i}"
             wenv = env.copy()
@@ -977,9 +1061,17 @@ def main() -> int:
             wenv["MEGABONK_INSTANCE_ID"] = iid
             wenv["POLICY_NAME"] = args.policy_name
             wenv["WORKER_PORT"] = str(args.worker_base_port + i)
+            wenv.setdefault("METABONK_WORKER_PORT", wenv["WORKER_PORT"])
             wenv["MEGABONK_SIDECAR_PORT"] = str(args.sidecar_base_port + i)
             wenv["METABONK_BONKLINK_HOST"] = str(args.bonklink_host)
             wenv["METABONK_BONKLINK_PORT"] = str(args.bonklink_base_port + i)
+            wenv["METABONK_WORKER_ID"] = str(i)
+            if force_gpu_env:
+                wenv.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+                wenv.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+                wenv.setdefault("__VK_LAYER_NV_optimus", "NVIDIA_only")
+                if "VK_ICD_FILENAMES" not in wenv and nvidia_icd.exists():
+                    wenv["VK_ICD_FILENAMES"] = str(nvidia_icd)
             if args.capture_disabled:
                 wenv.setdefault("METABONK_CAPTURE_DISABLED", "1")
             if xvfb_ok:
@@ -991,7 +1083,8 @@ def main() -> int:
                 wenv["SDL_VIDEODRIVER"] = "x11"
                 wenv.setdefault("XDG_SESSION_TYPE", "x11")
                 wenv.setdefault("METABONK_INPUT_DISPLAY", wenv["DISPLAY"])
-                wenv.setdefault("METABONK_INPUT_BACKEND", "xdotool")
+                if not wenv.get("METABONK_INPUT_BACKEND"):
+                    wenv["METABONK_INPUT_BACKEND"] = "libxdo" if libxdo_ok else "xdotool"
                 procs.append(
                     _spawn(
                         f"xvfb-{iid}",
@@ -1007,7 +1100,10 @@ def main() -> int:
                     wenv["METABONK_INPUT_DISPLAY"] = str(
                         wenv.get("METABONK_GAMESCOPE_INPUT_DISPLAY", ":1")
                     )
-                wenv.setdefault("METABONK_INPUT_BACKEND", "xdotool")
+                if not wenv.get("METABONK_INPUT_DISPLAY") and wenv.get("DISPLAY"):
+                    wenv["METABONK_INPUT_DISPLAY"] = wenv["DISPLAY"]
+                if not wenv.get("METABONK_INPUT_BACKEND"):
+                    wenv["METABONK_INPUT_BACKEND"] = "libxdo" if libxdo_ok else "xdotool"
                 wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "1")
                 if not (
                     wenv.get("METABONK_INPUT_BUTTONS")
@@ -1018,13 +1114,47 @@ def main() -> int:
                 # Default the xdotool window matcher to the game name if not specified.
                 if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                     wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
+            if xvfb_ok:
+                disp = str(wenv.get("DISPLAY") or "")
+                if disp:
+                    if disp in seen_displays:
+                        raise SystemExit(f"[start_omega] ERROR: duplicate DISPLAY assigned: {disp}")
+                    seen_displays.add(disp)
+            worker_port = str(wenv.get("WORKER_PORT") or "")
+            if worker_port:
+                if worker_port in seen_worker_ports:
+                    raise SystemExit(f"[start_omega] ERROR: duplicate WORKER_PORT assigned: {worker_port}")
+                seen_worker_ports.add(worker_port)
+            sidecar_port = str(wenv.get("MEGABONK_SIDECAR_PORT") or "")
+            if sidecar_port:
+                if sidecar_port in seen_sidecar_ports:
+                    raise SystemExit(f"[start_omega] ERROR: duplicate SIDECAR_PORT assigned: {sidecar_port}")
+                seen_sidecar_ports.add(sidecar_port)
+            bonklink_port = str(wenv.get("METABONK_BONKLINK_PORT") or "")
+            if bonklink_port:
+                if bonklink_port in seen_bonklink_ports:
+                    raise SystemExit(f"[start_omega] ERROR: duplicate BONKLINK_PORT assigned: {bonklink_port}")
+                seen_bonklink_ports.add(bonklink_port)
+            gpu_choice = None
+            if worker_gpu_map:
+                gpu_choice = worker_gpu_map[i % len(worker_gpu_map)]
+            elif len(candidate_gpus) > 1:
+                gpu_choice = candidate_gpus[i % len(candidate_gpus)]
+            if gpu_choice is not None:
+                wenv["CUDA_VISIBLE_DEVICES"] = str(gpu_choice)
+                wenv["METABONK_WORKER_GPU"] = str(gpu_choice)
             if logs_dir:
                 iso_path = logs_dir / f"worker_{i}_isolation.log"
                 try:
                     with iso_path.open("w", encoding="utf-8") as f:
                         f.write(f"INSTANCE_ID={iid}\n")
+                        f.write(f"WORKER_ID={i}\n")
                         f.write(f"DISPLAY={wenv.get('DISPLAY','')}\n")
                         f.write(f"METABONK_INPUT_DISPLAY={wenv.get('METABONK_INPUT_DISPLAY','')}\n")
+                        f.write(f"WORKER_PORT={wenv.get('WORKER_PORT','')}\n")
+                        f.write(f"SIDECAR_PORT={wenv.get('MEGABONK_SIDECAR_PORT','')}\n")
+                        f.write(f"BONKLINK_PORT={wenv.get('METABONK_BONKLINK_PORT','')}\n")
+                        f.write(f"CUDA_VISIBLE_DEVICES={wenv.get('CUDA_VISIBLE_DEVICES','')}\n")
                         f.write(f"XVFB_ENABLED={str(bool(xvfb_ok))}\n")
                 except Exception:
                     pass
