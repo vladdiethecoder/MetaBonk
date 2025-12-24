@@ -301,6 +301,16 @@ class WorkerService:
         except Exception:
             self._action_log_freq = 0
         self._last_action_log_step = -1
+        self._action_clip_enabled = os.environ.get("METABONK_ACTION_CLIP", "1") in ("1", "true", "True")
+        try:
+            self._action_clip_min = float(os.environ.get("METABONK_ACTION_CLIP_MIN", "-1.0"))
+        except Exception:
+            self._action_clip_min = -1.0
+        try:
+            self._action_clip_max = float(os.environ.get("METABONK_ACTION_CLIP_MAX", "1.0"))
+        except Exception:
+            self._action_clip_max = 1.0
+        self._action_clip_logged = False
         try:
             self._menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
         except Exception:
@@ -3735,6 +3745,26 @@ class WorkerService:
                                 forced_ui_click = None
                     except Exception:
                         forced_ui_click = None
+
+            if self._action_clip_enabled and a_cont:
+                raw_cont = [float(x) for x in (a_cont or [])]
+                clipped = []
+                for val in raw_cont:
+                    if val < self._action_clip_min:
+                        clipped.append(self._action_clip_min)
+                    elif val > self._action_clip_max:
+                        clipped.append(self._action_clip_max)
+                    else:
+                        clipped.append(val)
+                if clipped != raw_cont:
+                    a_cont = clipped
+                    if not self._action_clip_logged:
+                        self._action_clip_logged = True
+                        print(
+                            f"[worker:{self.instance_id}] action_clip raw={raw_cont} clipped={clipped} "
+                            f"range=({self._action_clip_min},{self._action_clip_max})",
+                            flush=True,
+                        )
 
             input_bootstrap = False
             teacher_action_idx = None
