@@ -576,7 +576,7 @@ export default function MseMp4Video({
           <div className="mse-hud-row">
             p95/p99: {hud?.p95 != null ? hud.p95.toFixed(1) : "n/a"} / {hud?.p99 != null ? hud.p99.toFixed(1) : "n/a"} ms
           </div>
-          <div className="mse-hud-row">stalls>100ms: {hud?.stalls100 ?? "n/a"}</div>
+          <div className="mse-hud-row">stalls&gt;100ms: {hud?.stalls100 ?? "n/a"}</div>
           <div className="mse-hud-row">
             dropped: {hud?.dropped ?? "n/a"} / {hud?.total ?? "n/a"}
           </div>
