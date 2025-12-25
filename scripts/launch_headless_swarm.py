@@ -14,10 +14,10 @@ Examples:
   python scripts/launch_headless_swarm.py --workers 20
 
   # Services + 20 workers, and ask each worker to spawn a game process
-  # (template is formatted with {instance_id} and {sidecar_port} and {display})
+  # (template is formatted with {instance_id} and {sidecar_port})
   METABONK_VISUAL_ONLY=1 \\
   MEGABONK_CMD_TEMPLATE='gamescope -w 1280 -h 720 --headless -- /path/to/MegaBonk.x86_64 --instance {instance_id}' \\
-  python scripts/launch_headless_swarm.py --workers 20 --xvfb
+  python scripts/launch_headless_swarm.py --workers 20
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def main() -> int:
     parser.add_argument(
         "--xvfb",
         action="store_true",
-        help="Start one Xvfb per worker and set DISPLAY=:{base+i}.",
+        help="(disabled) Xvfb is forbidden in GPU-only MetaBonk.",
     )
     parser.add_argument("--xvfb-display-base", type=int, default=90)
     parser.add_argument("--xvfb-size", default="1280x720x24")
@@ -95,6 +95,8 @@ def main() -> int:
         help="Disable PipeWire capture (defaults to enabled for GPU streaming).",
     )
     args = parser.parse_args()
+    if bool(args.xvfb):
+        raise SystemExit("[launch_headless_swarm] ERROR: Xvfb is forbidden (MetaBonk is GPU-only). Use gamescope isolation.")
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     py = sys.executable

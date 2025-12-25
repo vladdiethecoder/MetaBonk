@@ -91,10 +91,15 @@ def _spawn(
 def _kill(p: Optional[subprocess.Popen], name: str) -> None:
     if not p:
         return
-    if p.poll() is not None:
+    try:
+        if p.poll() is not None:
+            return
+    except KeyboardInterrupt:
         return
     try:
         os.killpg(p.pid, signal.SIGTERM)
+    except KeyboardInterrupt:
+        return
     except Exception:
         try:
             p.terminate()
@@ -103,11 +108,25 @@ def _kill(p: Optional[subprocess.Popen], name: str) -> None:
     # Escalate if needed (allow enough time for workers to gracefully shut down their
     # spawned game processes; if we SIGKILL too quickly, we can strand GPU-heavy children).
     t0 = time.time()
-    while time.time() - t0 < 10.0 and p.poll() is None:
-        time.sleep(0.1)
-    if p.poll() is None:
+    try:
+        while time.time() - t0 < 10.0:
+            try:
+                if p.poll() is not None:
+                    break
+            except KeyboardInterrupt:
+                return
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        return
+    try:
+        alive = p.poll() is None
+    except KeyboardInterrupt:
+        return
+    if alive:
         try:
             os.killpg(p.pid, signal.SIGKILL)
+        except KeyboardInterrupt:
+            return
         except Exception:
             try:
                 p.kill()
@@ -227,7 +246,18 @@ def main() -> int:
     parser.add_argument(
         "--stream-backend",
         default=os.environ.get("METABONK_STREAM_BACKEND", "auto"),
-        help="Stream backend: auto|gst|ffmpeg|x11grab (default: env or auto).",
+        help="Stream backend: auto|gst|ffmpeg (default: env or auto).",
+    )
+    parser.add_argument(
+        "--synthetic-eye",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("METABONK_SYNTHETIC_EYE", "1") or "1") in ("1", "true", "True"),
+        help="Use the Smithay/Vulkan synthetic eye (PipeWire-free agent loop).",
+    )
+    parser.add_argument(
+        "--synthetic-eye-bin",
+        default=os.environ.get("METABONK_SYNTHETIC_EYE_BIN", ""),
+        help="Path to metabonk_smithay_eye binary (optional).",
     )
 
     # UI
@@ -350,19 +380,16 @@ def main() -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
     env.setdefault("METABONK_RUN_DIR", str(run_dir))
     env.setdefault("MEGABONK_LOG_DIR", str(run_dir))
-    # Watch mode should not starve the user's actual game of VRAM. Default to CPU-only
-    # services (vision/learner) unless explicitly overridden.
-    if args.mode == "watch" and not bool(args.watch_use_gpu):
-        env.setdefault("CUDA_VISIBLE_DEVICES", "")
-        env.setdefault("METABONK_DEVICE", "cpu")
-        env.setdefault("METABONK_LEARNER_DEVICE", "cpu")
-        env.setdefault("METABONK_WORLD_MODEL_DEVICE", "cpu")
-        env.setdefault("METABONK_VISION_DEVICE", "cpu")
-        env.setdefault("METABONK_REQUIRE_CUDA", "0")
-    elif args.mode == "dream" and not str(args.device or "").strip().lower().startswith("cuda"):
-        env.setdefault("METABONK_REQUIRE_CUDA", "0")
-    else:
-        env.setdefault("METABONK_REQUIRE_CUDA", "1")
+    # MetaBonk is GPU-only. Refuse any attempt to opt into CPU devices, even in watch/dream modes.
+    if str(env.get("METABONK_REQUIRE_CUDA", "") or "").strip().lower() in ("0", "false", "no", "off"):
+        raise SystemExit("[start] ERROR: MetaBonk is GPU-only; METABONK_REQUIRE_CUDA=0 is not supported.")
+    if args.mode == "dream" and not str(args.device or "").strip().lower().startswith("cuda"):
+        raise SystemExit("[start] ERROR: MetaBonk is GPU-only; --device must be cuda for dream mode.")
+    env["METABONK_REQUIRE_CUDA"] = "1"
+    env.setdefault("METABONK_DEVICE", "cuda")
+    env.setdefault("METABONK_LEARNER_DEVICE", "cuda")
+    env.setdefault("METABONK_WORLD_MODEL_DEVICE", "cuda")
+    env.setdefault("METABONK_VISION_DEVICE", "cuda")
 
     # Default to "no memory access" + learned reward-from-video.
     env["METABONK_USE_RESEARCH_SHM"] = "0"
@@ -397,6 +424,9 @@ def main() -> int:
         env["METABONK_STREAM_HEIGHT"] = str(env.get("MEGABONK_HEIGHT"))
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
+    stream_backend = str(env.get("METABONK_STREAM_BACKEND") or "auto").strip().lower()
+    if stream_backend == "x11grab":
+        raise SystemExit("[start] ERROR: MetaBonk is GPU-only; x11grab is not supported (PipeWire DMA-BUF required).")
     # Default to LSTM PPO + frame stacking for stability in partial observability.
     env.setdefault("METABONK_PPO_USE_LSTM", "1")
     env.setdefault("METABONK_PPO_SEQ_LEN", "32")
@@ -563,6 +593,12 @@ def main() -> int:
             "--stream-backend",
             str(args.stream_backend),
         ]
+        # Prevent duplicate UI when running `./start`: start.py owns UI lifecycle.
+        omega_cmd.append("--no-ui")
+        if bool(getattr(args, "synthetic_eye", True)):
+            omega_cmd.append("--synthetic-eye")
+            if str(getattr(args, "synthetic_eye_bin", "") or "").strip():
+                omega_cmd += ["--synthetic-eye-bin", str(args.synthetic_eye_bin)]
         if game_dir and args.mode != "watch":
             omega_cmd += [
                 "--game-dir",

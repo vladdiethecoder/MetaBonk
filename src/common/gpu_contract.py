@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -14,6 +15,13 @@ MIN_DRIVER_VERSION = (555, 58)
 REQUIRED_KMS_FLAGS = ("nvidia-drm.modeset=1", "nvidia-drm.fbdev=1")
 GBM_LIBS = ("libnvidia-allocator.so", "libnvidia-egl-gbm.so")
 GBM_BACKEND_NAMES = ("nvidia-drm_gbm.so",)
+NVENC_CODECS = {
+    "h264": ("h264_nvenc", "h264_cuvid"),
+    "avc": ("h264_nvenc", "h264_cuvid"),
+    "hevc": ("hevc_nvenc", "hevc_cuvid"),
+    "h265": ("hevc_nvenc", "hevc_cuvid"),
+    "av1": ("av1_nvenc", "av1_cuvid"),
+}
 
 
 @dataclass
@@ -23,6 +31,9 @@ class GpuContractStatus:
     kms_flags_ok: bool
     gbm_ok: bool
     eglstream_ok: bool
+    cuda_ok: bool
+    nvenc_ok: bool
+    nvdec_ok: bool
     errors: List[str]
 
 
@@ -160,6 +171,16 @@ def _find_gbm_backend(env: Dict[str, str]) -> Optional[Path]:
     return None
 
 
+def _ffmpeg_has_token(ffmpeg: str, *, flag: str, token: str) -> bool:
+    try:
+        out = subprocess.check_output([ffmpeg, "-hide_banner", flag], stderr=subprocess.STDOUT, timeout=8.0)
+    except Exception:
+        return False
+    txt = out.decode("utf-8", "replace").lower()
+    t = token.strip().lower()
+    return f" {t} " in txt or f"\t{t} " in txt
+
+
 def _collect_eglstream_logs(env: Dict[str, str]) -> List[Path]:
     raw = str(env.get("METABONK_EGLSTREAM_LOGS", "") or "").strip()
     paths: List[Path] = []
@@ -208,6 +229,44 @@ def _scan_for_eglstream(paths: Iterable[Path]) -> Optional[str]:
     return None
 
 
+def _cuda_driver_ok() -> Tuple[bool, Optional[str]]:
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+    except OSError as e:
+        return False, f"CUDA driver library load failed: {e}"
+
+    try:
+        lib.cuInit.argtypes = [ctypes.c_uint]
+        lib.cuInit.restype = ctypes.c_int
+        rc = int(lib.cuInit(0))
+    except Exception as e:
+        return False, f"CUDA driver init call failed: {e}"
+
+    if rc == 0:
+        return True, None
+
+    # Best effort error string.
+    msg: Optional[str] = None
+    try:
+        lib.cuGetErrorString.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        lib.cuGetErrorString.restype = ctypes.c_int
+        s = ctypes.c_char_p()
+        lib.cuGetErrorString(rc, ctypes.byref(s))
+        if s.value:
+            msg = s.value.decode("utf-8", "replace")
+    except Exception:
+        msg = None
+
+    hint = (
+        "CUDA driver initialization failed. This often means the NVIDIA kernel driver entered a fatal state "
+        "(e.g. NVRM/UVM global fatal error) and requires an OS reboot to recover.\n"
+        "  Check kernel logs: `journalctl -k --no-pager | rg -n \"uvm encountered global fatal error|Xid\"`"
+    )
+    if msg:
+        return False, f"{hint}\n  cuInit rc={rc} ({msg})"
+    return False, f"{hint}\n  cuInit rc={rc}"
+
+
 def gpu_contract_status(env: Optional[Dict[str, str]] = None) -> GpuContractStatus:
     env = env or dict(os.environ)
     errors: List[str] = []
@@ -241,6 +300,10 @@ def gpu_contract_status(env: Optional[Dict[str, str]] = None) -> GpuContractStat
         if fbdev is not None and str(fbdev).strip() not in ("Y", "1", "y", "true"):
             errors.append(f"nvidia_drm.fbdev is '{fbdev}' (expected 1).")
 
+    cuda_ok, cuda_err = _cuda_driver_ok()
+    if not cuda_ok and cuda_err:
+        errors.append(cuda_err)
+
     gbm_missing = []
     for lib in GBM_LIBS:
         if not _ldconfig_has(lib) and not _find_lib_on_disk(lib):
@@ -262,12 +325,43 @@ def gpu_contract_status(env: Optional[Dict[str, str]] = None) -> GpuContractStat
         eglstream_ok = False
         errors.append(eglstream_err)
 
+    # Streaming/proof is GPU-only: require NVENC (encode) + NVDEC/CUVID (decode) availability when enabled.
+    stream_enabled = str(env.get("METABONK_STREAM", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    capture_disabled = str(env.get("METABONK_CAPTURE_DISABLED", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    nvenc_ok = True
+    nvdec_ok = True
+    if stream_enabled and not capture_disabled:
+        codec = str(env.get("METABONK_STREAM_CODEC", "h264") or "h264").strip().lower()
+        required = NVENC_CODECS.get(codec) or NVENC_CODECS["h264"]
+        required_encoder, required_decoder = required
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            nvenc_ok = False
+            nvdec_ok = False
+            errors.append("Streaming enabled but ffmpeg is missing (required for NVENC/NVDEC verification).")
+        else:
+            if not _ffmpeg_has_token(ffmpeg, flag="-encoders", token=required_encoder):
+                nvenc_ok = False
+                errors.append(
+                    f"Streaming enabled but required NVENC encoder '{required_encoder}' is not available "
+                    "(check your ffmpeg build)."
+                )
+            if not _ffmpeg_has_token(ffmpeg, flag="-decoders", token=required_decoder):
+                nvdec_ok = False
+                errors.append(
+                    f"Streaming enabled but required NVDEC/CUVID decoder '{required_decoder}' is not available "
+                    "(check your ffmpeg build)."
+                )
+
     return GpuContractStatus(
         driver_version=driver_version or "missing",
         driver_ok=driver_ok,
         kms_flags_ok=kms_flags_ok,
         gbm_ok=gbm_ok,
         eglstream_ok=eglstream_ok,
+        cuda_ok=cuda_ok,
+        nvenc_ok=nvenc_ok,
+        nvdec_ok=nvdec_ok,
         errors=errors,
     )
 
@@ -287,7 +381,10 @@ if __name__ == "__main__":
         f"driver_ok={int(status.driver_ok)} "
         f"kms_ok={int(status.kms_flags_ok)} "
         f"gbm_ok={int(status.gbm_ok)} "
-        f"eglstream_ok={int(status.eglstream_ok)}"
+        f"eglstream_ok={int(status.eglstream_ok)} "
+        f"cuda_ok={int(status.cuda_ok)} "
+        f"nvenc_ok={int(status.nvenc_ok)} "
+        f"nvdec_ok={int(status.nvdec_ok)}"
     )
     if status.errors:
         for err in status.errors:

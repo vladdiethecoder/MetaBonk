@@ -36,6 +36,9 @@ node_modules/
 **/dist/
 **/build/
 
+# === Rust ===
+/rust/target/
+
 # === .NET / Unity plugin builds ===
 **/bin/
 **/obj/
