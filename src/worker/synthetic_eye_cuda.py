@@ -32,17 +32,19 @@ from .synthetic_eye_stream import SyntheticEyeFrame
 class SyntheticEyeCudaHandle:
     frame: SyntheticEyeFrame
     ext_frame: CudaExternalFrame
-    acquire: CudaExternalSemaphore
-    release: CudaExternalSemaphore
     stream: driver.CUstream
+    acquire: Optional[CudaExternalSemaphore] = None
+    release: Optional[CudaExternalSemaphore] = None
 
     def destroy(self) -> None:
         try:
-            self.acquire.destroy()
+            if self.acquire is not None:
+                self.acquire.destroy()
         except Exception:
             pass
         try:
-            self.release.destroy()
+            if self.release is not None:
+                self.release.destroy()
         except Exception:
             pass
         try:
@@ -130,6 +132,7 @@ class SyntheticEyeCudaIngestor:
             "yes",
             "on",
         )
+        self._warned_no_fence: bool = False
 
     def _debug_fd(self, fd: int, name: str) -> None:
         if not self._debug_fds:
@@ -145,6 +148,27 @@ class SyntheticEyeCudaIngestor:
             )
         except OSError as e:
             print(f"[DEBUG] {name} fd={int(fd)} INVALID: {e}", flush=True)
+
+    def _safe_import_semaphore(self, fd: int, name: str) -> Optional[CudaExternalSemaphore]:
+        """Best-effort import of external semaphores; returns None if invalid."""
+        try:
+            fd_i = int(fd)
+        except Exception:
+            fd_i = -1
+        if fd_i < 0:
+            return None
+        try:
+            os.fstat(fd_i)
+        except OSError:
+            if self._debug_fds:
+                print(f"[WARN] {name} fence fd invalid (fd={fd_i}); skipping", flush=True)
+            return None
+        try:
+            return import_external_semaphore_fd(fd_i, timeline=self.timeline_semaphores)
+        except Exception as e:
+            if self._debug_fds:
+                print(f"[WARN] {name} fence import failed (fd={fd_i}): {e}", flush=True)
+            return None
 
     def _reap_pending(self) -> None:
         """Destroy resources whose CUDA work has completed (non-blocking)."""
@@ -232,6 +256,11 @@ class SyntheticEyeCudaIngestor:
         self.last_width = int(frame.width)
         self.last_height = int(frame.height)
         self.last_size_bytes = int(getattr(frame, "size_bytes", 0) or 0)
+        if self._debug_fds and int(frame.modifier) == 0:
+            print(
+                f"[WARN] Synthetic Eye modifier=0 (linear) for frame {int(frame.frame_id)}",
+                flush=True,
+            )
         dmabuf_fd = int(frame.dmabuf_fd)
         dmabuf_fd_dup: Optional[int] = None
         use_dup = str(os.environ.get("METABONK_SYNTHETIC_EYE_DUP_FD", "1")).strip().lower() in (
@@ -247,11 +276,17 @@ class SyntheticEyeCudaIngestor:
             except Exception:
                 dmabuf_fd_dup = None
         try:
-            acquire = import_external_semaphore_fd(frame.acquire_fence_fd, timeline=self.timeline_semaphores)
-            release = import_external_semaphore_fd(frame.release_fence_fd, timeline=self.timeline_semaphores)
-
-            # Wait until compositor finished producing the frame.
-            wait_external_semaphore(acquire, stream=self.stream, value=None)
+            acquire = self._safe_import_semaphore(frame.acquire_fence_fd, "ACQUIRE")
+            release = self._safe_import_semaphore(frame.release_fence_fd, "RELEASE")
+            if acquire is not None:
+                # Wait until compositor finished producing the frame.
+                wait_external_semaphore(acquire, stream=self.stream, value=None)
+            elif self._strict_fence_sync and not self._warned_no_fence:
+                self._warned_no_fence = True
+                print(
+                    "[WARN] Synthetic Eye missing/invalid acquire fence; running unsynchronized",
+                    flush=True,
+                )
 
             # Map DMA-BUF into CUDA. Prefer mipmapped array for tiled modifiers.
             if int(frame.modifier) != 0:
@@ -292,7 +327,8 @@ class SyntheticEyeCudaIngestor:
     def end(self, handle: SyntheticEyeCudaHandle) -> None:
         """Signal release fence and cleanup imported CUDA objects."""
         self._reap_pending()
-        signal_external_semaphore(handle.release, stream=handle.stream, value=None)
+        if handle.release is not None:
+            signal_external_semaphore(handle.release, stream=handle.stream, value=None)
         # Record an event after the release signal so we can destroy imported resources once
         # queued GPU work is done, without blocking the worker threads indefinitely.
         try:
@@ -327,11 +363,13 @@ class SyntheticEyeCudaIngestor:
         self.last_height = int(frame.height)
         self.last_size_bytes = int(getattr(frame, "size_bytes", 0) or 0)
         try:
-            acquire = import_external_semaphore_fd(frame.acquire_fence_fd, timeline=self.timeline_semaphores)
-            release = import_external_semaphore_fd(frame.release_fence_fd, timeline=self.timeline_semaphores)
+            acquire = self._safe_import_semaphore(frame.acquire_fence_fd, "ACQUIRE")
+            release = self._safe_import_semaphore(frame.release_fence_fd, "RELEASE")
             # Enqueue async wait/signal on the CUDA stream; do not synchronize per-frame.
-            wait_external_semaphore(acquire, stream=self.stream, value=None)
-            signal_external_semaphore(release, stream=self.stream, value=None)
+            if acquire is not None:
+                wait_external_semaphore(acquire, stream=self.stream, value=None)
+            if release is not None:
+                signal_external_semaphore(release, stream=self.stream, value=None)
             # Record event and defer destruction until the GPU stream has progressed.
             ev = create_event()
             record_event(ev, stream=self.stream)

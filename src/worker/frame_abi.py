@@ -151,12 +151,17 @@ def _parse_frame_v1(payload: bytes, fds: List[int]) -> FrameV1:
     ) = fixed.unpack_from(payload, 0)
     dmabuf_fd_count = int(dmabuf_fd_count)
     plane_count = int(plane_count)
-    expected_fds = dmabuf_fd_count + 2
-    if len(fds) != expected_fds:
-        raise ValueError(f"frame fd_count mismatch: expected {expected_fds}, got {len(fds)}")
+    min_fds = dmabuf_fd_count
+    max_fds = dmabuf_fd_count + 2
+    if len(fds) < min_fds or len(fds) > max_fds:
+        raise ValueError(f"frame fd_count mismatch: expected {min_fds}..{max_fds}, got {len(fds)}")
     dmabuf_fds = [int(x) for x in fds[:dmabuf_fd_count]]
-    acquire_fence_fd = int(fds[dmabuf_fd_count])
-    release_fence_fd = int(fds[dmabuf_fd_count + 1])
+    acquire_fence_fd = -1
+    release_fence_fd = -1
+    if len(fds) >= dmabuf_fd_count + 1:
+        acquire_fence_fd = int(fds[dmabuf_fd_count])
+    if len(fds) >= dmabuf_fd_count + 2:
+        release_fence_fd = int(fds[dmabuf_fd_count + 1])
 
     planes: List[PlaneV1] = []
     plane_struct = struct.Struct("<BBHIIII")

@@ -138,10 +138,11 @@ impl FrameV1 {
         let plane_count = payload.get_u8();
         let _reserved0 = payload.get_u16_le();
 
-        let expected = dmabuf_fd_count as usize + 2;
-        if fd_count != expected {
+        let min_expected = dmabuf_fd_count as usize;
+        let max_expected = dmabuf_fd_count as usize + 2;
+        if fd_count < min_expected || fd_count > max_expected {
             return Err(AbiError::FrameFdCount {
-                expected,
+                expected: max_expected,
                 got: fd_count,
             });
         }
@@ -193,4 +194,3 @@ impl ResetV1 {
         out
     }
 }
-

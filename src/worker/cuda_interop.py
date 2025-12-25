@@ -89,17 +89,40 @@ class CudaExternalSemaphore:
             pass
 
 
+def _import_external_memory(fd: int, size_bytes: int) -> driver.CUexternalMemory:
+    """Import external memory with fallbacks for handle type/flags."""
+    _ensure_ctx()
+    handle_types = (
+        driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD,
+        driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+    )
+    flag_candidates = (int(driver.CUDA_EXTERNAL_MEMORY_DEDICATED), 0)
+    last_err = 0
+    last_type = None
+    last_flags = None
+    for handle_type in handle_types:
+        for flags in flag_candidates:
+            desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
+            desc.type = handle_type
+            desc.handle.fd = int(fd)
+            desc.size = int(size_bytes)
+            desc.flags = int(flags)
+            err, ext_mem = driver.cuImportExternalMemory(desc)
+            err_i = _err_int(err)
+            if err_i == 0:
+                return ext_mem
+            last_err = err_i
+            last_type = handle_type
+            last_flags = flags
+    raise RuntimeError(
+        "cuImportExternalMemory failed with cudaError="
+        f"{last_err} (handle_type={last_type}, flags={last_flags})"
+    )
+
+
 def import_dmabuf_as_buffer(fd: int, size_bytes: int) -> CudaExternalFrame:
     """Import an exported GPU memory FD as a linear CUDA buffer."""
-    _ensure_ctx()
-    desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
-    desc.type = driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
-    desc.handle.fd = int(fd)
-    desc.size = int(size_bytes)
-    # Vulkan exportables are typically dedicated allocations.
-    desc.flags = int(driver.CUDA_EXTERNAL_MEMORY_DEDICATED)
-    err, ext_mem = driver.cuImportExternalMemory(desc)
-    _check(err, "cuImportExternalMemory(DMABUF_FD)")
+    ext_mem = _import_external_memory(fd, size_bytes)
 
     buf_desc = driver.CUDA_EXTERNAL_MEMORY_BUFFER_DESC()
     buf_desc.offset = 0
@@ -122,14 +145,7 @@ def import_dmabuf_as_mipmapped_array(
     num_channels: int = 4,
 ) -> CudaExternalFrame:
     """Import an exported GPU memory FD as a CUDA mipmapped array (required for tiled modifiers)."""
-    _ensure_ctx()
-    desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
-    desc.type = driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
-    desc.handle.fd = int(fd)
-    desc.size = int(size_bytes)
-    desc.flags = int(driver.CUDA_EXTERNAL_MEMORY_DEDICATED)
-    err, ext_mem = driver.cuImportExternalMemory(desc)
-    _check(err, "cuImportExternalMemory(OPAQUE_FD)")
+    ext_mem = _import_external_memory(fd, size_bytes)
 
     mip_desc = driver.CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC()
     mip_desc.offset = 0

@@ -336,6 +336,24 @@ impl VulkanProducer {
         // Export DMABuf FD for the memory backing this image.
         let dmabuf_fd = self.export_memory_dmabuf_fd(memory)?;
 
+        debug!(
+            "export frame: modifier=0x{:016x} fourcc=0x{:08x} stride={} offset={} size_bytes={}",
+            modifier,
+            self.drm_fourcc,
+            stride,
+            offset,
+            mem_size
+        );
+
+        debug!(
+            "export frame: modifier=0x{:016x} fourcc=0x{:08x} stride={} offset={} size_bytes={}",
+            modifier,
+            self.drm_fourcc,
+            stride,
+            offset,
+            mem_size
+        );
+
         self.frame_id += 1;
         {
             let slot = &mut self.slots[slot_idx];
@@ -662,6 +680,15 @@ impl VulkanProducer {
         }
         let size_bytes = (u64::from(offset) + (u64::from(stride).saturating_mul(u64::from(height))))
             .min(u64::from(u32::MAX)) as u32;
+
+        debug!(
+            "export frame (passthrough): modifier=0x{:016x} fourcc=0x{:08x} stride={} offset={} size_bytes={}",
+            modifier,
+            self.drm_fourcc,
+            stride,
+            offset,
+            size_bytes
+        );
 
         let (acquire, acquire_fd) = self.create_exportable_semaphore()?;
         let (release, release_fd) = self.create_exportable_semaphore()?;

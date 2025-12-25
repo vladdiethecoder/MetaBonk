@@ -11,7 +11,7 @@ use anyhow::Context;
 use clap::Parser;
 use metabonk_frame_abi::{FrameV1, MsgType, PlaneV1, ResetV1};
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     args::Args,
@@ -19,6 +19,14 @@ use crate::{
     frame_socket::FrameServer,
     vulkan_producer::{VkSelect, VulkanProducer},
 };
+
+fn fd_valid(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    ret != -1
+}
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -90,9 +98,11 @@ fn main() -> anyhow::Result<()> {
     let passthrough: bool = std::env::var("METABONK_SYNTHETIC_EYE_PASSTHROUGH")
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true);
+        .unwrap_or(false);
     if args.xwayland && passthrough {
         info!("synthetic_eye passthrough enabled (METABONK_SYNTHETIC_EYE_PASSTHROUGH=1): forwarding XWayland DMA-BUF without Vulkan import");
+    } else if args.xwayland {
+        info!("synthetic_eye passthrough disabled (METABONK_SYNTHETIC_EYE_PASSTHROUGH=0): using Vulkan export path");
     }
     loop {
         let t0 = std::time::Instant::now();
@@ -150,11 +160,15 @@ fn main() -> anyhow::Result<()> {
                 match producer.render_from_dmabuf(d) {
                     Ok(v) => Ok(v),
                     Err(e) => {
-                        // Fallback within GPU-only constraints: forward the DMA-BUF directly rather than
-                        // dropping to a synthetic pattern or stalling on driver-specific import failures.
-                        warn!("render_from_dmabuf failed; falling back to passthrough: {e}");
-                        let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
-                        producer.render_passthrough_dmabuf(d, Some((w, h)))
+                        if args.xwayland && passthrough {
+                            // Optional fallback within GPU-only constraints.
+                            warn!("render_from_dmabuf failed; falling back to passthrough: {e}");
+                            let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
+                            producer.render_passthrough_dmabuf(d, Some((w, h)))
+                        } else {
+                            warn!("render_from_dmabuf failed with passthrough disabled: {e}");
+                            Err(e)
+                        }
                     }
                 }
             }
@@ -198,8 +212,27 @@ fn main() -> anyhow::Result<()> {
                     }],
                 };
                 let payload_bytes = payload.encode_payload();
-                let fds = [rf.dmabuf_fd, rf.acquire_fence_fd, rf.release_fence_fd]
-                    .map(|fd| fd as i32);
+                let mut fds: Vec<i32> = vec![rf.dmabuf_fd as i32];
+                let mut acquire_fd = rf.acquire_fence_fd;
+                let mut release_fd = rf.release_fence_fd;
+                let acquire_ok = fd_valid(acquire_fd);
+                let release_ok = fd_valid(release_fd);
+                if acquire_ok && release_ok {
+                    fds.push(acquire_fd as i32);
+                    fds.push(release_fd as i32);
+                } else {
+                    debug!(
+                        "dropping invalid fence fds: acquire_fd={} ok={} release_fd={} ok={}",
+                        acquire_fd,
+                        acquire_ok,
+                        release_fd,
+                        release_ok
+                    );
+                    acquire_fd = -1;
+                    release_fd = -1;
+                    let _ = nix::unistd::close(rf.acquire_fence_fd);
+                    let _ = nix::unistd::close(rf.release_fence_fd);
+                }
 
                 if let Err(e) = server.send_message(MsgType::Frame, &payload_bytes, &fds) {
                     warn!("frame send failed: {e}");
