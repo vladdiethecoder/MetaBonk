@@ -138,6 +138,14 @@ class Heartbeat(MBBaseModel):
     overrun: Optional[bool] = None
     # Build / inventory (visual-model derived; do not require memory access).
     inventory_items: Optional[list[dict[str, Any]]] = None
+    # Host/worker memory telemetry (best-effort; used by density governor / UI).
+    rss_mb: Optional[float] = None
+    vms_mb: Optional[float] = None
+    launcher_rss_mb: Optional[float] = None
+    launcher_vms_mb: Optional[float] = None
+    mem_available_mb: Optional[float] = None
+    mem_total_mb: Optional[float] = None
+    swap_free_mb: Optional[float] = None
     synergy_edges: Optional[list[dict[str, Any]]] = None
     evolution_recipes: Optional[list[dict[str, Any]]] = None
     # Fast-loop telemetry (best-effort).

@@ -117,6 +117,26 @@ class RolloutBuffer:
         self.eval_clip_url = None
         return batch
 
+    def reset(self) -> None:
+        """Drop all currently buffered steps (best-effort).
+
+        Used when upstream visual capture is detected to be invalid (e.g. compositor/XWayland reset),
+        to avoid training on frozen/hallucinated segments.
+        """
+        self.obs = []
+        self.actions_cont = []
+        self.actions_disc = []
+        self.rewards = []
+        self.dones = []
+        self.log_probs = []
+        self.values = []
+        self.action_masks = []
+        self.episode_returns = []
+        self.episode_lengths = []
+        self._cur_ep_return = 0.0
+        self._cur_ep_len = 0
+        self.eval_clip_url = None
+
 
 class LearnerClient:
     def __init__(self, learner_url: str, timeout_s: float = 5.0):

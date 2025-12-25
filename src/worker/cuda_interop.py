@@ -1,43 +1,116 @@
-"""CUDA interop helpers for importing DMABuf frames.
+"""CUDA interop helpers for importing DMABuf frames + external semaphores.
 
-These helpers wrap cuda-python external memory APIs. They are optional and
-only used when a GPU-resident processing path is desired.
+MetaBonk's Synthetic Eye uses:
+  - DMA-BUF FDs for image memory (Vulkan -> linux-dmabuf -> consumer)
+  - Vulkan external semaphore FDs (OPAQUE_FD) for acquire/release fences
+
+Important: CUDA Runtime external memory API (cudaImportExternalMemory) does not
+expose a DMA-BUF handle type in the current cuda-python runtime bindings, but
+the CUDA Driver API does. Use the Driver API for all external interop here.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from cuda.bindings import runtime  # type: ignore
+from cuda.bindings import driver  # type: ignore
+
+
+def _err_int(err) -> int:
+    """Normalize cuda-python return values to an integer error code."""
+    try:
+        if isinstance(err, tuple) and err:
+            err = err[0]
+        return int(err)
+    except Exception:
+        return 0
+
+
+def _check(err, what: str) -> None:
+    err_i = _err_int(err)
+    if err_i != 0:
+        raise RuntimeError(f"{what} failed with cudaError={err_i}")
+
+
+_CTX_READY = False
+_CTX = None
+
+
+def _ensure_ctx() -> None:
+    # CUDA contexts are thread-affine: every thread interacting with the Driver API must have a
+    # current context set. Retain the primary context once, but always call cuCtxSetCurrent.
+    global _CTX_READY, _CTX
+    _check(driver.cuInit(0), "cuInit")
+    # Use the primary context for device 0 (respects CUDA_VISIBLE_DEVICES mapping).
+    err, dev = driver.cuDeviceGet(0)
+    _check(err, "cuDeviceGet(0)")
+    if not _CTX_READY or _CTX is None:
+        err, ctx = driver.cuDevicePrimaryCtxRetain(dev)
+        _check(err, "cuDevicePrimaryCtxRetain")
+        _CTX = ctx
+        _CTX_READY = True
+    _check(driver.cuCtxSetCurrent(_CTX), "cuCtxSetCurrent")
+
+
+def _to_stream(stream) -> driver.CUstream:
+    if stream is None:
+        return driver.CUstream(0)
+    if isinstance(stream, driver.CUstream):
+        return stream
+    try:
+        ptr = stream.getPtr() if hasattr(stream, "getPtr") else int(stream)
+    except Exception:
+        ptr = 0
+    return driver.CUstream(int(ptr))
 
 
 @dataclass
 class CudaExternalFrame:
-    ext_mem: runtime.cudaExternalMemory_t
+    ext_mem: driver.CUexternalMemory
     mapped_ptr: Optional[int] = None
-    mipmapped_array: Optional[runtime.cudaMipmappedArray_t] = None  # type: ignore[name-defined]
+    mipmapped_array: Optional[driver.CUmipmappedArray] = None
 
-    def destroy(self):
+    def destroy(self) -> None:
         try:
-            runtime.cudaDestroyExternalMemory(self.ext_mem)
+            _check(driver.cuDestroyExternalMemory(self.ext_mem), "cuDestroyExternalMemory")
+        except Exception:
+            pass
+
+
+@dataclass
+class CudaExternalSemaphore:
+    ext_sem: driver.CUexternalSemaphore
+
+    def destroy(self) -> None:
+        try:
+            _check(driver.cuDestroyExternalSemaphore(self.ext_sem), "cuDestroyExternalSemaphore")
         except Exception:
             pass
 
 
 def import_dmabuf_as_buffer(fd: int, size_bytes: int) -> CudaExternalFrame:
-    """Import a DMABuf fd as a linear CUDA buffer."""
-    desc = runtime.cudaExternalMemoryHandleDesc()
-    desc.type = runtime.cudaExternalMemoryHandleType.cudaExternalMemoryHandleTypeOpaqueFd
-    desc.handle.fd = fd
-    desc.size = size_bytes
-    ext_mem = runtime.cudaImportExternalMemory(desc)[1]
+    """Import an exported GPU memory FD as a linear CUDA buffer."""
+    _ensure_ctx()
+    desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
+    desc.type = driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
+    desc.handle.fd = int(fd)
+    desc.size = int(size_bytes)
+    # Vulkan exportables are typically dedicated allocations.
+    desc.flags = int(driver.CUDA_EXTERNAL_MEMORY_DEDICATED)
+    err, ext_mem = driver.cuImportExternalMemory(desc)
+    _check(err, "cuImportExternalMemory(DMABUF_FD)")
 
-    buf_desc = runtime.cudaExternalMemoryBufferDesc()
+    buf_desc = driver.CUDA_EXTERNAL_MEMORY_BUFFER_DESC()
     buf_desc.offset = 0
-    buf_desc.size = size_bytes
-    ptr = runtime.cudaExternalMemoryGetMappedBuffer(ext_mem, buf_desc)[1]
-    return CudaExternalFrame(ext_mem=ext_mem, mapped_ptr=ptr)
+    buf_desc.size = int(size_bytes)
+    err, devptr = driver.cuExternalMemoryGetMappedBuffer(ext_mem, buf_desc)
+    _check(err, "cuExternalMemoryGetMappedBuffer")
+    try:
+        devptr_i = int(devptr)
+    except Exception:
+        devptr_i = 0
+    return CudaExternalFrame(ext_mem=ext_mem, mapped_ptr=devptr_i)
 
 
 def import_dmabuf_as_mipmapped_array(
@@ -45,27 +118,128 @@ def import_dmabuf_as_mipmapped_array(
     size_bytes: int,
     width: int,
     height: int,
-    format_desc: Tuple[int, int, int, int],
+    *,
+    num_channels: int = 4,
 ) -> CudaExternalFrame:
-    """Import a DMABuf fd as a CUDA mipmapped array.
+    """Import an exported GPU memory FD as a CUDA mipmapped array (required for tiled modifiers)."""
+    _ensure_ctx()
+    desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
+    desc.type = driver.CUexternalMemoryHandleType.CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
+    desc.handle.fd = int(fd)
+    desc.size = int(size_bytes)
+    desc.flags = int(driver.CUDA_EXTERNAL_MEMORY_DEDICATED)
+    err, ext_mem = driver.cuImportExternalMemory(desc)
+    _check(err, "cuImportExternalMemory(OPAQUE_FD)")
 
-    This is required for NVIDIA block-linear/tiled layouts.
-
-    format_desc: cudaChannelFormatDesc components (x,y,z,w bits).
-    """
-    desc = runtime.cudaExternalMemoryHandleDesc()
-    desc.type = runtime.cudaExternalMemoryHandleType.cudaExternalMemoryHandleTypeOpaqueFd
-    desc.handle.fd = fd
-    desc.size = size_bytes
-    ext_mem = runtime.cudaImportExternalMemory(desc)[1]
-
-    mip_desc = runtime.cudaExternalMemoryMipmappedArrayDesc()
+    mip_desc = driver.CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC()
     mip_desc.offset = 0
-    mip_desc.formatDesc = runtime.cudaChannelFormatDesc(*format_desc)
-    mip_desc.extent = runtime.cudaExtent(width, height, 0)
     mip_desc.numLevels = 1
-    mip_desc.flags = 0
-    mip = runtime.cudaExternalMemoryGetMappedMipmappedArray(ext_mem, mip_desc)[1]
+    mip_desc.arrayDesc.Width = int(width)
+    mip_desc.arrayDesc.Height = int(height)
+    mip_desc.arrayDesc.Depth = 0
+    mip_desc.arrayDesc.Format = driver.CUarray_format.CU_AD_FORMAT_UNORM_INT8X4
+    mip_desc.arrayDesc.NumChannels = int(num_channels)
+    mip_desc.arrayDesc.Flags = 0
+    err, mip = driver.cuExternalMemoryGetMappedMipmappedArray(ext_mem, mip_desc)
+    _check(err, "cuExternalMemoryGetMappedMipmappedArray")
 
     return CudaExternalFrame(ext_mem=ext_mem, mipmapped_array=mip)
 
+
+def import_external_semaphore_fd(fd: int, *, timeline: bool = False) -> CudaExternalSemaphore:
+    """Import a Vulkan-exported external semaphore FD into CUDA (Driver API)."""
+    _ensure_ctx()
+    desc = driver.CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC()
+    if timeline:
+        desc.type = driver.CUexternalSemaphoreHandleType.CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD
+    else:
+        desc.type = driver.CUexternalSemaphoreHandleType.CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD
+    desc.handle.fd = int(fd)
+    desc.flags = 0
+    err, ext_sem = driver.cuImportExternalSemaphore(desc)
+    _check(err, "cuImportExternalSemaphore")
+    if not isinstance(ext_sem, driver.CUexternalSemaphore):
+        raise RuntimeError(f"cuImportExternalSemaphore returned unexpected type: {type(ext_sem)}")
+    return CudaExternalSemaphore(ext_sem=ext_sem)
+
+
+def wait_external_semaphore(
+    sem: CudaExternalSemaphore,
+    *,
+    stream=None,
+    value: Optional[int] = None,
+) -> None:
+    params = driver.CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS()
+    if value is not None:
+        try:
+            params.params.fence.value = int(value)
+        except Exception:
+            pass
+    st = _to_stream(stream)
+    _check(driver.cuWaitExternalSemaphoresAsync([sem.ext_sem], [params], 1, st), "cuWaitExternalSemaphoresAsync")
+
+
+def signal_external_semaphore(
+    sem: CudaExternalSemaphore,
+    *,
+    stream=None,
+    value: Optional[int] = None,
+) -> None:
+    params = driver.CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS()
+    if value is not None:
+        try:
+            params.params.fence.value = int(value)
+        except Exception:
+            pass
+    st = _to_stream(stream)
+    _check(driver.cuSignalExternalSemaphoresAsync([sem.ext_sem], [params], 1, st), "cuSignalExternalSemaphoresAsync")
+
+
+def stream_synchronize(stream=None) -> None:
+    _ensure_ctx()
+    st = _to_stream(stream)
+    _check(driver.cuStreamSynchronize(st), "cuStreamSynchronize")
+
+
+def create_event() -> driver.CUevent:
+    """Create a CUDA event in the current context."""
+    _ensure_ctx()
+    err, ev = driver.cuEventCreate(0)
+    _check(err, "cuEventCreate")
+    return ev
+
+
+def record_event(ev: driver.CUevent, *, stream=None) -> None:
+    """Record a CUDA event on a stream."""
+    _ensure_ctx()
+    st = _to_stream(stream)
+    _check(driver.cuEventRecord(ev, st), "cuEventRecord")
+
+
+def query_event(ev: driver.CUevent) -> int:
+    """Return CUDA error code for cuEventQuery (0=ready, nonzero=not ready/error)."""
+    _ensure_ctx()
+    return _err_int(driver.cuEventQuery(ev))
+
+
+def destroy_event(ev: driver.CUevent) -> None:
+    """Destroy a CUDA event (best-effort)."""
+    try:
+        _ensure_ctx()
+        _check(driver.cuEventDestroy(ev), "cuEventDestroy")
+    except Exception:
+        pass
+
+
+def create_stream(*, non_blocking: bool = True) -> driver.CUstream:
+    """Create a dedicated CUDA stream for external semaphore servicing.
+
+    The default stream can be implicitly synchronized with unrelated GPU work (e.g. PyTorch),
+    which delays release-fence signaling and can deadlock the compositor. Use a dedicated
+    non-blocking stream by default.
+    """
+    _ensure_ctx()
+    flags = driver.CUstream_flags.CU_STREAM_NON_BLOCKING if non_blocking else driver.CUstream_flags.CU_STREAM_DEFAULT
+    err, st = driver.cuStreamCreate(flags)
+    _check(err, "cuStreamCreate")
+    return st

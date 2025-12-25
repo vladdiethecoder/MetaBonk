@@ -13,9 +13,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import math as _math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,6 +46,13 @@ else:
 from src.common.schemas import CurriculumConfig, HEARTBEAT_SCHEMA_VERSION, Heartbeat, InstanceConfig, TrainerConfig
 from .launcher import GameLauncher
 from .stream import CaptureStream
+try:
+    from .synthetic_eye_stream import SyntheticEyeStream, SyntheticEyeFrame  # type: ignore
+    from .synthetic_eye_cuda import SyntheticEyeCudaIngestor  # type: ignore
+except Exception:  # pragma: no cover
+    SyntheticEyeStream = None  # type: ignore
+    SyntheticEyeFrame = None  # type: ignore
+    SyntheticEyeCudaIngestor = None  # type: ignore
 from .trainer import Trainer
 from .perception import construct_observation
 from .rollout import LearnerClient, RolloutBuffer
@@ -229,21 +238,48 @@ class WorkerService:
         self.host = host
         self.port = port
         self.launcher = GameLauncher(instance_id=instance_id, display=display)
-        use_dmabuf = True
-        audit_log_path = os.environ.get("METABONK_DMABUF_AUDIT_LOG")
-        if not audit_log_path:
-            run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
-            if run_dir:
-                try:
-                    worker_id = os.environ.get("METABONK_WORKER_ID", "0")
-                except Exception:
-                    worker_id = "0"
-                audit_log_path = str(Path(run_dir) / "logs" / f"worker_{worker_id}_dmabuf.log")
-        self.stream = CaptureStream(
-            pipewire_node=os.environ.get("PIPEWIRE_NODE"),
-            use_dmabuf=use_dmabuf,
-            audit_log_path=audit_log_path,
-        )
+        self._frame_source = str(os.environ.get("METABONK_FRAME_SOURCE", "pipewire") or "").strip().lower()
+        if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            if SyntheticEyeStream is None:
+                raise RuntimeError("SyntheticEyeStream unavailable (missing src/worker/synthetic_eye_stream.py)")
+            self.stream = SyntheticEyeStream(socket_path=os.environ.get("METABONK_FRAME_SOCK"))  # type: ignore[assignment]
+            audit_log_path = os.environ.get("METABONK_DMABUF_AUDIT_LOG")
+            if not audit_log_path:
+                run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+                if run_dir:
+                    try:
+                        worker_id = os.environ.get("METABONK_WORKER_ID", "0")
+                    except Exception:
+                        worker_id = "0"
+                    audit_log_path = str(Path(run_dir) / "logs" / f"worker_{worker_id}_dmabuf.log")
+            # CUDA ingest is required to signal release fences (avoids compositor deadlock).
+            if SyntheticEyeCudaIngestor is None:
+                raise RuntimeError("SyntheticEyeCudaIngestor unavailable (missing CUDA bindings)")
+            try:
+                audit_interval_s = float(os.environ.get("METABONK_DMABUF_AUDIT_INTERVAL_S", "2.0"))
+            except Exception:
+                audit_interval_s = 2.0
+            self._synthetic_eye_ingestor = SyntheticEyeCudaIngestor(  # type: ignore[call-arg]
+                audit_log_path=audit_log_path,
+                audit_interval_s=audit_interval_s,
+            )
+        else:
+            use_dmabuf = True
+            audit_log_path = os.environ.get("METABONK_DMABUF_AUDIT_LOG")
+            if not audit_log_path:
+                run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+                if run_dir:
+                    try:
+                        worker_id = os.environ.get("METABONK_WORKER_ID", "0")
+                    except Exception:
+                        worker_id = "0"
+                    audit_log_path = str(Path(run_dir) / "logs" / f"worker_{worker_id}_dmabuf.log")
+            self.stream = CaptureStream(
+                pipewire_node=os.environ.get("PIPEWIRE_NODE"),
+                use_dmabuf=use_dmabuf,
+                audit_log_path=audit_log_path,
+            )
+            self._synthetic_eye_ingestor = None
         # Starting a GStreamer PipeWire capture pipeline can be fragile on some systems
         # (driver/gi/gstreamer mismatches). For stream HUD purposes we only need NVENC,
         # so keep capture opt-in and default it off.
@@ -272,6 +308,7 @@ class WorkerService:
             self.rollout.eval_seed = None
         self.curriculum = CurriculumConfig()
         self._stop = threading.Event()
+        self._boot_ts = time.time()
         self._config_poll_s = float(os.environ.get("METABONK_CONFIG_POLL_S", "30.0"))
         self._warned_no_reward_frame = False
         self._eval_clip_on_done = os.environ.get("METABONK_EVAL_CLIP_ON_DONE", "0") in ("1", "true", "True")
@@ -289,6 +326,18 @@ class WorkerService:
         self._pipewire_health_ts: float = 0.0
         self._pipewire_daemon_ok: Optional[bool] = None
         self._pipewire_session_ok: Optional[bool] = None
+        # Synthetic Eye resilience: restart worker on compositor resets/stalls to avoid training on frozen frames.
+        self._synthetic_eye_reset_restart = str(
+            os.environ.get("METABONK_SYNTHETIC_EYE_RESET_RESTART", "1")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            self._synthetic_eye_stall_restart_s = float(
+                os.environ.get("METABONK_SYNTHETIC_EYE_STALL_RESTART_S", "15.0")
+            )
+        except Exception:
+            self._synthetic_eye_stall_restart_s = 15.0
+        self._synthetic_eye_drain_enabled: bool = False
+        self._synthetic_eye_drain_last_error_ts: float = 0.0
         self._menu_doom_score: float = 0.0
         self._game_restart_enabled = os.environ.get("METABONK_GAME_RESTART", "1") in ("1", "true", "True")
         self._game_restart_possible = _game_restart_possible()
@@ -662,7 +711,7 @@ class WorkerService:
         self._menu_bootstrap_step = 0
         self._menu_bootstrap_next_ts = 0.0
         self._menu_bootstrap_last_menu: Optional[str] = None
-        self._init_input_backend()
+        # Delay X11 input backend init until after the game (gamescope/Xwayland) display exists.
         # Optional BonkLink bridge (BepInEx 6 IL2CPP).
         self._use_bonklink = os.environ.get("METABONK_USE_BONKLINK", "0") in ("1", "true", "True")
         self._bonklink = None
@@ -1010,6 +1059,15 @@ class WorkerService:
     def _ensure_streamer(self) -> None:
         if not self._stream_enabled:
             return
+        # Allow the launcher/orchestrator to disable streaming entirely for low-priority instances.
+        # This reduces per-instance RAM/VRAM overhead (encoder + buffers) without affecting training.
+        if str(os.environ.get("METABONK_STREAMER_ENABLED", "1") or "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            return
         if self.streamer is not None:
             return
         backend = (os.environ.get("METABONK_STREAM_BACKEND") or "").strip().lower()
@@ -1067,17 +1125,21 @@ class WorkerService:
         """Enable/disable PipeWire capture at runtime (best-effort)."""
         enabled = bool(enabled)
         new_disabled = not enabled
+        is_synthetic_eye = self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
         if bool(getattr(self, "_capture_disabled", False)) == new_disabled:
             if not new_disabled:
                 self._ensure_preview_jpeg()
             return
         self._capture_disabled = new_disabled
         if new_disabled:
-            if not bool(getattr(self, "_pipewire_drain_enabled", False)):
-                try:
-                    self.stream.stop()
-                except Exception:
-                    pass
+            # Synthetic Eye is the vision path; it must keep consuming frames even when
+            # "featured capture"/preview is toggled off by the orchestrator.
+            if not is_synthetic_eye:
+                if not bool(getattr(self, "_pipewire_drain_enabled", False)):
+                    try:
+                        self.stream.stop()
+                    except Exception:
+                        pass
             try:
                 self._stop_preview_jpeg()
             except Exception:
@@ -1099,7 +1161,12 @@ class WorkerService:
                     self._fifo_publisher = None
         else:
             self._ensure_pipewire_node()
-            if bool(getattr(self, "_pipewire_drain_enabled", False)) or self._gst_capture_enabled:
+            if is_synthetic_eye:
+                try:
+                    self.stream.start()
+                except Exception:
+                    pass
+            elif bool(getattr(self, "_pipewire_drain_enabled", False)) or self._gst_capture_enabled:
                 try:
                     self.stream.start()
                 except Exception:
@@ -1193,7 +1260,97 @@ class WorkerService:
 
     def start(self):
         self.launcher.launch()
+        # If DISPLAY was explicitly provided (e.g., Smithay compositor.env handshake), honor it and
+        # do not attempt gamescope log discovery.
+        if self.display:
+            disp = str(self.display)
+            os.environ["DISPLAY"] = disp
+            os.environ["METABONK_INPUT_DISPLAY"] = disp
+            xtest_ok = self._check_xtest(display=disp)
+            if not xtest_ok:
+                raise RuntimeError(f"[worker:{self.instance_id}] XTEST extension not available on {disp}")
+            self._upsert_isolation_log(
+                {
+                    "DISPLAY": disp,
+                    "METABONK_INPUT_DISPLAY": disp,
+                    "XTEST": "1" if xtest_ok else "0",
+                }
+            )
+            self._init_input_backend()
+            self._bind_input_window()
+            # Synthetic Eye: start the socket reader thread early so the producer does not block on accept()
+            # and so we can begin consuming frames immediately.
+            if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+                try:
+                    self.stream.start()
+                except Exception:
+                    pass
+                self._start_synthetic_eye_drain()
+            self._ensure_pipewire_node()
+            if bool(getattr(self, "_pipewire_drain_enabled", False)) and not getattr(self, "_capture_disabled_env", False):
+                try:
+                    self.stream.start()
+                except Exception:
+                    pass
+            if self._fifo_stream_enabled and not getattr(self, "_capture_disabled_env", False):
+                try:
+                    self._ensure_streamer()
+                except Exception:
+                    pass
+                if self._fifo_publisher is not None:
+                    try:
+                        self._fifo_publisher.start()
+                    except Exception:
+                        pass
+            if not getattr(self, "_capture_disabled", False):
+                self._ensure_streamer()
+            threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+            threading.Thread(target=self._rollout_loop, daemon=True).start()
+            return
+
+        # Otherwise discover the gamescope-provided Xwayland display from launcher logs so libxdo/xdotool
+        # connects to the correct isolated X server (never the host :0).
+        try:
+            disp = self._discover_gamescope_xwayland_display()
+            input_backend = str(os.environ.get("METABONK_INPUT_BACKEND") or "").strip().lower()
+            if not disp and input_backend in ("libxdo", "xdotool", ""):
+                lp = getattr(self.launcher, "log_path", None)
+                tail = ""
+                try:
+                    if lp and Path(str(lp)).exists():
+                        tail = Path(str(lp)).read_text(errors="replace")[-4000:]
+                except Exception:
+                    tail = ""
+                raise RuntimeError(
+                    f"gamescope Xwayland display not discovered (launcher log={lp}). "
+                    f"Last log tail:\n{tail}"
+                )
+            if disp:
+                self.display = disp
+                os.environ["DISPLAY"] = disp
+                os.environ["METABONK_INPUT_DISPLAY"] = disp
+                xtest_ok = self._check_xtest(display=disp)
+                if not xtest_ok:
+                    raise RuntimeError(f"XTEST extension not available on {disp}")
+                self._upsert_isolation_log(
+                    {
+                        "DISPLAY": disp,
+                        "METABONK_INPUT_DISPLAY": disp,
+                        "XTEST": "1" if xtest_ok else "0",
+                    }
+                )
+        except Exception as e:
+            raise RuntimeError(f"[worker:{self.instance_id}] failed to discover gamescope Xwayland display: {e}") from e
+        self._init_input_backend()
         self._bind_input_window()
+        # Synthetic Eye: start the socket reader thread early so the producer does not block on accept()
+        # and so we can begin consuming frames immediately.
+        if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            try:
+                self.stream.start()
+            except Exception:
+                pass
+            self._start_synthetic_eye_drain()
         # If this worker is going to stream via GPU, we need to discover the node after launch.
         self._ensure_pipewire_node()
         if bool(getattr(self, "_pipewire_drain_enabled", False)) and not getattr(self, "_capture_disabled_env", False):
@@ -1219,6 +1376,131 @@ class WorkerService:
             self._ensure_streamer()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._rollout_loop, daemon=True).start()
+
+    def _start_synthetic_eye_drain(self) -> None:
+        if self._synthetic_eye_drain_enabled:
+            return
+        if self._frame_source not in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            return
+        if self._synthetic_eye_ingestor is None:
+            return
+        self._synthetic_eye_drain_enabled = True
+        threading.Thread(target=self._synthetic_eye_drain_loop, daemon=True).start()
+
+    def _synthetic_eye_drain_loop(self) -> None:
+        """Continuously service Synthetic Eye acquire/release fences.
+
+        This keeps the compositor buffer pool flowing even when the main rollout loop is busy.
+        """
+        try:
+            from .cuda_interop import _ensure_ctx
+
+            _ensure_ctx()
+            try:
+                import torch  # type: ignore
+
+                torch.cuda._lazy_init()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        while not self._stop.is_set():
+            try:
+                frames = getattr(self.stream, "drain")() if hasattr(self.stream, "drain") else [self.stream.read()]
+            except Exception:
+                frames = []
+            frames = [f for f in frames if f is not None]
+            if not frames:
+                time.sleep(0.005)
+                continue
+            for frame in frames:
+                try:
+                    if (
+                        SyntheticEyeFrame is not None
+                        and isinstance(frame, SyntheticEyeFrame)
+                        and self._synthetic_eye_ingestor is not None
+                    ):
+                        try:
+                            # For soak runs, we disable capture/inference entirely. In that mode we
+                            # only need to prove that frames are advancing; skip CUDA fence import
+                            # to avoid churn/driver flakiness while still enforcing GPU-only DMA-BUF.
+                            if bool(getattr(self, "_capture_disabled", False)) or bool(getattr(self, "_capture_disabled_env", False)):
+                                self._synthetic_eye_ingestor.note_frame(frame)
+                            else:
+                                if (
+                                    os.environ.get("METABONK_VISION_AUDIT", "0") == "1"
+                                    and int(frame.frame_id) % 60 == 0
+                                ):
+                                    h = None
+                                    try:
+                                        h = self._synthetic_eye_ingestor.begin(frame)
+                                    except Exception as e:
+                                        print(
+                                            f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                            f"IMPORT_FAIL err={e} fd={int(frame.dmabuf_fd)} size={int(frame.size_bytes)} "
+                                            f"fourcc=0x{int(frame.drm_fourcc) & 0xFFFFFFFF:08x} "
+                                            f"modifier=0x{int(frame.modifier) & 0xFFFFFFFFFFFFFFFF:016x}",
+                                            flush=True,
+                                        )
+                                        try:
+                                            self._synthetic_eye_ingestor.handshake_only(frame)
+                                        except Exception as e2:
+                                            print(
+                                                f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                f"handshake_fallback_failed: {e2}",
+                                                flush=True,
+                                            )
+                                        continue
+                                        try:
+                                            from src.agent.tensor_bridge import tensor_from_external_frame
+
+                                            offset_bytes = int(frame.offset) if int(frame.modifier) == 0 else 0
+                                            raw_tensor = tensor_from_external_frame(
+                                                h.ext_frame,
+                                                width=frame.width,
+                                                height=frame.height,
+                                                stride_bytes=frame.stride,
+                                                offset_bytes=offset_bytes,
+                                                stream=h.stream,
+                                            )
+                                            obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
+                                            mean_val = float(obs.mean().item())
+                                            std_val = float(obs.std().item())
+                                            print(
+                                                f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                f"shape={tuple(obs.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                f"device={obs.device}",
+                                                flush=True,
+                                            )
+                                        except Exception as e:
+                                            print(
+                                                f"[VISION] worker={self.instance_id} tensor bridge failed: {e}",
+                                                flush=True,
+                                            )
+                                    finally:
+                                        if h is not None:
+                                            self._synthetic_eye_ingestor.end(h)
+                                else:
+                                    self._synthetic_eye_ingestor.handshake_only(frame)
+                            try:
+                                ts = float(getattr(frame, "timestamp", 0.0) or 0.0) or time.time()
+                                self._latest_frame_ts = ts
+                                self._record_obs_frame_ts(ts)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            now = time.time()
+                            if (now - self._synthetic_eye_drain_last_error_ts) > 5.0:
+                                self._synthetic_eye_drain_last_error_ts = now
+                                print(
+                                    f"[worker:{self.instance_id}] synthetic_eye handshake_only failed: {e}",
+                                    flush=True,
+                                )
+                finally:
+                    try:
+                        frame.close()
+                    except Exception:
+                        pass
 
     def stop(self):
         self._stop.set()
@@ -1246,25 +1528,106 @@ class WorkerService:
                 self._fifo_publisher.stop()
             except Exception:
                 pass
-        if self._input_backend is not None:
+
+    def _discover_gamescope_xwayland_display(self) -> Optional[str]:
+        """Parse gamescope logs to find the Xwayland DISPLAY (e.g. ':1')."""
+        log_path = getattr(self.launcher, "log_path", None)
+        if not log_path:
+            return None
+        print(f"[worker:{self.instance_id}] waiting for gamescope Xwayland display in {log_path}", flush=True)
+        try:
+            wait_s = float(os.environ.get("METABONK_INPUT_DISPLAY_WAIT_S", "20.0"))
+        except Exception:
+            wait_s = 20.0
+        deadline = time.time() + max(0.1, float(wait_s))
+        pat = re.compile(r"Starting Xwayland on :(\d+)")
+        last: Optional[str] = None
+        while time.time() < deadline:
             try:
-                for k in list(self._input_held_keys):
-                    try:
-                        self._input_backend.key_up(str(k))
-                    except Exception:
-                        pass
-                for b in list(self._input_held_mouse):
-                    try:
-                        self._input_backend.mouse_button(str(b), False)
-                    except Exception:
-                        pass
+                if log_path.exists():
+                    data = log_path.read_text(errors="replace")
+                    m = pat.findall(data)
+                    if m:
+                        last = m[-1]
+                        break
             except Exception:
                 pass
+            time.sleep(0.2)
+        if not last:
+            return None
+        try:
+            disp = f":{int(last)}"
+        except Exception:
+            return None
+        print(f"[worker:{self.instance_id}] gamescope Xwayland display: {disp}", flush=True)
+        return disp
+
+    def _check_xtest(self, *, display: str) -> bool:
+        """Require XTEST extension for X11 input injection."""
+        if not shutil.which("xdpyinfo"):
+            raise RuntimeError("xdpyinfo is required to validate XTEST (install xorg-x11-utils)")
+        try:
+            wait_s = float(os.environ.get("METABONK_INPUT_XTEST_WAIT_S", "5.0"))
+        except Exception:
+            wait_s = 5.0
+        deadline = time.time() + max(0.1, float(wait_s))
+        last_out = ""
+        while time.time() < deadline:
             try:
-                self._input_backend.close()
-            except Exception:
-                pass
-            self._input_backend = None
+                result = subprocess.run(
+                    ["xdpyinfo", "-display", str(display), "-ext", "XTEST"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                time.sleep(0.2)
+                continue
+            out = (result.stdout or "") + (result.stderr or "")
+            last_out = out
+            if result.returncode == 0 and "not supported" not in out.lower():
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _upsert_isolation_log(self, kv: dict[str, str]) -> None:
+        try:
+            run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+            if not run_dir:
+                return
+            worker_id = os.environ.get("METABONK_WORKER_ID")
+            if not worker_id:
+                try:
+                    worker_id = str(int(str(self.instance_id).rsplit("-", 1)[-1]))
+                except Exception:
+                    worker_id = None
+            if not worker_id:
+                return
+            log_path = os.path.join(run_dir, "logs", f"worker_{worker_id}_isolation.log")
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+            updated: set[str] = set()
+            for idx, line in enumerate(lines):
+                if "=" not in line:
+                    continue
+                key = line.split("=", 1)[0].strip()
+                if key in kv and key not in updated:
+                    lines[idx] = f"{key}={kv[key]}\n"
+                    updated.add(key)
+            for key, value in kv.items():
+                if key in updated:
+                    continue
+                if any(l.startswith(f"{key}=") for l in lines):
+                    continue
+                lines.append(f"{key}={value}\n")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception:
+            return
 
     def _bind_input_window(self) -> None:
         if not self._input_backend:
@@ -1288,23 +1651,13 @@ class WorkerService:
                 wid = self._input_backend.get_window_id()
             if wid:
                 os.environ["METABONK_INPUT_XDO_WID"] = str(wid)
-            run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
-            if not run_dir:
-                return
-            worker_id = os.environ.get("METABONK_WORKER_ID")
-            if not worker_id:
-                try:
-                    worker_id = str(int(str(self.instance_id).rsplit("-", 1)[-1]))
-                except Exception:
-                    worker_id = None
-            if not worker_id:
-                return
-            log_path = os.path.join(run_dir, "logs", f"worker_{worker_id}_isolation.log")
-            with open(log_path, "a", encoding="utf-8") as f:
-                if pid:
-                    f.write(f"GAME_PID={int(pid)}\n")
-                if wid:
-                    f.write(f"WINDOW_ID={wid}\n")
+            updates: dict[str, str] = {}
+            if pid:
+                updates["GAME_PID"] = str(int(pid))
+            if wid:
+                updates["WINDOW_ID"] = str(wid)
+            if updates:
+                self._upsert_isolation_log(updates)
         except Exception:
             return
 
@@ -2312,6 +2665,7 @@ class WorkerService:
         name = self._input_backend_name
         if name not in ("uinput", "xdotool", "xdo", "libxdo"):
             return
+        strict_input = os.environ.get("METABONK_REQUIRE_INPUT", "1") in ("1", "true", "True")
         self._input_buttons = self._parse_input_buttons()
         self._menu_bias_indices = self._resolve_menu_bias_indices()
         if not self._input_buttons:
@@ -2340,18 +2694,37 @@ class WorkerService:
                 self._input_menu_bootstrap = False
                 return
             try:
+                wait_s = float(os.environ.get("METABONK_INPUT_DISPLAY_WAIT_S", "5.0"))
+            except Exception:
+                wait_s = 5.0
+            deadline = time.time() + max(0.0, float(wait_s))
+            last_err: Optional[Exception] = None
+            try:
                 display = os.environ.get("METABONK_INPUT_DISPLAY") or self.display
                 xauth = os.environ.get("METABONK_INPUT_XAUTHORITY") or os.environ.get("XAUTHORITY")
                 window_name = os.environ.get("METABONK_INPUT_XDO_WINDOW")
                 window_class = os.environ.get("METABONK_INPUT_XDO_CLASS")
-                self._input_backend = LibXDoBackend(
-                    display=display,
-                    xauth=xauth,
-                    window_name=window_name,
-                    window_class=window_class,
-                )
-                print(f"[worker:{self.instance_id}] libxdo backend enabled (DISPLAY={display})")
+                while True:
+                    try:
+                        self._input_backend = LibXDoBackend(
+                            display=display,
+                            xauth=xauth,
+                            window_name=window_name,
+                            window_class=window_class,
+                        )
+                        print(f"[worker:{self.instance_id}] libxdo backend enabled (DISPLAY={display})")
+                        last_err = None
+                        break
+                    except LibXDoError as e:
+                        last_err = e
+                        if time.time() >= deadline:
+                            raise
+                        time.sleep(0.2)
             except LibXDoError as e:
+                if strict_input:
+                    raise RuntimeError(
+                        f"[worker:{self.instance_id}] libxdo backend failed (strict input): {e}"
+                    ) from e
                 print(f"[worker:{self.instance_id}] libxdo backend failed: {e}")
                 self._input_backend = None
                 self._input_menu_bootstrap = False
@@ -2366,14 +2739,30 @@ class WorkerService:
             xauth = os.environ.get("METABONK_INPUT_XAUTHORITY") or os.environ.get("XAUTHORITY")
             window_name = os.environ.get("METABONK_INPUT_XDO_WINDOW")
             window_class = os.environ.get("METABONK_INPUT_XDO_CLASS")
-            self._input_backend = XDoToolBackend(
-                display=display,
-                xauth=xauth,
-                window_name=window_name,
-                window_class=window_class,
-            )
-            print(f"[worker:{self.instance_id}] xdotool backend enabled (DISPLAY={display})")
+            try:
+                wait_s = float(os.environ.get("METABONK_INPUT_DISPLAY_WAIT_S", "5.0"))
+            except Exception:
+                wait_s = 5.0
+            deadline = time.time() + max(0.0, float(wait_s))
+            while True:
+                try:
+                    self._input_backend = XDoToolBackend(
+                        display=display,
+                        xauth=xauth,
+                        window_name=window_name,
+                        window_class=window_class,
+                    )
+                    print(f"[worker:{self.instance_id}] xdotool backend enabled (DISPLAY={display})")
+                    break
+                except XDoToolError as e:
+                    if time.time() >= deadline:
+                        raise
+                    time.sleep(0.2)
         except XDoToolError as e:
+            if strict_input:
+                raise RuntimeError(
+                    f"[worker:{self.instance_id}] xdotool backend failed (strict input): {e}"
+                ) from e
             print(f"[worker:{self.instance_id}] xdotool backend failed: {e}")
             self._input_backend = None
             self._input_menu_bootstrap = False
@@ -2664,6 +3053,70 @@ class WorkerService:
         next_retry = 0.0
         while not self._stop.is_set():
             now = time.time()
+
+            # Synthetic Eye control: drop buffered rollout on compositor/XWayland resets to avoid
+            # poisoning training with frozen frames.
+            try:
+                if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf") and hasattr(self.stream, "pop_reset"):
+                    r = self.stream.pop_reset()  # type: ignore[attr-defined]
+                else:
+                    r = None
+            except Exception:
+                r = None
+            if r is not None:
+                try:
+                    reason = int(getattr(r, "reason", 0) or 0)
+                except Exception:
+                    reason = 0
+                print(f"[worker] synthetic_eye reset detected (reason={reason}); dropping buffered rollout", flush=True)
+                try:
+                    self.rollout.reset()
+                except Exception:
+                    # Fall back to flush() semantics (does not reset episode counters).
+                    try:
+                        _ = self.rollout.flush()
+                    except Exception:
+                        pass
+                # Best-effort: clear any pending CUDA fence cleanup so we don't accumulate stale
+                # external semaphore handles across compositor resets.
+                try:
+                    if getattr(self, "_synthetic_eye_ingestor", None) is not None:
+                        self._synthetic_eye_ingestor.on_reset()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                self._episode_start_ts = now
+                self._episode_idx += 1
+                # Only restart the worker for "hard" resets (e.g. XWayland restart). For output resets
+                # (reason=2) we must keep draining and signaling release fences; restarting here can
+                # strand producer waits and trigger a deadlock loop.
+                if self._synthetic_eye_reset_restart and reason in (1,):
+                    print(
+                        f"[worker] synthetic_eye reset (reason={reason}) -> restarting worker to recover vision",
+                        flush=True,
+                    )
+                    try:
+                        self.launcher.shutdown()
+                    except Exception:
+                        pass
+                    raise SystemExit(3)
+
+            # Synthetic Eye stall detector: if frames stop advancing, restart worker (GPU-only policy).
+            if (
+                self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
+                and float(self._synthetic_eye_stall_restart_s or 0.0) > 0.0
+                and (now - float(self._boot_ts or now)) > 30.0
+            ):
+                last_ts = float(getattr(self, "_latest_frame_ts", 0.0) or 0.0)
+                if last_ts > 0 and (now - last_ts) > float(self._synthetic_eye_stall_restart_s):
+                    print(
+                        f"[worker] synthetic_eye stalled (no frames for {now - last_ts:.1f}s) -> restarting worker",
+                        flush=True,
+                    )
+                    try:
+                        self.launcher.shutdown()
+                    except Exception:
+                        pass
+                    raise SystemExit(4)
             if (now - float(self._pipewire_health_ts or 0.0)) >= 5.0:
                 try:
                     self._pipewire_daemon_ok = bool(GameLauncher.pipewire_daemon_ok(timeout_s=0.4))
@@ -2887,6 +3340,68 @@ class WorkerService:
                 self._last_step_seen = step_now
                 self._last_step_ts = now
             step_age_s = (now - self._last_step_ts) if self._last_step_ts > 0 else None
+
+            # Memory telemetry (best-effort; do not fail the heartbeat on /proc parsing issues).
+            def _kb_from_status(pid: int) -> tuple[Optional[float], Optional[float]]:
+                try:
+                    p = f"/proc/{int(pid)}/status"
+                    rss_kb: Optional[float] = None
+                    vms_kb: Optional[float] = None
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("VmRSS:"):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    rss_kb = float(parts[1])
+                            elif line.startswith("VmSize:"):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    vms_kb = float(parts[1])
+                            if rss_kb is not None and vms_kb is not None:
+                                break
+                    return rss_kb, vms_kb
+                except Exception:
+                    return None, None
+
+            def _kb_from_meminfo() -> tuple[Optional[float], Optional[float], Optional[float]]:
+                try:
+                    mem_total: Optional[float] = None
+                    mem_avail: Optional[float] = None
+                    swap_free: Optional[float] = None
+                    with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.startswith("MemTotal:"):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    mem_total = float(parts[1])
+                            elif line.startswith("MemAvailable:"):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    mem_avail = float(parts[1])
+                            elif line.startswith("SwapFree:"):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    swap_free = float(parts[1])
+                            if mem_total is not None and mem_avail is not None and swap_free is not None:
+                                break
+                    return mem_total, mem_avail, swap_free
+                except Exception:
+                    return None, None, None
+
+            def _mb(kb: Optional[float]) -> Optional[float]:
+                if kb is None:
+                    return None
+                try:
+                    mb = float(kb) / 1024.0
+                    if not _math.isfinite(mb):
+                        return None
+                    return mb
+                except Exception:
+                    return None
+
+            rss_kb, vms_kb = _kb_from_status(int(os.getpid()))
+            launcher_rss_kb, launcher_vms_kb = _kb_from_status(int(launcher_pid or 0)) if launcher_pid else (None, None)
+            mem_total_kb, mem_avail_kb, swap_free_kb = _kb_from_meminfo()
             hb = Heartbeat(
                 schema_version=int(HEARTBEAT_SCHEMA_VERSION),
                 run_id=os.environ.get("METABONK_RUN_ID"),
@@ -2940,6 +3455,13 @@ class WorkerService:
                 action_entropy=action_entropy,
                 bonk_confidence=bonk_confidence,
                 menu_doom_spiral=float(self._menu_doom_score),
+                rss_mb=_mb(rss_kb),
+                vms_mb=_mb(vms_kb),
+                launcher_rss_mb=_mb(launcher_rss_kb),
+                launcher_vms_mb=_mb(launcher_vms_kb),
+                mem_total_mb=_mb(mem_total_kb),
+                mem_available_mb=_mb(mem_avail_kb),
+                swap_free_mb=_mb(swap_free_kb),
             )
             if requests:
                 try:
@@ -3301,12 +3823,25 @@ class WorkerService:
                     except Exception:
                         detections = []
 
-            # Fallback: PipeWire capture (only if bridge absent).
+            # Fallback: visual capture (PipeWire or Synthetic Eye) when no bridge frames exist.
+            # Synthetic Eye is the GPU-only vision sensor: always consume frames so the producer
+            # can make forward progress (release fences must be serviced), even if other sources
+            # also provide observations.
             if (
-                (not detections)
-                and (not used_pixels)
-                and (not getattr(self, "_capture_disabled", False))
-                and not (self._use_bridge and self.bridge and self._bridge_loop)
+                (
+                    self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
+                    and not bool(getattr(self, "_synthetic_eye_drain_enabled", False))
+                )
+                or (
+                    (not detections)
+                    and (not used_pixels)
+                    and (not getattr(self, "_capture_disabled", False))
+                    and not (self._use_bridge and self.bridge and self._bridge_loop)
+                    and not (
+                        self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
+                        and bool(getattr(self, "_synthetic_eye_drain_enabled", False))
+                    )
+                )
             ):
                 frame = self.stream.read()
                 if frame is not None:
@@ -3315,42 +3850,96 @@ class WorkerService:
                     except Exception:
                         self._latest_frame_ts = time.time()
                     self._record_obs_frame_ts(self._latest_frame_ts)
-                    frame_size = (frame.width, frame.height)
-                    if self.highlight and frame.cpu_rgb:
-                        self.highlight.add_frame(frame.cpu_rgb, frame.width, frame.height)
-                    if frame.cpu_rgb:
+                    # Synthetic Eye frames are GPU-only (DMA-BUF + fences). For now, the worker
+                    # only performs explicit-sync handshake (wait acquire / signal release) to
+                    # keep the compositor's buffer pool flowing. Vision inference on DMA-BUF is
+                    # wired separately (see src/worker/synthetic_eye_cuda.py).
+                    if SyntheticEyeFrame is not None and isinstance(frame, SyntheticEyeFrame):
                         try:
-                            import numpy as np
+                            if self._synthetic_eye_ingestor is not None:
+                                h = None
+                                try:
+                                    h = self._synthetic_eye_ingestor.begin(frame)
+                                    try:
+                                        from src.agent.tensor_bridge import tensor_from_external_frame
 
-                            reward_frame_hwc = np.frombuffer(frame.cpu_rgb, dtype=np.uint8).reshape(
-                                (int(frame.height), int(frame.width), 3)
-                            )
+                                        offset_bytes = int(frame.offset) if int(frame.modifier) == 0 else 0
+                                        raw_tensor = tensor_from_external_frame(
+                                            h.ext_frame,
+                                            width=frame.width,
+                                            height=frame.height,
+                                            stride_bytes=frame.stride,
+                                            offset_bytes=offset_bytes,
+                                            stream=h.stream,
+                                        )
+                                        obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
+                                        if os.environ.get("METABONK_VISION_AUDIT", "0") == "1":
+                                            if int(frame.frame_id) % 60 == 0:
+                                                mean_val = float(obs.mean().item())
+                                                std_val = float(obs.std().item())
+                                                print(
+                                                    f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                    f"shape={tuple(obs.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                    f"device={obs.device}",
+                                                    flush=True,
+                                                )
+                                    except Exception as e:
+                                        print(
+                                            f"[VISION] worker={self.instance_id} tensor bridge failed: {e}",
+                                            flush=True,
+                                        )
+                                finally:
+                                    if h is not None:
+                                        self._synthetic_eye_ingestor.end(h)
+                            else:
+                                # If CUDA ingest is unavailable, avoid deadlocking the producer by
+                                # dropping the frame immediately (release fence remains unsignaled).
+                                # This configuration is unsupported for Synthetic Eye runs.
+                                pass
                         except Exception:
-                            reward_frame_hwc = None
-                    if requests and frame.cpu_rgb:
+                            # Do not propagate; keep worker alive even if a single frame import fails.
+                            pass
                         try:
-                            import base64
-                            import io
-                            from PIL import Image
-
-                            img = Image.frombytes("RGB", (frame.width, frame.height), frame.cpu_rgb)
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG", quality=80)
-                            latest_image_bytes = buf.getvalue()
-                            latest_image_source = "pipewire"
-                            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-                            vr = requests.post(
-                                f"{self.vision_url}/predict",
-                                json={"image_b64": b64},
-                                timeout=1.0,
-                            )
-                            if vr.ok:
-                                data = vr.json() or {}
-                                detections = data.get("detections", []) or []
-                                if isinstance(data.get("metrics"), dict):
-                                    vision_metrics.update(data.get("metrics") or {})
+                            frame.close()
                         except Exception:
-                            detections = []
+                            pass
+                    else:
+                        frame_size = (frame.width, frame.height)
+                        if self.highlight and frame.cpu_rgb:
+                            self.highlight.add_frame(frame.cpu_rgb, frame.width, frame.height)
+                        if frame.cpu_rgb:
+                            try:
+                                import numpy as np
+
+                                reward_frame_hwc = np.frombuffer(frame.cpu_rgb, dtype=np.uint8).reshape(
+                                    (int(frame.height), int(frame.width), 3)
+                                )
+                            except Exception:
+                                reward_frame_hwc = None
+                        if requests and frame.cpu_rgb:
+                            try:
+                                import base64
+                                import io
+                                from PIL import Image
+
+                                img = Image.frombytes("RGB", (frame.width, frame.height), frame.cpu_rgb)
+                                buf = io.BytesIO()
+                                img.save(buf, format="JPEG", quality=80)
+                                latest_image_bytes = buf.getvalue()
+                                latest_image_source = "pipewire"
+                                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                                vr = requests.post(
+                                    f"{self.vision_url}/predict",
+                                    json={"image_b64": b64},
+                                    timeout=1.0,
+                                )
+                                if vr.ok:
+                                    data = vr.json() or {}
+                                    detections = data.get("detections", []) or []
+                                    if isinstance(data.get("metrics"), dict):
+                                        vision_metrics.update(data.get("metrics") or {})
+                            except Exception:
+                                detections = []
 
             # Persist latest frame bytes for UI fallback/debug endpoints.
             if latest_image_bytes is not None:
@@ -3666,7 +4255,30 @@ class WorkerService:
                 lp = 0.0
                 val = 0.0
             else:
-                a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask_for_policy)
+                try:
+                    a_cont, a_disc, lp, val = self.trainer.act(obs, action_mask=action_mask_for_policy)
+                    # Hardening: guard against NaNs/Infs from unstable policy weights. A crash here can
+                    # stall Synthetic Eye by leaving release fences unsignaled.
+                    if any((not _math.isfinite(float(x))) for x in (list(a_cont) if a_cont else [])):
+                        raise ValueError("non-finite continuous action")
+                    if not _math.isfinite(float(lp)) or not _math.isfinite(float(val)):
+                        raise ValueError("non-finite lp/val")
+                except Exception as e:
+                    try:
+                        self.trainer.reset_state()
+                    except Exception:
+                        pass
+                    a_cont, a_disc = self._sample_random_action(action_mask_for_policy or action_mask)
+                    lp = 0.0
+                    val = 0.0
+                    now_dbg = time.time()
+                    last_warn = float(getattr(self, "_last_policy_nan_warn_ts", 0.0) or 0.0)
+                    if (now_dbg - last_warn) > 5.0:
+                        self._last_policy_nan_warn_ts = now_dbg
+                        print(
+                            f"[worker:{self.instance_id}] WARN: policy.act failed ({e}); using random action and resetting state",
+                            flush=True,
+                        )
             action_mask_for_rollout = action_mask_for_policy
 
             # Optional SIMA2 backend override (inference).
@@ -5906,8 +6518,6 @@ def main() -> int:
     parser.add_argument("--frame-stack", type=int, default=int(os.environ.get("METABONK_FRAME_STACK", "4")))
     parser.add_argument("--display", default=os.environ.get("DISPLAY"))
     args = parser.parse_args()
-
-    resolve_gamescope_serial()
 
     global service
     service = WorkerService(
