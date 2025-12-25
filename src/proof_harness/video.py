@@ -112,9 +112,8 @@ def build_ffmpeg_record_cmd(
         "yes",
         "on",
     )
-    if overlay_textfile and not disable_drawtext:
-        if not _ffmpeg_has_filter("drawtext"):
-            overlay_textfile = None
+    if overlay_textfile and disable_drawtext:
+        overlay_textfile = None
     if overlay_textfile:
         font_part = f":fontfile={font_path}" if font_path else ""
         vf.append(
