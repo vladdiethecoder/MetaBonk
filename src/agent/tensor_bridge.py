@@ -5,11 +5,14 @@ Exposes the __cuda_array_interface__ for device memory imported via CUDA interop
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from cuda.bindings import driver  # type: ignore
+
+_DEBUG_TENSOR_BRIDGE = os.environ.get("METABONK_TENSOR_BRIDGE_DEBUG", "0") == "1"
 
 from ..worker.cuda_interop import CudaExternalFrame, _ensure_ctx
 
@@ -223,6 +226,13 @@ def tensor_from_external_frame(
     bytes_per_pixel = int(channels) * int(itemsize)
 
     if frame.mipmapped_array is None and frame.mapped_ptr:
+        if _DEBUG_TENSOR_BRIDGE:
+            print(
+                "[TENSOR_BRIDGE] linear path "
+                f"width={int(width)} height={int(height)} "
+                f"channels={int(channels)} stride_bytes={stride_bytes} offset_bytes={int(offset_bytes)}",
+                flush=True,
+            )
         img = image_from_external_frame(
             frame,
             width=width,
@@ -249,6 +259,13 @@ def tensor_from_external_frame(
 
     if offset_bytes:
         raise RuntimeError("offset_bytes is not supported for tiled CUDA arrays")
+
+    if _DEBUG_TENSOR_BRIDGE:
+        print(
+            "[TENSOR_BRIDGE] detile path "
+            f"width={int(width)} height={int(height)} channels={int(channels)}",
+            flush=True,
+        )
 
     _ensure_ctx()
     err, level0 = driver.cuMipmappedArrayGetLevel(frame.mipmapped_array, 0)

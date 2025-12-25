@@ -153,7 +153,10 @@ def import_dmabuf_as_mipmapped_array(
     mip_desc.arrayDesc.Width = int(width)
     mip_desc.arrayDesc.Height = int(height)
     mip_desc.arrayDesc.Depth = 0
-    mip_desc.arrayDesc.Format = driver.CUarray_format.CU_AD_FORMAT_UNORM_INT8X4
+    # Use a raw 8-bit array with explicit channel count. The *_X4 variants encode
+    # channel count in the format and can lead to misinterpretation when combined
+    # with NumChannels for external memory imports on some drivers.
+    mip_desc.arrayDesc.Format = driver.CUarray_format.CU_AD_FORMAT_UNSIGNED_INT8
     mip_desc.arrayDesc.NumChannels = int(num_channels)
     mip_desc.arrayDesc.Flags = 0
     err, mip = driver.cuExternalMemoryGetMappedMipmappedArray(ext_mem, mip_desc)

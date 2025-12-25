@@ -1450,7 +1450,7 @@ class WorkerService:
                                                 f"handshake_fallback_failed: {e2}",
                                                 flush=True,
                                             )
-                                        continue
+                                    else:
                                         try:
                                             from src.agent.tensor_bridge import tensor_from_external_frame
 
@@ -1463,9 +1463,11 @@ class WorkerService:
                                                 offset_bytes=offset_bytes,
                                                 stream=h.stream,
                                             )
+                                            raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
                                             obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
                                             mean_val = float(obs.mean().item())
                                             std_val = float(obs.std().item())
+                                            self._dump_frame_to_png(obs, int(frame.frame_id), mean_val, std_val)
                                             print(
                                                 f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
                                                 f"shape={tuple(obs.shape)} mean={mean_val:.4f} std={std_val:.4f} "
@@ -1641,8 +1643,128 @@ class WorkerService:
                 os.environ["METABONK_INPUT_XDO_PID"] = str(int(pid))
                 print(f"[worker:{self.instance_id}] bound input to pid {int(pid)}", flush=True)
                 self._log_input_binding(int(pid))
+                if os.environ.get("METABONK_INPUT_AUDIT", "0") == "1" and not bool(
+                    getattr(self, "_input_audit_started", False)
+                ):
+                    self._input_audit_started = True
+                    threading.Thread(target=self._run_input_audit, daemon=True).start()
         except Exception:
             pass
+
+    def _run_input_audit(self) -> None:
+        try:
+            backend = getattr(self, "_input_backend", None)
+            if not backend:
+                print(f"[INPUT] worker={self.instance_id} audit SKIP backend=None", flush=True)
+                return
+
+            # For X11 backends, allow falling back to the active window during audit
+            # so we can still validate injection even if PID-based lookup is delayed.
+            try:
+                if hasattr(backend, "allow_active_fallback"):
+                    backend.allow_active_fallback = True
+            except Exception:
+                pass
+
+            deadline = time.time() + float(os.environ.get("METABONK_INPUT_AUDIT_WAIT_S", "15.0") or "15.0")
+            wid = None
+            before_menu = None
+            while time.time() < deadline:
+                try:
+                    if hasattr(backend, "get_window_id"):
+                        wid = backend.get_window_id()
+                except Exception:
+                    wid = None
+                before_menu = getattr(self, "_last_menu_mode", None)
+                if wid is not None or before_menu is not None:
+                    break
+                time.sleep(0.1)
+
+            print(
+                f"[INPUT] worker={self.instance_id} audit BEGIN display={os.environ.get('DISPLAY')} wid={wid} "
+                f"before_menu_mode={before_menu}",
+                flush=True,
+            )
+
+            # Optional: verify we can move the pointer on this DISPLAY as a concrete effect.
+            pointer_before = None
+            pointer_after = None
+            pointer_moved = False
+            try:
+                if shutil.which("xdotool") and os.environ.get("DISPLAY"):
+                    env = os.environ.copy()
+                    if getattr(backend, "xauth", None):
+                        env["XAUTHORITY"] = str(getattr(backend, "xauth"))
+                    out = subprocess.check_output(
+                        ["xdotool", "getmouselocation", "--shell"],
+                        env=env,
+                        stderr=subprocess.DEVNULL,
+                    ).decode("utf-8", "replace")
+                    kv = {}
+                    for line in out.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            kv[k.strip()] = v.strip()
+                    if "X" in kv and "Y" in kv:
+                        pointer_before = (int(kv["X"]), int(kv["Y"]))
+            except Exception:
+                pointer_before = None
+
+            # Minimal, non-destructive sequence: tap Escape then Return.
+            send_fail = False
+            for key in ("Escape", "Return"):
+                try:
+                    backend.key_down(key)
+                    time.sleep(0.03)
+                    backend.key_up(key)
+                except Exception as e:
+                    send_fail = True
+                    print(f"[INPUT] worker={self.instance_id} audit key={key} SEND_FAIL err={e}", flush=True)
+                time.sleep(0.15)
+
+            try:
+                backend.mouse_move(40, 0)
+                time.sleep(0.05)
+                backend.mouse_move(-40, 0)
+            except Exception:
+                pass
+
+            try:
+                if shutil.which("xdotool") and os.environ.get("DISPLAY"):
+                    env = os.environ.copy()
+                    if getattr(backend, "xauth", None):
+                        env["XAUTHORITY"] = str(getattr(backend, "xauth"))
+                    out = subprocess.check_output(
+                        ["xdotool", "getmouselocation", "--shell"],
+                        env=env,
+                        stderr=subprocess.DEVNULL,
+                    ).decode("utf-8", "replace")
+                    kv = {}
+                    for line in out.splitlines():
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            kv[k.strip()] = v.strip()
+                    if "X" in kv and "Y" in kv:
+                        pointer_after = (int(kv["X"]), int(kv["Y"]))
+            except Exception:
+                pointer_after = None
+
+            if pointer_before is not None and pointer_after is not None:
+                dx = abs(int(pointer_after[0]) - int(pointer_before[0]))
+                dy = abs(int(pointer_after[1]) - int(pointer_before[1]))
+                pointer_moved = (dx + dy) >= 5
+
+            time.sleep(float(os.environ.get("METABONK_INPUT_AUDIT_POST_S", "1.0") or "1.0"))
+            after_menu = getattr(self, "_last_menu_mode", None)
+            changed = (before_menu is not None) and (after_menu is not None) and (after_menu != before_menu)
+            print(
+                f"[INPUT] worker={self.instance_id} audit END after_menu_mode={after_menu} changed={changed} "
+                f"pointer_moved={pointer_moved} send_fail={send_fail} "
+                f"mouse_before={pointer_before} mouse_after={pointer_after}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[INPUT] worker={self.instance_id} audit FAILED err={e}", flush=True)
 
     def _log_input_binding(self, pid: Optional[int]) -> None:
         try:
@@ -1689,6 +1811,48 @@ class WorkerService:
                     self._obs_fps = float((len(self._obs_frame_times) - 1) / dt)
         except Exception:
             pass
+
+    @staticmethod
+    def _maybe_swizzle_channels(raw_tensor, drm_fourcc: int):
+        """Swap channel order for common little-endian DRM formats (XR24/AR24)."""
+        try:
+            fmt = int(drm_fourcc) & 0xFFFFFFFF
+        except Exception:
+            return raw_tensor
+        if fmt in (0x34325258, 0x34325241):  # XRGB8888 / ARGB8888
+            try:
+                return raw_tensor[..., [2, 1, 0, 3]]
+            except Exception:
+                return raw_tensor
+        return raw_tensor
+
+    def _dump_frame_to_png(self, obs_tensor, frame_id: int, mean_val: float, std_val: float) -> None:
+        if os.environ.get("METABONK_DUMP_FRAMES") != "1":
+            return
+        try:
+            import numpy as np
+            from PIL import Image
+        except Exception:
+            return
+        out_dir = Path(os.environ.get("METABONK_DUMP_FRAMES_DIR", "/tmp/metabonk_frames"))
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        try:
+            frame_np = (
+                obs_tensor.permute(1, 2, 0)
+                .detach()
+                .float()
+                .clamp(0.0, 1.0)
+                .cpu()
+                .numpy()
+            )
+            frame_np = (frame_np * 255.0).astype(np.uint8)
+            filename = f"frame_{int(frame_id):06d}_mean{mean_val:.4f}_std{std_val:.4f}.png"
+            Image.fromarray(frame_np).save(out_dir / filename)
+        except Exception:
+            return
 
     def _record_flight_frame(
         self,
@@ -3872,6 +4036,7 @@ class WorkerService:
                                             offset_bytes=offset_bytes,
                                             stream=h.stream,
                                         )
+                                        raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
                                         obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
                                         if os.environ.get("METABONK_VISION_AUDIT", "0") == "1":
                                             if int(frame.frame_id) % 60 == 0:
@@ -6534,7 +6699,20 @@ def main() -> int:
     )
     service.start()
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")  # type: ignore
+    loop_impl = os.environ.get("METABONK_UVICORN_LOOP")
+    if os.environ.get("METABONK_DISABLE_IO_URING") == "1":
+        os.environ["LIBUV_USE_IO_URING"] = "0"
+
+    uvicorn_kwargs = dict(host=args.host, port=args.port, log_level="info")
+    if loop_impl:
+        uvicorn_kwargs["loop"] = loop_impl
+        print(f"[worker] uvicorn loop override: {loop_impl}")
+    http_impl = os.environ.get("METABONK_UVICORN_HTTP")
+    if http_impl:
+        uvicorn_kwargs["http"] = http_impl
+        print(f"[worker] uvicorn http override: {http_impl}")
+
+    uvicorn.run(app, **uvicorn_kwargs)  # type: ignore
     service.stop()
     return 0
 
