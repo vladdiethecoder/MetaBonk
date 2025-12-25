@@ -45,6 +45,7 @@ use smithay::{
             DmabufState,
             ImportNotifier,
         },
+        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjHandler, DrmSyncobjState},
         output::OutputHandler,
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData},
         shm::{ShmHandler, ShmState},
@@ -60,6 +61,7 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use tracing::{info, warn};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::egl::EGLDisplay;
 
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_agent_v1::{self, ZmetabonkAgentV1};
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_orchestrator_v1::{self, ZmetabonkOrchestratorV1};
@@ -74,6 +76,9 @@ impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
+
+#[derive(Clone, Copy, Debug)]
+struct XWaylandPid(u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentTier {
@@ -176,6 +181,7 @@ pub struct EyeCompositor {
     seat_state: SeatState<Self>,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
+    drm_syncobj_state: Option<DrmSyncobjState>,
     #[allow(dead_code)]
     dmabuf_global: DmabufGlobal,
     #[allow(dead_code)]
@@ -197,6 +203,7 @@ pub struct EyeCompositor {
     latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
     primary_surface: Option<ObjectId>,
     xwayland_ready_at: Option<Instant>,
+    last_no_buffer_log_at: Instant,
     last_non_dmabuf_log_at: Instant,
     last_commit_log_at: Instant,
     saw_any_buffer: bool,
@@ -214,6 +221,7 @@ impl EyeCompositor {
         export_size: Arc<Mutex<(u32, u32)>>,
         latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
         dmabuf_state: DmabufState,
+        drm_syncobj_state: Option<DrmSyncobjState>,
         dmabuf_global: DmabufGlobal,
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(dh);
@@ -235,6 +243,7 @@ impl EyeCompositor {
             seat_state,
             shm_state,
             dmabuf_state,
+            drm_syncobj_state,
             dmabuf_global,
             metabonk_control_global,
             metabonk_orchestrators: Vec::new(),
@@ -254,6 +263,7 @@ impl EyeCompositor {
             latest_dmabuf,
             primary_surface: None,
             xwayland_ready_at: None,
+            last_no_buffer_log_at: Instant::now(),
             last_non_dmabuf_log_at: Instant::now(),
             last_commit_log_at: Instant::now(),
             saw_any_buffer: false,
@@ -271,6 +281,20 @@ impl EyeCompositor {
         self.agents
             .entry(pid)
             .or_insert_with(|| AgentState::new(pid, fallback))
+    }
+
+    fn pid_for_client(client: &Client) -> u32 {
+        if let Some(cs) = client.get_data::<ClientState>() {
+            if cs.pid != 0 {
+                return cs.pid;
+            }
+        }
+        if let Some(x) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            if let Some(pid) = x.user_data().get::<XWaylandPid>().map(|p| p.0) {
+                return pid;
+            }
+        }
+        0
     }
 
     fn broadcast_agent_detected(&mut self, pid: u32) {
@@ -452,6 +476,12 @@ impl DmabufHandler for EyeCompositor {
     }
 }
 
+impl DrmSyncobjHandler for EyeCompositor {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
+    }
+}
+
 impl CompositorHandler for EyeCompositor {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -473,9 +503,14 @@ impl CompositorHandler for EyeCompositor {
             info!(commit_calls = self.commit_calls, "wl_surface commits observed");
         }
 
+        // This compositor has a single output; treat every client surface as entering it.
+        // Some clients (notably XWayland/glamor) expect wl_surface.enter events to decide
+        // how/where to present.
+        self.output.enter(surface);
+
         // Frame callback throttling: drain callbacks requested for this commit and schedule them based on agent tier.
         if let Some(client) = surface.client() {
-            let pid = client.get_data::<ClientState>().map(|cs| cs.pid).unwrap_or(0);
+            let pid = Self::pid_for_client(&client);
             if pid != 0 {
                 self.queue_frame_callbacks_for_surface(surface, pid);
             }
@@ -495,7 +530,17 @@ impl CompositorHandler for EyeCompositor {
             };
             let buf = match rs.lock().ok().and_then(|s| s.buffer().cloned()) {
                 Some(b) => b,
-                None => return,
+                None => {
+                    if now.duration_since(self.last_no_buffer_log_at) > Duration::from_secs(2) {
+                        self.last_no_buffer_log_at = now;
+                        let pid = surface
+                            .client()
+                            .map(|c| Self::pid_for_client(&c))
+                            .unwrap_or(0);
+                        info!(pid, "wl_surface commit without buffer (no attach)");
+                    }
+                    return;
+                }
             };
             if !self.saw_any_buffer {
                 self.saw_any_buffer = true;
@@ -517,7 +562,7 @@ impl CompositorHandler for EyeCompositor {
                     let fmt = dmabuf.format().code;
                     let pid = surface
                         .client()
-                        .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.pid))
+                        .map(|c| Self::pid_for_client(&c))
                         .unwrap_or(0);
                     info!(
                         pid,
@@ -533,8 +578,9 @@ impl CompositorHandler for EyeCompositor {
 
                 // Record the latest surface seen for this pid (for featured selection).
                 if let Some(client) = surface.client() {
-                    if let Some(cs) = client.get_data::<ClientState>() {
-                        let agent = self.ensure_agent(cs.pid);
+                    let pid = Self::pid_for_client(&client);
+                    if pid != 0 {
+                        let agent = self.ensure_agent(pid);
                         agent.surface = Some(surface.clone());
                     }
                 }
@@ -670,7 +716,7 @@ impl XdgShellHandler for EyeCompositor {
         let pid = surface
             .wl_surface()
             .client()
-            .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.pid))
+            .map(|c| Self::pid_for_client(&c))
             .unwrap_or(0);
         if pid != 0 {
             let agent = self.ensure_agent(pid);
@@ -698,7 +744,7 @@ impl XdgShellHandler for EyeCompositor {
         let pid = surface
             .wl_surface()
             .client()
-            .and_then(|c| c.get_data::<ClientState>().map(|cs| cs.pid))
+            .map(|c| Self::pid_for_client(&c))
             .unwrap_or(0);
         if pid == 0 {
             return;
@@ -722,6 +768,7 @@ impl OutputHandler for EyeCompositor {}
 delegate_compositor!(EyeCompositor);
 smithay::delegate_shm!(EyeCompositor);
 smithay::delegate_dmabuf!(EyeCompositor);
+smithay::delegate_drm_syncobj!(EyeCompositor);
 smithay::delegate_output!(EyeCompositor);
 delegate_xwayland_shell!(EyeCompositor);
 delegate_xdg_shell!(EyeCompositor);
@@ -835,6 +882,7 @@ pub fn spawn_wayland_xwayland_thread(
     frame_sock: String,
     output_w: u32,
     output_h: u32,
+    main_dev: libc::dev_t,
     export_period: Arc<Mutex<Duration>>,
     export_size: Arc<Mutex<(u32, u32)>>,
     latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
@@ -851,33 +899,129 @@ pub fn spawn_wayland_xwayland_thread(
 
         // Advertise linux-dmabuf so XWayland clients can submit GPU buffers (no SHM fallback).
         let mut dmabuf_state = DmabufState::new();
-        let main_dev: libc::dev_t = {
-            let node = std::env::var("METABONK_DRM_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-            let md = std::fs::metadata(&node).with_context(|| format!("metadata({node})"))?;
-            use std::os::unix::fs::MetadataExt;
-            md.rdev() as libc::dev_t
-        };
         use smithay::backend::allocator::{Format, Fourcc, Modifier};
-        let formats: Vec<Format> = vec![
+        let preferred_modifiers: [Modifier; 6] = [
+            Modifier::Nvidia_16bx2_block_one_gob,
+            Modifier::Nvidia_16bx2_block_two_gob,
+            Modifier::Nvidia_16bx2_block_four_gob,
+            Modifier::Nvidia_16bx2_block_eight_gob,
+            Modifier::Nvidia_16bx2_block_sixteen_gob,
+            Modifier::Nvidia_16bx2_block_thirtytwo_gob,
+        ];
+        let preferred_codes: [Fourcc; 4] = [
+            Fourcc::Argb8888,
+            Fourcc::Xrgb8888,
+            Fourcc::Abgr8888,
+            Fourcc::Xbgr8888,
+        ];
+        let mut preferred_formats: Vec<Format> = Vec::new();
+        for modifier in preferred_modifiers {
+            for code in preferred_codes {
+                preferred_formats.push(Format { code, modifier });
+            }
+        }
+        let allow_linear = std::env::var("METABONK_DMABUF_ALLOW_LINEAR")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !allow_linear {
+            info!("dmabuf: linear modifier disabled (set METABONK_DMABUF_ALLOW_LINEAR=1 to enable)");
+        }
+        let mut formats = preferred_formats.clone();
+        let linear_formats: Vec<Format> = vec![
             Format { code: Fourcc::Argb8888, modifier: Modifier::Linear },
             Format { code: Fourcc::Xrgb8888, modifier: Modifier::Linear },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_one_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_one_gob },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_two_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_two_gob },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_four_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_four_gob },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_eight_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_eight_gob },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_sixteen_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_sixteen_gob },
-            Format { code: Fourcc::Argb8888, modifier: Modifier::Nvidia_16bx2_block_thirtytwo_gob },
-            Format { code: Fourcc::Xrgb8888, modifier: Modifier::Nvidia_16bx2_block_thirtytwo_gob },
+            Format { code: Fourcc::Abgr8888, modifier: Modifier::Linear },
+            Format { code: Fourcc::Xbgr8888, modifier: Modifier::Linear },
         ];
-        let default_feedback = DmabufFeedbackBuilder::new(main_dev, formats)
+        if allow_linear {
+            formats.extend(linear_formats.iter().copied());
+        }
+        info!(
+            main_dev = format_args!("0x{:x}", main_dev as u64),
+            formats_len = formats.len(),
+            preferred_len = preferred_formats.len(),
+            allow_linear,
+            "dmabuf: configured feedback formats"
+        );
+        let mut builder = DmabufFeedbackBuilder::new(main_dev, formats);
+        // Debug lever: when linear is enabled, offer a dedicated "linear first" tranche so that
+        // clients which don't gracefully retry other modifiers have a known-good escape hatch.
+        if allow_linear {
+            builder = builder.add_preference_tranche(main_dev, None, linear_formats);
+        }
+        let default_feedback = builder
+            .add_preference_tranche(main_dev, None, preferred_formats)
             .build()
             .context("build dmabuf feedback")?;
         let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<EyeCompositor>(&dh, &default_feedback);
+
+        // Bind an EGLDisplay to the Wayland display so EGL-based clients (notably XWayland/glamor)
+        // can create hardware-accelerated wl_buffers. Without this, XWayland may fail to export
+        // pixmaps to Wayland buffers ("Error getting buffer").
+        let _egl_buffer_reader = {
+            use std::os::unix::fs::MetadataExt;
+            let mut render_node: Option<std::path::PathBuf> = None;
+            if let Ok(p) = std::env::var("METABONK_DRM_RENDER_NODE") {
+                render_node = Some(std::path::PathBuf::from(p));
+            } else if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+                for ent in entries.flatten() {
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with("renderD") {
+                        continue;
+                    }
+                    let Ok(md) = ent.metadata() else { continue };
+                    if md.rdev() as libc::dev_t == main_dev {
+                        render_node = Some(ent.path());
+                        break;
+                    }
+                }
+            }
+            let render_node = render_node.with_context(|| {
+                format!(
+                    "resolve DRM render node path for main_dev=0x{:x} (set METABONK_DRM_RENDER_NODE)",
+                    main_dev as u64
+                )
+            })?;
+
+            // wl_drm is legacy and expects a *primary* node in many stacks. Use the corresponding
+            // /dev/dri/cardX node for EGL_WL_bind_wayland_display so XWayland can authenticate and
+            // export wl_buffers reliably; keep linux-dmabuf feedback tied to the render node.
+            let card_node = if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
+                std::path::PathBuf::from(p)
+            } else {
+                let base = render_node
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "renderD?".into());
+                let sys = std::path::Path::new("/sys/class/drm").join(&base).join("device/drm");
+                let mut found: Option<std::path::PathBuf> = None;
+                if let Ok(entries) = std::fs::read_dir(&sys) {
+                    for ent in entries.flatten() {
+                        let name = ent.file_name().to_string_lossy().to_string();
+                        if name.starts_with("card") {
+                            found = Some(std::path::Path::new("/dev/dri").join(name));
+                            break;
+                        }
+                    }
+                }
+                found.unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/card0"))
+            };
+
+            let drm_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&card_node)
+                .with_context(|| format!("open({card_node:?})"))?;
+            let gbm_dev = gbm::Device::new(drm_file).context("gbm::Device::new")?;
+            let egl = unsafe { EGLDisplay::new(gbm_dev).context("EGLDisplay::new")? };
+            info!(
+                render_node = %render_node.to_string_lossy(),
+                card_node = %card_node.to_string_lossy(),
+                "EGL display ready; binding wl_drm infrastructure for XWayland"
+            );
+            egl.bind_wl_display(&dh).context("EGLDisplay::bind_wl_display")?
+        };
 
         // Advertise a headless wl_output. XWayland (and other clients) expect at least one output
         // to exist before committing buffers in rootless mode.
@@ -901,6 +1045,56 @@ pub fn spawn_wayland_xwayland_thread(
             *g = (output_w, output_h);
         }
 
+        let drm_syncobj_state: Option<DrmSyncobjState> = (|| {
+            use smithay::backend::drm::DrmDeviceFd;
+            use smithay::utils::DeviceFd;
+            use std::os::fd::OwnedFd;
+            use std::os::unix::fs::MetadataExt;
+
+            // Prefer the render node matching linux-dmabuf feedback main device.
+            let mut render_node: Option<std::path::PathBuf> = None;
+            if let Ok(p) = std::env::var("METABONK_DRM_RENDER_NODE") {
+                render_node = Some(std::path::PathBuf::from(p));
+            } else if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+                for ent in entries.flatten() {
+                    let name = ent.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with("renderD") {
+                        continue;
+                    }
+                    let Ok(md) = ent.metadata() else { continue };
+                    if md.rdev() as libc::dev_t == main_dev {
+                        render_node = Some(ent.path());
+                        break;
+                    }
+                }
+            }
+            let render_node = match render_node {
+                Some(p) => p,
+                None => {
+                    warn!("linux-drm-syncobj-v1 disabled: could not resolve render node (set METABONK_DRM_RENDER_NODE)");
+                    return None;
+                }
+            };
+            let drm_file = match std::fs::OpenOptions::new().read(true).write(true).open(&render_node) {
+                Ok(f) => f,
+                Err(err) => {
+                    warn!(?err, render_node = %render_node.to_string_lossy(), "linux-drm-syncobj-v1 disabled: failed to open render node");
+                    return None;
+                }
+            };
+            let owned: OwnedFd = drm_file.into();
+            let dev_fd = DeviceFd::from(owned);
+            let drm_dev = DrmDeviceFd::new(dev_fd);
+            if supports_syncobj_eventfd(&drm_dev) {
+                info!("linux-drm-syncobj-v1 enabled for explicit sync");
+                Some(DrmSyncobjState::new::<EyeCompositor>(&dh, drm_dev))
+            } else {
+                warn!("linux-drm-syncobj-v1 disabled: drmSyncobjEventfd not supported on this device");
+                None
+            }
+        })();
+
         let mut state = EyeCompositor::new(
             &dh,
             output_w as i32,
@@ -910,6 +1104,7 @@ pub fn spawn_wayland_xwayland_thread(
             export_size,
             latest_dmabuf,
             dmabuf_state,
+            drm_syncobj_state,
             dmabuf_global,
         );
 
@@ -946,17 +1141,38 @@ pub fn spawn_wayland_xwayland_thread(
         let xwayland_log_err = xwayland_log
             .try_clone()
             .with_context(|| format!("clone({xwayland_log_path:?})"))?;
-        let (xwayland_source, xwayland_client) = XWayland::spawn(
-            &dh,
-            None,
+        let mut xwayland_env: Vec<(String, String)> = vec![
             // XWayland needs to connect to our per-instance Wayland socket. Since we isolate
             // each compositor by rebinding XDG_RUNTIME_DIR, we must also provide the matching
             // WAYLAND_DISPLAY name explicitly for the XWayland child process.
-            [
-                ("XDG_RUNTIME_DIR".to_string(), run_dir.to_string_lossy().to_string()),
-                ("WAYLAND_DISPLAY".to_string(), socket_name.clone()),
-            ]
-            .into_iter(),
+            ("XDG_RUNTIME_DIR".to_string(), run_dir.to_string_lossy().to_string()),
+            ("WAYLAND_DISPLAY".to_string(), socket_name.clone()),
+        ];
+        let wayland_debug = std::env::var("METABONK_XWAYLAND_WAYLAND_DEBUG")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if wayland_debug {
+            xwayland_env.push(("WAYLAND_DEBUG".to_string(), "client".to_string()));
+        }
+        if std::env::var("METABONK_XWAYLAND_NO_GLAMOR")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+        {
+            xwayland_env.push(("XWAYLAND_NO_GLAMOR".to_string(), "1".to_string()));
+        }
+        if std::env::var("METABONK_XWAYLAND_NO_DRI3")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+        {
+            xwayland_env.push(("XWAYLAND_NO_DRI3".to_string(), "1".to_string()));
+        }
+        let (xwayland_source, xwayland_client) = XWayland::spawn(
+            &dh,
+            None,
+            xwayland_env.into_iter(),
             true,
             Stdio::from(xwayland_log),
             Stdio::from(xwayland_log_err),
@@ -976,6 +1192,9 @@ pub fn spawn_wayland_xwayland_thread(
                     if let Ok(creds) = xwayland_client.get_credentials(&dh_for_creds) {
                         let pid = creds.pid as u32;
                         if pid != 0 {
+                            if let Some(cd) = xwayland_client.get_data::<smithay::xwayland::XWaylandClientData>() {
+                                let _ = cd.user_data().insert_if_missing_threadsafe(|| XWaylandPid(pid));
+                            }
                             state.ensure_agent(pid);
                             state.broadcast_agent_detected(pid);
                         }

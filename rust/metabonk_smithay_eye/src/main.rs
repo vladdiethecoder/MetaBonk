@@ -48,9 +48,27 @@ fn main() -> anyhow::Result<()> {
     )));
     let export_size: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((args.width, args.height)));
 
+    let select = VkSelect {
+        device_index: args.vk_device_index,
+        device_name_contains: args.vk_device_name_contains.clone(),
+    };
+    let mut producer = VulkanProducer::new(args.width, args.height, &args.format, args.slots.max(2), select)?;
+
     // If XWayland is enabled, start a per-instance Wayland socket + XWayland + XWM in a background thread.
     // The thread writes compositor.env only once XWayland is ready (dynamic DISPLAY handshake).
     if args.xwayland {
+        let main_dev: libc::dev_t = if let Ok(node) = std::env::var("METABONK_DRM_RENDER_NODE") {
+            let md = std::fs::metadata(&node).with_context(|| format!("metadata({node})"))?;
+            use std::os::unix::fs::MetadataExt;
+            md.rdev() as libc::dev_t
+        } else if let Some(dev_id) = producer.drm_main_device_dev_id() {
+            dev_id
+        } else {
+            anyhow::bail!(
+                "unable to resolve DRM device id for linux-dmabuf feedback (set METABONK_DRM_RENDER_NODE explicitly)"
+            );
+        };
+
         // When running as a compositor, keep the Wayland socket isolated per instance by rebinding
         // XDG_RUNTIME_DIR to the instance run_dir for this process. Do this *after* resolving the
         // frame socket path so we don't accidentally nest run_dir paths.
@@ -65,6 +83,7 @@ fn main() -> anyhow::Result<()> {
             sock_path.clone(),
             args.width,
             args.height,
+            main_dev,
             export_period.clone(),
             export_size.clone(),
             latest_dmabuf.clone(),
@@ -74,12 +93,6 @@ fn main() -> anyhow::Result<()> {
         write_env_file(&run_dir, &args, &sock_path)?;
     }
     info!("frame socket: {sock_path}");
-
-    let select = VkSelect {
-        device_index: args.vk_device_index,
-        device_name_contains: args.vk_device_name_contains.clone(),
-    };
-    let mut producer = VulkanProducer::new(args.width, args.height, &args.format, args.slots.max(2), select)?;
 
     let mut phase: u8 = 0;
     let mut saw_xwayland_dmabuf = false;

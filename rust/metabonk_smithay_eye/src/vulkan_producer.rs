@@ -45,13 +45,32 @@ pub struct VulkanProducer {
 }
 
 #[derive(Clone, Debug)]
+enum SrcKind {
+    Image {
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        layout: vk::ImageLayout,
+    },
+    Buffer {
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+        row_pitch: u64,
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct SrcCache {
     key: u64,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
     width: u32,
     height: u32,
-    layout: vk::ImageLayout,
+    kind: SrcKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ImportedResource {
+    Image(vk::Image, vk::DeviceMemory),
+    Buffer(vk::Buffer, vk::DeviceMemory),
 }
 
 struct Slot {
@@ -66,7 +85,7 @@ struct Slot {
     prev_acquire: Option<vk::Semaphore>,
     prev_release: Option<vk::Semaphore>,
     to_destroy: Vec<(vk::Semaphore, vk::Semaphore)>,
-    to_destroy_imported: Vec<(vk::Image, vk::DeviceMemory)>,
+    to_destroy_imported: Vec<ImportedResource>,
 }
 
 impl VulkanProducer {
@@ -119,6 +138,16 @@ impl VulkanProducer {
         };
         producer.init_slots(slots)?;
         Ok(producer)
+    }
+
+    pub fn drm_main_device_dev_id(&self) -> Option<libc::dev_t> {
+        let node = self
+            .physical
+            .render_node()
+            .ok()
+            .flatten()
+            .or_else(|| self.physical.primary_node().ok().flatten())?;
+        Some(node.dev_id() as libc::dev_t)
     }
 
     fn init_slots(&mut self, count: usize) -> anyhow::Result<()> {
@@ -243,10 +272,18 @@ impl VulkanProducer {
                     self.device.destroy_semaphore(r, None);
                 }
             }
-            for (img, mem) in slot.to_destroy_imported.drain(..) {
+            for res in slot.to_destroy_imported.drain(..) {
                 unsafe {
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
+                    match res {
+                        ImportedResource::Image(img, mem) => {
+                            self.device.destroy_image(img, None);
+                            self.device.free_memory(mem, None);
+                        }
+                        ImportedResource::Buffer(buf, mem) => {
+                            self.device.destroy_buffer(buf, None);
+                            self.device.free_memory(mem, None);
+                        }
+                    }
                 }
             }
         }
@@ -393,10 +430,18 @@ impl VulkanProducer {
                     self.device.destroy_semaphore(r, None);
                 }
             }
-            for (img, mem) in slot.to_destroy_imported.drain(..) {
+            for res in slot.to_destroy_imported.drain(..) {
                 unsafe {
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
+                    match res {
+                        ImportedResource::Image(img, mem) => {
+                            self.device.destroy_image(img, None);
+                            self.device.free_memory(mem, None);
+                        }
+                        ImportedResource::Buffer(buf, mem) => {
+                            self.device.destroy_buffer(buf, None);
+                            self.device.free_memory(mem, None);
+                        }
+                    }
                 }
             }
         }
@@ -410,43 +455,78 @@ impl VulkanProducer {
         // is reusing a small set of DMA-BUFs (triple buffering), importing every tick can exhaust
         // driver resources and lead to ERROR_OUT_OF_DEVICE_MEMORY. Reuse the last import until the
         // DMA-BUF identity changes.
+        let modifier_u64: u64 = src.format().modifier.into();
+        let use_buffer_import = modifier_u64 == 0;
         let src_key = dmabuf_key(src);
         let mut src_layout = vk::ImageLayout::UNDEFINED;
         let mut imported_new = false;
-        let (src_image, src_mem, src_w, src_h) = if let Some(c) = self.last_src.as_ref() {
+        let (src_kind, src_w, src_h) = if let Some(c) = self.last_src.as_ref() {
             if c.key == src_key {
-                src_layout = c.layout;
-                (c.image, c.memory, c.width, c.height)
+                if let SrcKind::Image { layout, .. } = c.kind {
+                    src_layout = layout;
+                }
+                (c.kind.clone(), c.width, c.height)
             } else {
                 // Defer destruction of the previous import until the destination fence signals.
                 if let Some(old) = self.last_src.take() {
                     let slot = &mut self.slots[slot_idx];
-                    slot.to_destroy_imported.push((old.image, old.memory));
+                    match old.kind {
+                        SrcKind::Image { image, memory, .. } => {
+                            slot.to_destroy_imported.push(ImportedResource::Image(image, memory));
+                        }
+                        SrcKind::Buffer { buffer, memory, .. } => {
+                            slot.to_destroy_imported.push(ImportedResource::Buffer(buffer, memory));
+                        }
+                    }
                 }
-                let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+                let (kind, w, h) = if use_buffer_import {
+                    match self.import_dmabuf_buffer(src) {
+                        Ok((buf, mem, w, h, row_pitch, offset)) => {
+                            (SrcKind::Buffer { buffer: buf, memory: mem, row_pitch, offset }, w, h)
+                        }
+                        Err(e) => {
+                            warn!("linear dmabuf buffer import failed; falling back to image import: {e}");
+                            let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+                            (SrcKind::Image { image: img, memory: mem, layout: vk::ImageLayout::UNDEFINED }, w, h)
+                        }
+                    }
+                } else {
+                    let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+                    (SrcKind::Image { image: img, memory: mem, layout: vk::ImageLayout::UNDEFINED }, w, h)
+                };
                 imported_new = true;
                 self.last_src = Some(SrcCache {
                     key: src_key,
-                    image: img,
-                    memory: mem,
                     width: w,
                     height: h,
-                    layout: vk::ImageLayout::UNDEFINED,
+                    kind: kind.clone(),
                 });
-                (img, mem, w, h)
+                (kind, w, h)
             }
         } else {
-            let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+            let (kind, w, h) = if use_buffer_import {
+                match self.import_dmabuf_buffer(src) {
+                    Ok((buf, mem, w, h, row_pitch, offset)) => {
+                        (SrcKind::Buffer { buffer: buf, memory: mem, row_pitch, offset }, w, h)
+                    }
+                    Err(e) => {
+                        warn!("linear dmabuf buffer import failed; falling back to image import: {e}");
+                        let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+                        (SrcKind::Image { image: img, memory: mem, layout: vk::ImageLayout::UNDEFINED }, w, h)
+                    }
+                }
+            } else {
+                let (img, mem, w, h) = self.import_dmabuf_image(src)?;
+                (SrcKind::Image { image: img, memory: mem, layout: vk::ImageLayout::UNDEFINED }, w, h)
+            };
             imported_new = true;
             self.last_src = Some(SrcCache {
                 key: src_key,
-                image: img,
-                memory: mem,
                 width: w,
                 height: h,
-                layout: vk::ImageLayout::UNDEFINED,
+                kind: kind.clone(),
             });
-            (img, mem, w, h)
+            (kind, w, h)
         };
 
         let (dst_image, cmd, fence, prev_acquire, prev_release, modifier, stride, offset, mem_size, memory) = {
@@ -471,8 +551,16 @@ impl VulkanProducer {
             if imported_new {
                 // Not used by any GPU submission yet; safe to destroy immediately.
                 unsafe {
-                    self.device.destroy_image(src_image, None);
-                    self.device.free_memory(src_mem, None);
+                    match src_kind {
+                        SrcKind::Image { image, memory, .. } => {
+                            self.device.destroy_image(image, None);
+                            self.device.free_memory(memory, None);
+                        }
+                        SrcKind::Buffer { buffer, memory, .. } => {
+                            self.device.destroy_buffer(buffer, None);
+                            self.device.free_memory(memory, None);
+                        }
+                    }
                 }
                 self.last_src = None;
             }
@@ -494,85 +582,152 @@ impl VulkanProducer {
                 .level_count(1)
                 .layer_count(1);
 
-            let src_to_src = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .old_layout(src_layout)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(src_image)
-                .subresource_range(range);
+            match src_kind {
+                SrcKind::Image { image: src_image, .. } => {
+                    let src_to_src = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .old_layout(src_layout)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .image(src_image)
+                        .subresource_range(range);
 
-            let dst_to_dst = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::MEMORY_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .image(dst_image)
-                .subresource_range(range);
+                    let dst_to_dst = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(dst_image)
+                        .subresource_range(range);
 
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_to_src, dst_to_dst],
-            );
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[src_to_src, dst_to_dst],
+                    );
 
-            let sub = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1);
-            let region = vk::ImageCopy::default()
-                .src_subresource(sub)
-                .dst_subresource(sub)
-                .extent(vk::Extent3D {
-                    width: self.width,
-                    height: self.height,
-                    depth: 1,
-                });
-            self.device.cmd_copy_image(
-                cmd,
-                src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
+                    let sub = vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1);
+                    let region = vk::ImageCopy::default()
+                        .src_subresource(sub)
+                        .dst_subresource(sub)
+                        .extent(vk::Extent3D {
+                            width: self.width,
+                            height: self.height,
+                            depth: 1,
+                        });
+                    self.device.cmd_copy_image(
+                        cmd,
+                        src_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        dst_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
 
-            let dst_to_general = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(dst_image)
-                .subresource_range(range);
+                    let dst_to_general = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(dst_image)
+                        .subresource_range(range);
 
-            let src_back = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(src_image)
-                .subresource_range(range);
+                    let src_back = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .dst_access_mask(vk::AccessFlags::empty())
+                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(src_image)
+                        .subresource_range(range);
 
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_back, dst_to_general],
-            );
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[src_back, dst_to_general],
+                    );
+                }
+                SrcKind::Buffer { buffer, row_pitch, offset, .. } => {
+                    let dst_to_dst = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .image(dst_image)
+                        .subresource_range(range);
+
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[dst_to_dst],
+                    );
+
+                    let sub = vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1);
+                    let row_length = (row_pitch / 4).max(self.width as u64) as u32;
+                    let region = vk::BufferImageCopy::default()
+                        .buffer_offset(offset)
+                        .buffer_row_length(row_length)
+                        .buffer_image_height(self.height)
+                        .image_subresource(sub)
+                        .image_extent(vk::Extent3D {
+                            width: self.width,
+                            height: self.height,
+                            depth: 1,
+                        });
+                    self.device.cmd_copy_buffer_to_image(
+                        cmd,
+                        buffer,
+                        dst_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[region],
+                    );
+
+                    let dst_to_general = vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(dst_image)
+                        .subresource_range(range);
+
+                    self.device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[dst_to_general],
+                    );
+                }
+            }
 
             self.device.end_command_buffer(cmd)?;
         }
         if let Some(c) = self.last_src.as_mut() {
             if c.key == src_key {
-                c.layout = vk::ImageLayout::GENERAL;
+                if let SrcKind::Image { layout, .. } = &mut c.kind {
+                    *layout = vk::ImageLayout::GENERAL;
+                }
             }
         }
 
@@ -648,10 +803,18 @@ impl VulkanProducer {
                     self.device.destroy_semaphore(r, None);
                 }
             }
-            for (img, mem) in slot.to_destroy_imported.drain(..) {
+            for res in slot.to_destroy_imported.drain(..) {
                 unsafe {
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
+                    match res {
+                        ImportedResource::Image(img, mem) => {
+                            self.device.destroy_image(img, None);
+                            self.device.free_memory(mem, None);
+                        }
+                        ImportedResource::Buffer(buf, mem) => {
+                            self.device.destroy_buffer(buf, None);
+                            self.device.free_memory(mem, None);
+                        }
+                    }
                 }
             }
         }
@@ -881,6 +1044,156 @@ impl VulkanProducer {
         Ok((image, memory, width, height))
     }
 
+    fn import_dmabuf_buffer(
+        &self,
+        src: &Dmabuf,
+    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory, u32, u32, u64, u64)> {
+        if src.num_planes() != 1 {
+            anyhow::bail!("only single-plane dmabufs are supported (got {} planes)", src.num_planes());
+        }
+
+        let fmt = src.format().code;
+        match fmt {
+            ShmFourcc::Argb8888 | ShmFourcc::Xrgb8888 => {}
+            other => anyhow::bail!("unsupported source dmabuf format {other:?} (supported: ARGB8888/XRGB8888)"),
+        };
+
+        let size = src.size();
+        let width = size.w as u32;
+        let height = size.h as u32;
+        let offset = src.offsets().next().unwrap_or(0) as u64;
+        let stride = src.strides().next().unwrap_or(0) as u64;
+        let row_pitch = if stride == 0 {
+            (width as u64) * 4
+        } else {
+            stride
+        };
+        let size_bytes = offset + row_pitch.saturating_mul(height as u64);
+
+        let src_fd = src.handles().next().unwrap();
+        let fd0 = unsafe { libc::dup(src_fd.as_raw_fd()) };
+        if fd0 < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup dmabuf fd");
+        }
+
+        let try_import = |handle_type: vk::ExternalMemoryHandleTypeFlags, fd: i32| -> anyhow::Result<(vk::Buffer, vk::DeviceMemory)> {
+            let mut external =
+                vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+            let mut buf_info = vk::BufferCreateInfo::default()
+                .size(size_bytes)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            buf_info = buf_info.push_next(&mut external);
+
+            let buffer = unsafe { self.device.create_buffer(&buf_info, None) }.context("create imported buffer")?;
+
+            let mut dedicated_req = vk::MemoryDedicatedRequirements::default();
+            let mut mem_req2 = vk::MemoryRequirements2::default().push_next(&mut dedicated_req);
+            let req_info2 = vk::BufferMemoryRequirementsInfo2::default().buffer(buffer);
+            unsafe { self.device.get_buffer_memory_requirements2(&req_info2, &mut mem_req2) };
+            let mem_req = mem_req2.memory_requirements;
+
+            let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+            if let Err(e) = unsafe { self.khr_mem_fd.get_memory_fd_properties(handle_type, fd, &mut fd_props) } {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                let _ = unsafe { libc::close(fd) };
+                return Err(anyhow::anyhow!(e)).context("vkGetMemoryFdPropertiesKHR(buffer)");
+            }
+            let allowed_type_bits = mem_req.memory_type_bits & fd_props.memory_type_bits;
+            if allowed_type_bits == 0 {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                let _ = unsafe { libc::close(fd) };
+                anyhow::bail!(
+                    "no compatible Vulkan memory types for imported fd (buffer handle={handle_type:?} mem_req_bits=0x{:x} fd_bits=0x{:x})",
+                    mem_req.memory_type_bits,
+                    fd_props.memory_type_bits
+                );
+            }
+
+            let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(handle_type)
+                .fd(fd);
+            let mut dedicated_alloc = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+
+            let mut candidates: Vec<(u32, bool, u64)> = Vec::new();
+            {
+                let props = unsafe { self.instance.handle().get_physical_device_memory_properties(self.physical.handle()) };
+                for i in 0..props.memory_type_count {
+                    if (allowed_type_bits & (1 << i)) == 0 {
+                        continue;
+                    }
+                    let mt = props.memory_types[i as usize];
+                    let flags = mt.property_flags;
+                    let is_device_local = flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+                    let heap_idx = mt.heap_index as usize;
+                    let heap_size = props.memory_heaps.get(heap_idx).map(|h| h.size).unwrap_or(0);
+                    candidates.push((i, is_device_local, heap_size));
+                }
+            }
+            candidates.sort_by(|a, b| {
+                b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0))
+            });
+
+            let best = describe_memory_type_bits(self.instance.handle(), self.physical.handle(), allowed_type_bits);
+            let mut last_err: Option<vk::Result> = None;
+            let mut memory: Option<vk::DeviceMemory> = None;
+            for (mem_type_idx, _dev, _heap) in candidates {
+                let mut alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(mem_req.size)
+                    .memory_type_index(mem_type_idx);
+                if dedicated_req.requires_dedicated_allocation == vk::TRUE || dedicated_req.prefers_dedicated_allocation == vk::TRUE {
+                    alloc = alloc.push_next(&mut dedicated_alloc);
+                }
+                let alloc = alloc.push_next(&mut import_info);
+                match unsafe { self.device.allocate_memory(&alloc, None) } {
+                    Ok(m) => {
+                        memory = Some(m);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+            }
+            let memory = match memory {
+                Some(m) => m,
+                None => {
+                    unsafe { self.device.destroy_buffer(buffer, None) };
+                    let _ = unsafe { libc::close(fd) };
+                    anyhow::bail!(
+                        "allocate imported buffer memory failed: {:?} (handle={handle_type:?} src={}x{} stride={} offset={} mem_req.size={} allowed_types=0x{:x} {})",
+                        last_err.unwrap_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+                        width,
+                        height,
+                        row_pitch,
+                        offset,
+                        mem_req.size,
+                        allowed_type_bits,
+                        best
+                    );
+                }
+            };
+            unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }.context("bind imported buffer memory")?;
+            Ok((buffer, memory))
+        };
+
+        let (buffer, memory) = match try_import(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, fd0) {
+            Ok(v) => v,
+            Err(e_dmabuf) => {
+                warn!("DMA_BUF_EXT buffer import failed; retrying as OPAQUE_FD: {e_dmabuf}");
+                let fd1 = unsafe { libc::dup(src_fd.as_raw_fd()) };
+                if fd1 < 0 {
+                    return Err(std::io::Error::last_os_error()).context("dup dmabuf fd (retry opaque buffer)");
+                }
+                try_import(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD, fd1)
+                    .with_context(|| format!("OPAQUE_FD buffer import also failed (after DMA_BUF_EXT): {e_dmabuf}"))?
+            }
+        };
+
+        Ok((buffer, memory, width, height, row_pitch, offset))
+    }
+
     pub fn on_consumer_disconnect(&mut self) {
         for slot in &mut self.slots {
             if let (Some(pa), Some(pr)) = (slot.prev_acquire.take(), slot.prev_release.take()) {
@@ -894,8 +1207,16 @@ impl VulkanProducer {
     pub fn drop_cached_source(&mut self) {
         if let Some(c) = self.last_src.take() {
             unsafe {
-                self.device.destroy_image(c.image, None);
-                self.device.free_memory(c.memory, None);
+                match c.kind {
+                    SrcKind::Image { image, memory, .. } => {
+                        self.device.destroy_image(image, None);
+                        self.device.free_memory(memory, None);
+                    }
+                    SrcKind::Buffer { buffer, memory, .. } => {
+                        self.device.destroy_buffer(buffer, None);
+                        self.device.free_memory(memory, None);
+                    }
+                }
             }
         }
     }
@@ -937,13 +1258,29 @@ impl Drop for VulkanProducer {
     fn drop(&mut self) {
         unsafe {
             if let Some(c) = self.last_src.take() {
-                self.device.destroy_image(c.image, None);
-                self.device.free_memory(c.memory, None);
+                match c.kind {
+                    SrcKind::Image { image, memory, .. } => {
+                        self.device.destroy_image(image, None);
+                        self.device.free_memory(memory, None);
+                    }
+                    SrcKind::Buffer { buffer, memory, .. } => {
+                        self.device.destroy_buffer(buffer, None);
+                        self.device.free_memory(memory, None);
+                    }
+                }
             }
             for slot in self.slots.drain(..) {
-                for (img, mem) in slot.to_destroy_imported {
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
+                for res in slot.to_destroy_imported {
+                    match res {
+                        ImportedResource::Image(img, mem) => {
+                            self.device.destroy_image(img, None);
+                            self.device.free_memory(mem, None);
+                        }
+                        ImportedResource::Buffer(buf, mem) => {
+                            self.device.destroy_buffer(buf, None);
+                            self.device.free_memory(mem, None);
+                        }
+                    }
                 }
                 for (a, r) in slot.to_destroy {
                     self.device.destroy_semaphore(a, None);
