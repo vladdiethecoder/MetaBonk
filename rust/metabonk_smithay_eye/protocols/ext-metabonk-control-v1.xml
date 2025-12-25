@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="ext_metabonk_control_v1">
+  <interface name="zmetabonk_orchestrator_v1" version="1">
+    <description summary="Global manager for AI agent resource tiers"/>
+
+    <request name="get_agent_handle">
+      <description summary="Get a handle for a specific agent process"/>
+      <arg name="id" type="new_id" interface="zmetabonk_agent_v1"/>
+      <arg name="pid" type="uint" summary="System PID of the agent"/>
+    </request>
+
+    <event name="agent_detected">
+      <description summary="Notify platform when a new PID connects"/>
+      <arg name="pid" type="uint"/>
+      <arg name="app_id" type="string"/>
+    </event>
+  </interface>
+
+  <interface name="zmetabonk_agent_v1" version="1">
+    <description summary="Control interface for a specific agent"/>
+
+    <enum name="tier">
+      <entry name="featured" value="0" summary="1080p+, 60Hz, Zero-Copy Export"/>
+      <entry name="observation" value="1" summary="720p, 30Hz"/>
+      <entry name="background" value="2" summary="360p, 5Hz"/>
+      <entry name="suspended" value="3" summary="No rendering, keep-alive only"/>
+    </enum>
+
+    <request name="set_tier">
+      <description summary="Set the resource tier for this agent"/>
+      <arg name="tier" type="uint" enum="tier"/>
+    </request>
+
+    <request name="force_geometry">
+      <description summary="Override client-side resolution negotiation"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </request>
+
+    <event name="telemetry">
+      <arg name="fps" type="uint"/>
+      <arg name="gpu_time_us" type="uint"/>
+    </event>
+  </interface>
+</protocol>

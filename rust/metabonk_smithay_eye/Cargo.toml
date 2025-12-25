@@ -1,0 +1,23 @@
+[package]
+name = "metabonk_smithay_eye"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+metabonk_frame_abi = { path = "../metabonk_frame_abi" }
+ash = "0.38"
+clap = { version = "4", features = ["derive"] }
+drm-fourcc = "2"
+libc = "0.2"
+nix = { version = "0.29", features = ["socket", "uio"] }
+smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_vulkan", "wayland_frontend", "xwayland"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-client = "0.31"
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+x11rb = "0.13"
