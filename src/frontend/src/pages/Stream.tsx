@@ -239,7 +239,7 @@ function SafeGuides() {
         <span>0</span>
         <span>{UI_TOKENS.resolution.h}</span>
       </div>
-    </RouteScope>
+    </div>
   );
 }
 
@@ -499,11 +499,13 @@ function AttractOverlay({
   hof,
   shame,
   clips,
+  fxOn,
   variant = "stage",
 }: {
   hof: HofEntry[];
   shame: Array<{ instance_id: string; duration_s: number; score: number; ts: number }>;
   clips: AttractHighlights | null;
+  fxOn?: boolean;
   variant?: "stage" | "fullscreen";
 }) {
   const fameClip = clips?.fame?.clip_url ? `/api${clips.fame.clip_url}` : null;
@@ -511,8 +513,12 @@ function AttractOverlay({
   return (
     <div className={`attract-root ${variant === "fullscreen" ? "attract-root-fullscreen" : ""}`}>
       <div className="attract-ui">
-        <div className="attract-crt" />
-        <div className="attract-scanlines" />
+        {fxOn ? (
+          <>
+            <div className="attract-crt" />
+            <div className="attract-scanlines" />
+          </>
+        ) : null}
         <div className="attract-title">METABONK</div>
         <div className="attract-sub">ARCADE ATTRACT MODE</div>
         <div className="insert-coin">INSERT COIN</div>
@@ -583,6 +589,7 @@ function StreamTile({
   onClick,
   impact,
   focused,
+  fxOn,
   rankUp,
   scoreDelta30s,
   stepRate,
@@ -595,6 +602,7 @@ function StreamTile({
   onClick?: () => void;
   impact?: boolean;
   focused?: boolean;
+  fxOn?: boolean;
   rankUp?: number | null;
   scoreDelta30s?: number | null;
   stepRate?: number | null;
@@ -699,46 +707,53 @@ function StreamTile({
       style={{ cursor: onClick ? "pointer" : "default" }}
       onClick={onClick}
     >
-      <div className={`stream-tile-feed holo-feed ${glitch ? "holo-glitch" : ""}`} style={{ ["--surprise" as any]: surprise }}>
+      <div
+        className={`stream-tile-feed ${fxOn ? `holo-feed ${glitch ? "holo-glitch" : ""}` : ""}`}
+        style={fxOn ? ({ ["--surprise" as any]: surprise } as any) : undefined}
+      >
         {cornerTag ? <div className="stream-tile-role">{cornerTag}</div> : null}
         {rankUp && rankUp > 0 ? (
           <div className="stream-rank-burst" aria-label={`rank up ${rankUp}`}>
             ▲ +{rankUp}
           </div>
         ) : null}
-        {focused ? (
+        {fxOn && focused ? (
           <div className="holo-r3f">
             <HoloStreamCanvas videoEl={videoEl} fallbackUrl={frameUrl || undefined} surprise={surprise} glitch={glitch} />
           </div>
         ) : null}
-        <div className="holo-frame" />
-        <div className="holo-ghost" />
-        <div className="holo-fovea" />
-        <div className="holo-scan" />
-        <div className="holo-boxes" aria-hidden="true">
-          {overlayBoxes.map((b, i) => (
-            <div
-              key={`box-${i}`}
-              className="holo-box"
-              style={{ left: `${b.xPct}%`, top: `${b.yPct}%`, width: `${b.wPct}%`, height: `${b.hPct}%` }}
-            />
-          ))}
-        </div>
+        {fxOn ? (
+          <>
+            <div className="holo-frame" />
+            <div className="holo-ghost" />
+            <div className="holo-fovea" />
+            <div className="holo-scan" />
+            <div className="holo-boxes" aria-hidden="true">
+              {overlayBoxes.map((b, i) => (
+                <div
+                  key={`box-${i}`}
+                  className="holo-box"
+                  style={{ left: `${b.xPct}%`, top: `${b.yPct}%`, width: `${b.wPct}%`, height: `${b.hPct}%` }}
+                />
+              ))}
+            </div>
+          </>
+        ) : null}
         {useGo2rtc ? (
           <Go2rtcWebRTC
             baseUrl={go2rtcBase}
             streamName={go2rtcName}
-            className={`stream-img ${focused ? "holo-fallback" : ""}`}
-            onVideoReady={focused ? setVideoEl : undefined}
+            className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
+            onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debugHud={DEBUG_HUD}
           />
         ) : streamUrl && isVideo ? (
           <MseMp4Video
-            className={`stream-img ${focused ? "holo-fallback" : ""}`}
+            className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             url={streamUrl}
             fallbackUrl={frameUrl || undefined}
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
-            onVideoReady={focused ? setVideoEl : undefined}
+            onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debug={DEBUG_ON}
             debugHud={DEBUG_HUD}
           />
@@ -1221,6 +1236,7 @@ export default function Stream() {
   const [layoutMode, setLayoutMode] = useState<"broadcast" | "dense">("broadcast");
   const qs = useMemo(() => new URLSearchParams(loc.search), [loc.search]);
   const debugParamOn = useMemo(() => qs.get("debug") === "1", [qs]);
+  const fxOn = useMemo(() => qs.get("fx") === "1", [qs]);
   const safeOn = useMemo(() => {
     const safe = qs.get("safe") === "1";
     if (!safe) return false;
@@ -1953,12 +1969,14 @@ export default function Stream() {
           } as any
         }
       >
-      <div className="hud-fx">
-        <div className="hud-chroma" />
-        <div className="hud-vignette" />
-        <div className="hud-noise" />
-        <div className="hud-scanlines" />
-      </div>
+      {fxOn ? (
+        <div className="hud-fx">
+          <div className="hud-chroma" />
+          <div className="hud-vignette" />
+          <div className="hud-noise" />
+          <div className="hud-scanlines" />
+        </div>
+      ) : null}
       <div ref={canvasRef} className="hud-canvas">
         <div ref={stageRef} className={`hud-stage ${overrunAny || shakeOn ? "juice-shake" : ""} ${overrunAny ? "stream-root-overrun" : ""}`}>
           {safeOn ? <SafeGuides /> : null}
@@ -2078,7 +2096,7 @@ export default function Stream() {
                     {attractMode ? (
                       <div className="run-stage run-stage-idle">
                         <IdleStreamTile slotLabel="LIVE" className="run-stage-focus stream-tile-focused">
-                          <AttractOverlay hof={(hofQ.data as any) ?? []} shame={shameList} clips={(attractQ.data as any) ?? null} />
+                          <AttractOverlay hof={(hofQ.data as any) ?? []} shame={shameList} clips={(attractQ.data as any) ?? null} fxOn={fxOn} />
                         </IdleStreamTile>
                         <div className="run-stage-mosaic" aria-label="run mosaic">
                           <IdleStreamTile slotLabel="HOT" cornerTag="HOT" className="run-stage-mosaic-tile" />
@@ -2096,6 +2114,7 @@ export default function Stream() {
                           onClick={() => setFocusId(focus?.instance_id ?? null)}
                           impact={Boolean(focus?.instance_id && impactMap[String(focus.instance_id)] > nowMs)}
                           focused
+                          fxOn={fxOn}
                           rankUp={rankUpFor(focus?.instance_id)}
                           scoreDelta30s={focus?.instance_id ? scoreDelta30sById[String(focus.instance_id)] : null}
                           stepRate={focus?.instance_id ? stepRateById[String(focus.instance_id)] : null}
@@ -2114,6 +2133,7 @@ export default function Stream() {
                                 onClick={() => setFocusId(s.hb.instance_id ?? null)}
                                 impact={Boolean(iid && impactMap[iid] > nowMs)}
                                 focused={String(iid) === String(focus?.instance_id)}
+                                fxOn={fxOn}
                                 rankUp={rankUpFor(iid)}
                                 scoreDelta30s={scoreDelta30sById[iid]}
                                 stepRate={stepRateById[iid]}
@@ -2585,5 +2605,6 @@ export default function Stream() {
         </div>
       </div>
     </div>
+  </RouteScope>
   );
 }
