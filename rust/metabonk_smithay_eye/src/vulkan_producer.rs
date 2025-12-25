@@ -42,6 +42,7 @@ pub struct VulkanProducer {
     drm_fourcc: u32,
     vk_format: vk::Format,
     last_src: Option<SrcCache>,
+    force_linear_export: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,10 @@ struct Slot {
     stride: u32,
     offset: u32,
     mem_size: u64,
+    linear_buffer: Option<vk::Buffer>,
+    linear_memory: Option<vk::DeviceMemory>,
+    linear_size: u64,
+    linear_stride: u32,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     prev_acquire: Option<vk::Semaphore>,
@@ -118,6 +123,14 @@ impl VulkanProducer {
             other => anyhow::bail!("unsupported --format {other} (supported: ARGB8888)"),
         };
 
+        let force_linear_export = std::env::var("METABONK_FORCE_LINEAR_EXPORT")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        if force_linear_export {
+            info!("linear export enabled: copying frames into a linear staging buffer");
+        }
+
         let mut producer = Self {
             instance,
             physical,
@@ -135,6 +148,7 @@ impl VulkanProducer {
             drm_fourcc,
             vk_format,
             last_src: None,
+            force_linear_export,
         };
         producer.init_slots(slots)?;
         Ok(producer)
@@ -164,13 +178,20 @@ impl VulkanProducer {
         for idx in 0..count {
             let (image, memory, modifier, stride, offset, mem_size) =
                 self.create_exportable_image(self.width, self.height, self.vk_format)?;
+            let (linear_buffer, linear_memory, linear_size, linear_stride) = if self.force_linear_export {
+                let size = (self.width as u64) * (self.height as u64) * 4;
+                let (buf, mem, alloc_size) = self.create_exportable_linear_buffer(size)?;
+                (Some(buf), Some(mem), alloc_size, (self.width * 4))
+            } else {
+                (None, None, 0, 0)
+            };
             let fence = unsafe {
                 self.device.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                     None,
                 )
             }
-                .context("create fence")?;
+            .context("create fence")?;
             self.slots.push(Slot {
                 image,
                 memory,
@@ -178,6 +199,10 @@ impl VulkanProducer {
                 stride,
                 offset,
                 mem_size,
+                linear_buffer,
+                linear_memory,
+                linear_size,
+                linear_stride,
                 cmd: cmds[idx],
                 fence,
                 prev_acquire: None,
@@ -257,6 +282,32 @@ impl VulkanProducer {
         Ok((image, memory, modifier, stride, offset, mem_size))
     }
 
+    fn create_exportable_linear_buffer(
+        &self,
+        size: u64,
+    ) -> anyhow::Result<(vk::Buffer, vk::DeviceMemory, u64)> {
+        let mut external =
+            vk::ExternalMemoryBufferCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        let buffer = unsafe { self.device.create_buffer(&buffer_info, None) }.context("create_buffer")?;
+
+        let mem_req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let mut export_info =
+            vk::ExportMemoryAllocateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(find_memory_type(self.instance.handle(), self.physical.handle(), mem_req, true)?)
+            .push_next(&mut export_info);
+        let memory = unsafe { self.device.allocate_memory(&alloc, None) }.context("allocate_memory(buffer)")?;
+        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }.context("bind_buffer_memory")?;
+
+        Ok((buffer, memory, mem_req.size))
+    }
+
     pub fn render_next(&mut self, clear_phase: u8) -> anyhow::Result<RenderedFrame> {
         let slot_idx = self.next_slot % self.slots.len();
         self.next_slot = (self.next_slot + 1) % self.slots.len();
@@ -292,7 +343,22 @@ impl VulkanProducer {
         let (release, release_fd) = self.create_exportable_semaphore()?;
 
         // Record: clear image to a varying color (keeps MVP visually obvious for debugging).
-        let (image, cmd, fence, prev_acquire, prev_release, modifier, stride, offset, mem_size, memory) = {
+        let (
+            image,
+            cmd,
+            fence,
+            prev_acquire,
+            prev_release,
+            modifier,
+            stride,
+            offset,
+            mem_size,
+            memory,
+            linear_buffer,
+            linear_memory,
+            linear_size,
+            linear_stride,
+        ) = {
             let slot = &mut self.slots[slot_idx];
             (
                 slot.image,
@@ -305,8 +371,13 @@ impl VulkanProducer {
                 slot.offset,
                 slot.mem_size,
                 slot.memory,
+                slot.linear_buffer,
+                slot.linear_memory,
+                slot.linear_size,
+                slot.linear_stride,
             )
         };
+        let use_linear_export = self.force_linear_export && linear_buffer.is_some() && linear_memory.is_some();
 
         unsafe { self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.ok();
         unsafe {
@@ -334,22 +405,82 @@ impl VulkanProducer {
             let c = clear_color(clear_phase);
             self.device
                 .cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &c, &[range]);
-            let to_general = vk::ImageMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(image)
-                .subresource_range(range);
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_general],
-            );
+            if use_linear_export {
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(image)
+                    .subresource_range(range);
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1))
+                    .image_extent(vk::Extent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    });
+                if let Some(buf) = linear_buffer {
+                    self.device.cmd_copy_image_to_buffer(
+                        cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buf,
+                        &[region],
+                    );
+                }
+
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(image)
+                    .subresource_range(range);
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            } else {
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(image)
+                    .subresource_range(range);
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
             self.device.end_command_buffer(cmd)?;
         }
 
@@ -370,8 +501,19 @@ impl VulkanProducer {
 
         unsafe { self.device.queue_submit(self.queue, &[submit], fence) }.context("queue_submit")?;
 
-        // Export DMABuf FD for the memory backing this image.
-        let dmabuf_fd = self.export_memory_dmabuf_fd(memory)?;
+        // Export DMABuf FD for the memory backing the exported surface.
+        let (out_memory, out_modifier, out_stride, out_offset, out_size) = if use_linear_export {
+            (
+                linear_memory.expect("linear export memory missing"),
+                u64::from(DrmModifier::Linear),
+                linear_stride,
+                0,
+                linear_size,
+            )
+        } else {
+            (memory, modifier, stride, offset, mem_size)
+        };
+        let dmabuf_fd = self.export_memory_dmabuf_fd(out_memory)?;
 
         debug!(
             "export frame: modifier=0x{:016x} fourcc=0x{:08x} stride={} offset={} size_bytes={}",
@@ -406,10 +548,10 @@ impl VulkanProducer {
             width: self.width,
             height: self.height,
             drm_fourcc: self.drm_fourcc,
-            modifier,
-            stride,
-            offset,
-            size_bytes: mem_size as u32,
+            modifier: out_modifier,
+            stride: out_stride,
+            offset: out_offset,
+            size_bytes: out_size as u32,
             dmabuf_fd,
             acquire_fence_fd: acquire_fd,
             release_fence_fd: release_fd,
@@ -529,7 +671,22 @@ impl VulkanProducer {
             (kind, w, h)
         };
 
-        let (dst_image, cmd, fence, prev_acquire, prev_release, modifier, stride, offset, mem_size, memory) = {
+        let (
+            dst_image,
+            cmd,
+            fence,
+            prev_acquire,
+            prev_release,
+            modifier,
+            stride,
+            offset,
+            mem_size,
+            memory,
+            linear_buffer,
+            linear_memory,
+            linear_size,
+            linear_stride,
+        ) = {
             let slot = &mut self.slots[slot_idx];
             (
                 slot.image,
@@ -542,8 +699,13 @@ impl VulkanProducer {
                 slot.offset,
                 slot.mem_size,
                 slot.memory,
+                slot.linear_buffer,
+                slot.linear_memory,
+                slot.linear_size,
+                slot.linear_stride,
             )
         };
+        let use_linear_export = self.force_linear_export && linear_buffer.is_some() && linear_memory.is_some();
 
         if src_w != self.width || src_h != self.height {
             // For now, require a matching input size. (This avoids an extra blit path and keeps the ABI stable.)
@@ -721,6 +883,68 @@ impl VulkanProducer {
                 }
             }
 
+            if use_linear_export {
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(dst_image)
+                    .subresource_range(range);
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    });
+                if let Some(buf) = linear_buffer {
+                    self.device.cmd_copy_image_to_buffer(
+                        cmd,
+                        dst_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buf,
+                        &[region],
+                    );
+                }
+
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(dst_image)
+                    .subresource_range(range);
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
+
             self.device.end_command_buffer(cmd)?;
         }
         if let Some(c) = self.last_src.as_mut() {
@@ -748,8 +972,19 @@ impl VulkanProducer {
 
         unsafe { self.device.queue_submit(self.queue, &[submit], fence) }.context("queue_submit")?;
 
-        // Export DMABuf FD for the memory backing this image.
-        let dmabuf_fd = self.export_memory_dmabuf_fd(memory)?;
+        // Export DMABuf FD for the memory backing the exported surface.
+        let (out_memory, out_modifier, out_stride, out_offset, out_size) = if use_linear_export {
+            (
+                linear_memory.expect("linear export memory missing"),
+                u64::from(DrmModifier::Linear),
+                linear_stride,
+                0,
+                linear_size,
+            )
+        } else {
+            (memory, modifier, stride, offset, mem_size)
+        };
+        let dmabuf_fd = self.export_memory_dmabuf_fd(out_memory)?;
 
         self.frame_id += 1;
         {
@@ -766,10 +1001,10 @@ impl VulkanProducer {
             width: self.width,
             height: self.height,
             drm_fourcc: self.drm_fourcc,
-            modifier,
-            stride,
-            offset,
-            size_bytes: mem_size as u32,
+            modifier: out_modifier,
+            stride: out_stride,
+            offset: out_offset,
+            size_bytes: out_size as u32,
             dmabuf_fd,
             acquire_fence_fd: acquire_fd,
             release_fence_fd: release_fd,
@@ -1293,6 +1528,12 @@ impl Drop for VulkanProducer {
                     self.device.destroy_semaphore(r, None);
                 }
                 self.device.destroy_fence(slot.fence, None);
+                if let Some(buf) = slot.linear_buffer {
+                    self.device.destroy_buffer(buf, None);
+                }
+                if let Some(mem) = slot.linear_memory {
+                    self.device.free_memory(mem, None);
+                }
                 self.device.destroy_image(slot.image, None);
                 self.device.free_memory(slot.memory, None);
             }
@@ -1431,6 +1672,15 @@ fn query_modifiers(
     physical: vk::PhysicalDevice,
     format: vk::Format,
 ) -> anyhow::Result<Vec<u64>> {
+    let force_linear = std::env::var("METABONK_DMABUF_ONLY_LINEAR")
+        .ok()
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+        || std::env::var("METABONK_FORCE_LINEAR_EXPORT")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+
     let mut list0 = vk::DrmFormatModifierPropertiesListEXT::default();
     let mut props0 = vk::FormatProperties2::default().push_next(&mut list0);
     unsafe { instance.get_physical_device_format_properties2(physical, format, &mut props0) };
@@ -1444,6 +1694,22 @@ fn query_modifiers(
     unsafe { instance.get_physical_device_format_properties2(physical, format, &mut props) };
 
     let mut out: Vec<u64> = Vec::new();
+    if force_linear {
+        let linear = u64::from(DrmModifier::Linear);
+        for p in &vec_props {
+            if p.drm_format_modifier == linear {
+                out.push(p.drm_format_modifier);
+            }
+        }
+        if !out.is_empty() {
+            debug!(
+                "format {format:?} forcing linear modifier only ({} candidates)",
+                out.len()
+            );
+            return Ok(out);
+        }
+        warn!("format {format:?} no linear modifier available; falling back to full list");
+    }
     for p in &vec_props {
         // Prefer formats usable for transfer dst (we just clear via transfer).
         if p.drm_format_modifier_tiling_features.contains(vk::FormatFeatureFlags::TRANSFER_DST) {

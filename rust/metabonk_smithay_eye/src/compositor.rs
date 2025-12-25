@@ -13,8 +13,9 @@ use std::{
 use anyhow::Context;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use smithay::{
-    delegate_compositor, delegate_xdg_shell, delegate_xwayland_shell,
+    delegate_compositor, delegate_seat, delegate_xdg_shell, delegate_xwayland_shell,
     backend::allocator::dmabuf::Dmabuf,
+    backend::allocator::dmabuf::DmabufFlags,
     backend::allocator::Buffer as _,
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
@@ -48,7 +49,7 @@ use smithay::{
         drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjHandler, DrmSyncobjState},
         output::OutputHandler,
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData},
-        shm::{ShmHandler, ShmState},
+        shm::{self, ShmHandler, ShmState},
         socket::ListeningSocketSource,
         xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     },
@@ -61,10 +62,9 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use tracing::{info, warn};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
-use smithay::backend::egl::EGLDisplay;
-
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_agent_v1::{self, ZmetabonkAgentV1};
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_orchestrator_v1::{self, ZmetabonkOrchestratorV1};
+use crate::protocols::wl_drm::server::wl_drm::{self, WlDrm};
 
 #[derive(Default)]
 struct ClientState {
@@ -79,6 +79,20 @@ impl ClientData for ClientState {
 
 #[derive(Clone, Copy, Debug)]
 struct XWaylandPid(u32);
+
+#[derive(Clone, Debug)]
+struct WlDrmGlobalData {
+    device_path: String,
+    main_dev: u64,
+    formats: Vec<u32>,
+    capabilities: u32,
+}
+
+#[derive(Clone, Debug)]
+struct WlDrmData {
+    device_path: String,
+    main_dev: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentTier {
@@ -179,6 +193,8 @@ pub struct EyeCompositor {
     xwayland_shell_state: XWaylandShellState,
     xdg_shell_state: XdgShellState,
     seat_state: SeatState<Self>,
+    #[allow(dead_code)]
+    seat: Seat<Self>,
     shm_state: ShmState,
     dmabuf_state: DmabufState,
     drm_syncobj_state: Option<DrmSyncobjState>,
@@ -186,6 +202,8 @@ pub struct EyeCompositor {
     dmabuf_global: DmabufGlobal,
     #[allow(dead_code)]
     metabonk_control_global: smithay::reexports::wayland_server::backend::GlobalId,
+    #[allow(dead_code)]
+    wl_drm_global: smithay::reexports::wayland_server::backend::GlobalId,
     metabonk_orchestrators: Vec<ZmetabonkOrchestratorV1>,
     metabonk_agent_handles: HashMap<u32, Vec<ZmetabonkAgentV1>>,
     agents: HashMap<u32, AgentState>,
@@ -223,11 +241,15 @@ impl EyeCompositor {
         dmabuf_state: DmabufState,
         drm_syncobj_state: Option<DrmSyncobjState>,
         dmabuf_global: DmabufGlobal,
+        wl_drm_global_data: WlDrmGlobalData,
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
         let xdg_shell_state = XdgShellState::new::<Self>(dh);
-        let seat_state = SeatState::new();
+        let mut seat_state = SeatState::new();
+        let mut seat = seat_state.new_wl_seat(dh, "seat-0");
+        let _ = seat.add_pointer();
+        let _ = seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25);
         // wl_shm is required by many clients (including XWayland) even if we refuse
         // SHM buffers for the vision path. We expose it for compatibility and enforce
         // GPU-only capture by ignoring SHM commits in `commit()`.
@@ -236,16 +258,19 @@ impl EyeCompositor {
             wl_shm::Format::Xrgb8888,
         ]);
         let metabonk_control_global = dh.create_global::<Self, ZmetabonkOrchestratorV1, _>(1, ());
+        let wl_drm_global = dh.create_global::<Self, WlDrm, _>(2, wl_drm_global_data);
         Self {
             compositor_state,
             xwayland_shell_state,
             xdg_shell_state,
             seat_state,
+            seat,
             shm_state,
             dmabuf_state,
             drm_syncobj_state,
             dmabuf_global,
             metabonk_control_global,
+            wl_drm_global,
             metabonk_orchestrators: Vec::new(),
             metabonk_agent_handles: HashMap::new(),
             agents: HashMap::new(),
@@ -611,7 +636,28 @@ impl CompositorHandler for EyeCompositor {
                 // continues to present DMA-BUF frames.
                 if now.duration_since(self.last_non_dmabuf_log_at) > Duration::from_secs(2) {
                     self.last_non_dmabuf_log_at = now;
-                    warn!("non-dmabuf wl_buffer commit (SHM?) - GPU-only path requires linux-dmabuf");
+                    let pid = surface
+                        .client()
+                        .map(|c| Self::pid_for_client(&c))
+                        .unwrap_or(0);
+                    let mut logged = false;
+                    if let Ok(_) = shm::with_buffer_contents(&*buf, |_, len, data| {
+                        info!(
+                            pid,
+                            w = data.width,
+                            h = data.height,
+                            stride = data.stride,
+                            bytes = len,
+                            format = format_args!("{:?}", data.format),
+                            "shm commit"
+                        );
+                        logged = true;
+                    }) {
+                        // logged flag updated inside closure
+                    }
+                    if !logged {
+                        warn!(pid, "non-dmabuf wl_buffer commit (unknown buffer type)");
+                    }
                 }
             }
         });
@@ -766,12 +812,159 @@ impl XdgShellHandler for EyeCompositor {
 impl OutputHandler for EyeCompositor {}
 
 delegate_compositor!(EyeCompositor);
+delegate_seat!(EyeCompositor);
 smithay::delegate_shm!(EyeCompositor);
 smithay::delegate_dmabuf!(EyeCompositor);
 smithay::delegate_drm_syncobj!(EyeCompositor);
 smithay::delegate_output!(EyeCompositor);
 delegate_xwayland_shell!(EyeCompositor);
 delegate_xdg_shell!(EyeCompositor);
+
+impl smithay::reexports::wayland_server::GlobalDispatch<WlDrm, WlDrmGlobalData, EyeCompositor> for EyeCompositor {
+    fn bind(
+        _state: &mut EyeCompositor,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: smithay::reexports::wayland_server::New<WlDrm>,
+        global_data: &WlDrmGlobalData,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, EyeCompositor>,
+    ) {
+        let res = data_init.init(
+            resource,
+            WlDrmData {
+                device_path: global_data.device_path.clone(),
+                main_dev: global_data.main_dev,
+            },
+        );
+        res.device(global_data.device_path.clone());
+        for fmt in &global_data.formats {
+            res.format(*fmt);
+        }
+        res.capabilities(global_data.capabilities);
+    }
+}
+
+impl smithay::reexports::wayland_server::Dispatch<WlDrm, WlDrmData, EyeCompositor> for EyeCompositor {
+    fn request(
+        _state: &mut EyeCompositor,
+        _client: &Client,
+        resource: &WlDrm,
+        request: wl_drm::Request,
+        data: &WlDrmData,
+        _dh: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, EyeCompositor>,
+    ) {
+        match request {
+            wl_drm::Request::Authenticate { .. } => {
+                resource.authenticated();
+            }
+            wl_drm::Request::CreateBuffer { .. } | wl_drm::Request::CreatePlanarBuffer { .. } => {
+                resource.post_error(
+                    wl_drm::Error::InvalidName,
+                    "wl_drm name-based buffers are unsupported; use prime buffers or linux-dmabuf",
+                );
+            }
+            wl_drm::Request::CreatePrimeBuffer {
+                id,
+                name,
+                width,
+                height,
+                format,
+                offset0,
+                stride0,
+                offset1,
+                stride1,
+                offset2,
+                stride2,
+            } => {
+                use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                use smithay::backend::allocator::{Fourcc, Modifier};
+                use smithay::backend::drm::DrmNode;
+
+                if width <= 0 || height <= 0 {
+                    resource.post_error(wl_drm::Error::InvalidName, "invalid buffer dimensions");
+                    return;
+                }
+
+                let fourcc = match Fourcc::try_from(format) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        resource.post_error(wl_drm::Error::InvalidFormat, "unrecognized drm fourcc");
+                        return;
+                    }
+                };
+
+                let raw_fd = name.as_raw_fd();
+                let mut builder = Dmabuf::builder((width, height), fourcc, Modifier::Linear, DmabufFlags::empty());
+                if let Ok(node) = DrmNode::from_dev_id(data.main_dev as _) {
+                    builder.set_node(node);
+                }
+
+                let plane0_offset = match u32::try_from(offset0) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        resource.post_error(wl_drm::Error::InvalidName, "invalid plane0 offset");
+                        return;
+                    }
+                };
+                let plane0_stride = match u32::try_from(stride0) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        resource.post_error(wl_drm::Error::InvalidName, "invalid plane0 stride");
+                        return;
+                    }
+                };
+                if plane0_stride == 0 {
+                    resource.post_error(wl_drm::Error::InvalidName, "invalid plane0 stride");
+                    return;
+                }
+
+                if !builder.add_plane(name, 0, plane0_offset, plane0_stride) {
+                    resource.post_error(wl_drm::Error::InvalidName, "too many dmabuf planes");
+                    return;
+                }
+
+                let extra_planes = [(1u32, offset1, stride1), (2u32, offset2, stride2)];
+                for (idx, offset, stride) in extra_planes {
+                    if stride == 0 {
+                        continue;
+                    }
+                    let off = match u32::try_from(offset) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            resource.post_error(wl_drm::Error::InvalidName, "invalid plane offset");
+                            return;
+                        }
+                    };
+                    let strd = match u32::try_from(stride) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            resource.post_error(wl_drm::Error::InvalidName, "invalid plane stride");
+                            return;
+                        }
+                    };
+                    let dup_fd = unsafe { libc::dup(raw_fd) };
+                    if dup_fd < 0 {
+                        resource.post_error(wl_drm::Error::InvalidName, "dup dmabuf fd failed");
+                        return;
+                    }
+                    let owned = unsafe { OwnedFd::from_raw_fd(dup_fd) };
+                    if !builder.add_plane(owned, idx, off, strd) {
+                        resource.post_error(wl_drm::Error::InvalidName, "too many dmabuf planes");
+                        return;
+                    }
+                }
+
+                let Some(dmabuf) = builder.build() else {
+                    resource.post_error(wl_drm::Error::InvalidName, "failed to build dmabuf");
+                    return;
+                };
+
+                let _buf = data_init.init(id, dmabuf);
+            }
+        }
+    }
+}
 
 impl smithay::reexports::wayland_server::GlobalDispatch<ZmetabonkOrchestratorV1, (), EyeCompositor> for EyeCompositor {
     fn bind(
@@ -857,6 +1050,56 @@ impl smithay::reexports::wayland_server::Dispatch<ZmetabonkAgentV1, AgentHandleD
     }
 }
 
+fn resolve_render_node_path(main_dev: libc::dev_t) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Ok(p) = std::env::var("METABONK_DRM_RENDER_NODE") {
+        return Ok(PathBuf::from(p));
+    }
+
+    let entries = std::fs::read_dir("/dev/dri").context("read_dir(/dev/dri)")?;
+    for ent in entries.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if !name.starts_with("renderD") {
+            continue;
+        }
+        let Ok(md) = ent.metadata() else { continue };
+        if md.rdev() as libc::dev_t == main_dev {
+            return Ok(ent.path());
+        }
+    }
+
+    anyhow::bail!(
+        "could not resolve DRM render node for main_dev=0x{:x} (set METABONK_DRM_RENDER_NODE)",
+        main_dev as u64
+    )
+}
+
+fn resolve_card_node_path(main_dev: libc::dev_t) -> anyhow::Result<PathBuf> {
+    if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
+        return Ok(PathBuf::from(p));
+    }
+
+    let render_node = resolve_render_node_path(main_dev)?;
+    let base = render_node
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "renderD?".into());
+    let sys = std::path::Path::new("/sys/class/drm").join(&base).join("device/drm");
+    let mut found: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&sys) {
+        for ent in entries.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if name.starts_with("card") {
+                found = Some(PathBuf::from("/dev/dri").join(name));
+                break;
+            }
+        }
+    }
+
+    Ok(found.unwrap_or_else(|| PathBuf::from("/dev/dri/card0")))
+}
+
 fn write_compositor_env(
     run_dir: &Path,
     wayland_display: &str,
@@ -900,7 +1143,14 @@ pub fn spawn_wayland_xwayland_thread(
         // Advertise linux-dmabuf so XWayland clients can submit GPU buffers (no SHM fallback).
         let mut dmabuf_state = DmabufState::new();
         use smithay::backend::allocator::{Format, Fourcc, Modifier};
-        let preferred_modifiers: [Modifier; 6] = [
+        let only_linear = std::env::var("METABONK_DMABUF_ONLY_LINEAR")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if only_linear {
+            warn!("dmabuf: METABONK_DMABUF_ONLY_LINEAR=1 set; advertising only linear buffers");
+        }
+        let mut preferred_modifiers: Vec<Modifier> = vec![
             Modifier::Nvidia_16bx2_block_one_gob,
             Modifier::Nvidia_16bx2_block_two_gob,
             Modifier::Nvidia_16bx2_block_four_gob,
@@ -915,6 +1165,9 @@ pub fn spawn_wayland_xwayland_thread(
             Fourcc::Xbgr8888,
         ];
         let mut preferred_formats: Vec<Format> = Vec::new();
+        if only_linear {
+            preferred_modifiers.clear();
+        }
         for modifier in preferred_modifiers {
             for code in preferred_codes {
                 preferred_formats.push(Format { code, modifier });
@@ -922,7 +1175,8 @@ pub fn spawn_wayland_xwayland_thread(
         }
         let allow_linear = std::env::var("METABONK_DMABUF_ALLOW_LINEAR")
             .map(|v| v == "1")
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || only_linear;
         if !allow_linear {
             info!("dmabuf: linear modifier disabled (set METABONK_DMABUF_ALLOW_LINEAR=1 to enable)");
         }
@@ -949,78 +1203,38 @@ pub fn spawn_wayland_xwayland_thread(
         if allow_linear {
             builder = builder.add_preference_tranche(main_dev, None, linear_formats);
         }
-        let default_feedback = builder
-            .add_preference_tranche(main_dev, None, preferred_formats)
-            .build()
-            .context("build dmabuf feedback")?;
+        if !preferred_formats.is_empty() {
+            builder = builder.add_preference_tranche(main_dev, None, preferred_formats);
+        }
+        let default_feedback = builder.build().context("build dmabuf feedback")?;
         let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<EyeCompositor>(&dh, &default_feedback);
 
-        // Bind an EGLDisplay to the Wayland display so EGL-based clients (notably XWayland/glamor)
-        // can create hardware-accelerated wl_buffers. Without this, XWayland may fail to export
-        // pixmaps to Wayland buffers ("Error getting buffer").
-        let _egl_buffer_reader = {
-            use std::os::unix::fs::MetadataExt;
-            let mut render_node: Option<std::path::PathBuf> = None;
-            if let Ok(p) = std::env::var("METABONK_DRM_RENDER_NODE") {
-                render_node = Some(std::path::PathBuf::from(p));
-            } else if let Ok(entries) = std::fs::read_dir("/dev/dri") {
-                for ent in entries.flatten() {
-                    let name = ent.file_name();
-                    let name = name.to_string_lossy();
-                    if !name.starts_with("renderD") {
-                        continue;
-                    }
-                    let Ok(md) = ent.metadata() else { continue };
-                    if md.rdev() as libc::dev_t == main_dev {
-                        render_node = Some(ent.path());
-                        break;
-                    }
-                }
-            }
-            let render_node = render_node.with_context(|| {
-                format!(
-                    "resolve DRM render node path for main_dev=0x{:x} (set METABONK_DRM_RENDER_NODE)",
-                    main_dev as u64
-                )
-            })?;
+        // XWayland still expects a `wl_drm` global for device discovery and PRIME capability gating,
+        // even if it later submits buffers via `zwp_linux_dmabuf_v1`.
+        let wl_drm_global_data = {
+            use smithay::backend::drm::{DrmNode, NodeType};
 
-            // wl_drm is legacy and expects a *primary* node in many stacks. Use the corresponding
-            // /dev/dri/cardX node for EGL_WL_bind_wayland_display so XWayland can authenticate and
-            // export wl_buffers reliably; keep linux-dmabuf feedback tied to the render node.
-            let card_node = if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
-                std::path::PathBuf::from(p)
+            let render_node = resolve_render_node_path(main_dev)
+                .with_context(|| format!("resolve wl_drm device path for main_dev=0x{:x}", main_dev as u64))?;
+            let device_node = if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
+                PathBuf::from(p)
             } else {
-                let base = render_node
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "renderD?".into());
-                let sys = std::path::Path::new("/sys/class/drm").join(&base).join("device/drm");
-                let mut found: Option<std::path::PathBuf> = None;
-                if let Ok(entries) = std::fs::read_dir(&sys) {
-                    for ent in entries.flatten() {
-                        let name = ent.file_name().to_string_lossy().to_string();
-                        if name.starts_with("card") {
-                            found = Some(std::path::Path::new("/dev/dri").join(name));
-                            break;
-                        }
-                    }
-                }
-                found.unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/card0"))
+                DrmNode::from_dev_id(main_dev as _)
+                    .ok()
+                    .and_then(|n| n.dev_path_with_type(NodeType::Primary))
+                    .unwrap_or_else(|| render_node.clone())
             };
-
-            let drm_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&card_node)
-                .with_context(|| format!("open({card_node:?})"))?;
-            let gbm_dev = gbm::Device::new(drm_file).context("gbm::Device::new")?;
-            let egl = unsafe { EGLDisplay::new(gbm_dev).context("EGLDisplay::new")? };
-            info!(
-                render_node = %render_node.to_string_lossy(),
-                card_node = %card_node.to_string_lossy(),
-                "EGL display ready; binding wl_drm infrastructure for XWayland"
-            );
-            egl.bind_wl_display(&dh).context("EGLDisplay::bind_wl_display")?
+            WlDrmGlobalData {
+                device_path: device_node.to_string_lossy().to_string(),
+                main_dev: main_dev as u64,
+                formats: vec![
+                    Fourcc::Argb8888 as u32,
+                    Fourcc::Xrgb8888 as u32,
+                    Fourcc::Abgr8888 as u32,
+                    Fourcc::Xbgr8888 as u32,
+                ],
+                capabilities: wl_drm::Capability::Prime as u32,
+            }
         };
 
         // Advertise a headless wl_output. XWayland (and other clients) expect at least one output
@@ -1106,6 +1320,7 @@ pub fn spawn_wayland_xwayland_thread(
             dmabuf_state,
             drm_syncobj_state,
             dmabuf_global,
+            wl_drm_global_data,
         );
 
         // Listen for Wayland clients (required for XWayland to roundtrip).
