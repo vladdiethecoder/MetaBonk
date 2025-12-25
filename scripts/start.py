@@ -371,6 +371,8 @@ def main() -> int:
 
     # Base env for everything we spawn.
     env = os.environ.copy()
+    # Default Synthetic Eye passthrough off (use Vulkan export path).
+    env.setdefault("METABONK_SYNTHETIC_EYE_PASSTHROUGH", "0")
     env["ORCHESTRATOR_URL"] = f"http://127.0.0.1:{args.orch_port}"
     env["METABONK_EXPERIMENT_ID"] = args.experiment
     env.setdefault("METABONK_RUN_ID", f"run-omega-{int(time.time())}")

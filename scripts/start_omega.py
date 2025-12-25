@@ -734,6 +734,8 @@ def main() -> int:
     # path unless the user explicitly opts out (METABONK_SYNTHETIC_EYE_COMPOSITOR=0).
     if bool(getattr(args, "synthetic_eye", False)):
         env.setdefault("METABONK_SYNTHETIC_EYE_COMPOSITOR", "1")
+        # Smithay Eye hosts XWayland directly; avoid wrapping the game in gamescope unless explicitly requested.
+        env.setdefault("MEGABONK_USE_GAMESCOPE", "0")
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
     env.setdefault("METABONK_SUPERVISE_WORKERS", "1")
     if (
@@ -1353,6 +1355,8 @@ def main() -> int:
                 wenv["METABONK_WORKER_GPU"] = str(gpu_choice)
 
             if bool(getattr(args, "synthetic_eye", False)):
+                # Default to Vulkan export path on NVIDIA (passthrough off).
+                wenv.setdefault("METABONK_SYNTHETIC_EYE_PASSTHROUGH", "0")
                 eye_bin = str(getattr(args, "synthetic_eye_bin", "") or "").strip()
                 if not eye_bin:
                     for c in (
@@ -1385,6 +1389,10 @@ def main() -> int:
                 frame_sock = f"{run_root}/{iid}/frame.sock"
                 wenv["METABONK_FRAME_SOURCE"] = "synthetic_eye"
                 wenv["METABONK_FRAME_SOCK"] = frame_sock
+                # Force X11 path for the game: remove Wayland env vars so SDL/Proton
+                # doesn't attempt a native Wayland connection.
+                wenv.pop("WAYLAND_DISPLAY", None)
+                wenv["SDL_VIDEODRIVER"] = "x11"
                 # Do not set WAYLAND_DISPLAY in the worker env: gamescope treats this as a signal to use the
                 # Wayland backend and will attempt to connect to a socket. Synthetic Eye is currently an
                 # independent DMABuf+fence exporter (test pattern), not a Wayland compositor.
@@ -1453,6 +1461,9 @@ def main() -> int:
                     wenv["METABONK_INPUT_DISPLAY"] = disp
                     wenv["WAYLAND_DISPLAY"] = wl
                     wenv["XDG_RUNTIME_DIR"] = xdg
+                    # Force X11 for the game even when the compositor exposes WAYLAND_DISPLAY.
+                    wenv.pop("WAYLAND_DISPLAY", None)
+                    wenv["SDL_VIDEODRIVER"] = "x11"
                     # Avoid compositor output resets (reason=2) by forcing the game window size to
                     # match the Synthetic Eye compositor output. This prevents a resize loop where
                     # the compositor keeps resetting and the worker never reaches a steady frame stream.

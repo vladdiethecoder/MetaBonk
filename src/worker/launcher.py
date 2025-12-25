@@ -327,6 +327,14 @@ class GameLauncher:
         # Real implementation execs gamescope + game binary; recovery mode uses
         # an env-configurable command so the launcher is still useful in dev.
         self.use_gamescope = os.environ.get("MEGABONK_USE_GAMESCOPE", "1") == "1"
+        # When Synthetic Eye compositor hosts XWayland, do not wrap the game in gamescope.
+        if os.environ.get("METABONK_SYNTHETIC_EYE_COMPOSITOR", "0") == "1" or os.environ.get(
+            "METABONK_FRAME_SOURCE"
+        ) == "synthetic_eye":
+            if self.use_gamescope:
+                print("[launcher] forcing MEGABONK_USE_GAMESCOPE=0 for Synthetic Eye compositor")
+            self.use_gamescope = False
+            os.environ["MEGABONK_USE_GAMESCOPE"] = "0"
         if self.sidecar_port is None:
             sp = os.environ.get("MEGABONK_SIDECAR_PORT")
             self.sidecar_port = int(sp) if sp else None
@@ -375,6 +383,15 @@ class GameLauncher:
             args = [cmd]
 
         env = os.environ.copy()
+        if env.get("METABONK_FRAME_SOURCE") == "synthetic_eye" or env.get(
+            "METABONK_SYNTHETIC_EYE_COMPOSITOR", "0"
+        ) == "1":
+            env.pop("PROTON_ENABLE_WAYLAND", None)
+            env.pop("WAYLAND_DISPLAY", None)
+            env["PROTON_ENABLE_WAYLAND"] = "0"
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            env["SDL_VIDEODRIVER"] = "x11"
         if self.display:
             env["DISPLAY"] = self.display
         if self.sidecar_port is not None:
