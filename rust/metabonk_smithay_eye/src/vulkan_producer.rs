@@ -3,6 +3,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::io::RawFd,
 };
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -44,6 +45,10 @@ pub struct VulkanProducer {
     last_src: Option<SrcCache>,
     force_linear_export: bool,
     debug_dump_staging: bool,
+    debug_dump_after_frame: Option<u64>,
+    debug_dump_every_n: Option<u64>,
+    debug_dump_max: Option<u64>,
+    debug_dump_count: u64,
     debug_dump_done: bool,
 }
 
@@ -141,6 +146,26 @@ impl VulkanProducer {
                 v == "1" || v == "true" || v == "yes" || v == "on"
             })
             .unwrap_or(false);
+        let debug_dump_after_frame = std::env::var("METABONK_DEBUG_DUMP_STAGING_AFTER_FRAME")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        let debug_dump_every_n = std::env::var("METABONK_DEBUG_DUMP_STAGING_EVERY_N")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        let debug_dump_max = std::env::var("METABONK_DEBUG_DUMP_STAGING_MAX_DUMPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0);
+        if debug_dump_staging {
+            info!(
+                after_frame = debug_dump_after_frame.unwrap_or(1),
+                every_n = debug_dump_every_n,
+                max_dumps = debug_dump_max,
+                "debug staging dump enabled"
+            );
+        }
         let mut producer = Self {
             instance,
             physical,
@@ -160,6 +185,10 @@ impl VulkanProducer {
             last_src: None,
             force_linear_export,
             debug_dump_staging,
+            debug_dump_after_frame,
+            debug_dump_every_n,
+            debug_dump_max,
+            debug_dump_count: 0,
             debug_dump_done: false,
         };
         producer.init_slots(slots)?;
