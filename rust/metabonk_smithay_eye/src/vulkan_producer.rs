@@ -43,6 +43,8 @@ pub struct VulkanProducer {
     vk_format: vk::Format,
     last_src: Option<SrcCache>,
     force_linear_export: bool,
+    debug_dump_staging: bool,
+    debug_dump_done: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +91,7 @@ struct Slot {
     fence: vk::Fence,
     prev_acquire: Option<vk::Semaphore>,
     prev_release: Option<vk::Semaphore>,
+    to_destroy_sems: Vec<vk::Semaphore>,
     to_destroy: Vec<(vk::Semaphore, vk::Semaphore)>,
     to_destroy_imported: Vec<ImportedResource>,
 }
@@ -131,6 +134,13 @@ impl VulkanProducer {
             info!("linear export enabled: copying frames into a linear staging buffer");
         }
 
+        let debug_dump_staging = std::env::var("METABONK_DEBUG_DUMP_STAGING")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+            .unwrap_or(false);
         let mut producer = Self {
             instance,
             physical,
@@ -149,6 +159,8 @@ impl VulkanProducer {
             vk_format,
             last_src: None,
             force_linear_export,
+            debug_dump_staging,
+            debug_dump_done: false,
         };
         producer.init_slots(slots)?;
         Ok(producer)
@@ -207,6 +219,7 @@ impl VulkanProducer {
                 fence,
                 prev_acquire: None,
                 prev_release: None,
+                to_destroy_sems: Vec::new(),
                 to_destroy: Vec::new(),
                 to_destroy_imported: Vec::new(),
             });
@@ -239,7 +252,8 @@ impl VulkanProducer {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            // Must include TRANSFER_SRC when we later blit/copy out of this image.
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         image_info = image_info.push_next(&mut external).push_next(&mut modifier_list);
@@ -314,9 +328,14 @@ impl VulkanProducer {
         {
             let fence = self.slots[slot_idx].fence;
             // Wait for previous GPU work on this slot (allows safe semaphore destruction/reset).
-            self.wait_for_fence(fence).context("wait_for_fences")?;
+            self.wait_for_fence(fence, "Render", slot_idx).context("wait_for_fences")?;
             let slot = &mut self.slots[slot_idx];
             unsafe { self.device.reset_fences(&[slot.fence]) }.ok();
+            for sem in slot.to_destroy_sems.drain(..) {
+                unsafe {
+                    self.device.destroy_semaphore(sem, None);
+                }
+            }
             for (a, r) in slot.to_destroy.drain(..) {
                 unsafe {
                     self.device.destroy_semaphore(a, None);
@@ -558,14 +577,30 @@ impl VulkanProducer {
         })
     }
 
-    pub fn render_from_dmabuf(&mut self, src: &Dmabuf) -> anyhow::Result<RenderedFrame> {
+    pub fn render_from_dmabuf(&mut self, src: &Dmabuf, wait_fence_fd: Option<RawFd>) -> anyhow::Result<RenderedFrame> {
+        struct FdGuard(Option<RawFd>);
+        impl Drop for FdGuard {
+            fn drop(&mut self) {
+                if let Some(fd) = self.0.take() {
+                    let _ = close(fd);
+                }
+            }
+        }
+
+        info!(wait_fence_fd = ?wait_fence_fd, "render_from_dmabuf acquire sync fd");
+        let mut wait_fd = FdGuard(wait_fence_fd);
         let slot_idx = self.next_slot % self.slots.len();
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         {
             let fence = self.slots[slot_idx].fence;
-            self.wait_for_fence(fence).context("wait_for_fences")?;
+            self.wait_for_fence(fence, "Blit", slot_idx).context("wait_for_fences")?;
             let slot = &mut self.slots[slot_idx];
             unsafe { self.device.reset_fences(&[slot.fence]) }.ok();
+            for sem in slot.to_destroy_sems.drain(..) {
+                unsafe {
+                    self.device.destroy_semaphore(sem, None);
+                }
+            }
             for (a, r) in slot.to_destroy.drain(..) {
                 unsafe {
                     self.device.destroy_semaphore(a, None);
@@ -706,6 +741,35 @@ impl VulkanProducer {
             )
         };
         let use_linear_export = self.force_linear_export && linear_buffer.is_some() && linear_memory.is_some();
+        let debug_dump_enabled = self.debug_dump_staging && !self.debug_dump_done && use_linear_export;
+        let mut debug_buffer: Option<vk::Buffer> = None;
+        let mut debug_memory: Option<vk::DeviceMemory> = None;
+        let debug_buffer_size = (u64::from(self.width)) * (u64::from(self.height)) * 4;
+        if debug_dump_enabled {
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(debug_buffer_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buf = unsafe { self.device.create_buffer(&buffer_info, None) }
+                .context("create debug staging buffer")?;
+            let mem_req = unsafe { self.device.get_buffer_memory_requirements(buf) };
+            let mem_type = find_memory_type_with_flags(
+                self.instance.handle(),
+                self.physical.handle(),
+                mem_req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .context("find debug staging buffer memory type")?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(mem_req.size)
+                .memory_type_index(mem_type);
+            let mem = unsafe { self.device.allocate_memory(&alloc, None) }
+                .context("allocate debug staging buffer memory")?;
+            unsafe { self.device.bind_buffer_memory(buf, mem, 0) }
+                .context("bind debug staging buffer memory")?;
+            debug_buffer = Some(buf);
+            debug_memory = Some(mem);
+        }
 
         if src_w != self.width || src_h != self.height {
             // For now, require a matching input size. (This avoids an extra blit path and keeps the ABI stable.)
@@ -926,7 +990,15 @@ impl VulkanProducer {
                         &[region],
                     );
                 }
-
+                if let Some(buf) = debug_buffer {
+                    self.device.cmd_copy_image_to_buffer(
+                        cmd,
+                        dst_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buf,
+                        &[region],
+                    );
+                }
                 let to_general = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .dst_access_mask(vk::AccessFlags::MEMORY_READ)
@@ -955,11 +1027,33 @@ impl VulkanProducer {
             }
         }
 
+        let mut imported_wait_sem: Option<vk::Semaphore> = None;
+        if let Some(fd) = wait_fd.0.take() {
+            info!(fd, "importing acquire sync fd into semaphore");
+            match self.import_sync_fd_semaphore(fd) {
+                Ok(sem) => {
+                    info!(fd, "acquire sync fd import succeeded");
+                    imported_wait_sem = Some(sem);
+                    // Vulkan owns the fd after a successful import.
+                }
+                Err(err) => {
+                    warn!(fd, "failed to import acquire sync fd into semaphore: {err}");
+                    let _ = close(fd);
+                }
+            }
+        } else {
+            info!("no acquire sync fd provided for render_from_dmabuf");
+        }
+
         // Submit with explicit wait on previous consumer release.
         let mut wait_sems: Vec<vk::Semaphore> = Vec::new();
         let mut wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
         if let Some(prev_rel) = prev_release {
             wait_sems.push(prev_rel);
+            wait_stages.push(vk::PipelineStageFlags::TRANSFER);
+        }
+        if let Some(wait_sem) = imported_wait_sem {
+            wait_sems.push(wait_sem);
             wait_stages.push(vk::PipelineStageFlags::TRANSFER);
         }
         let signal_sems = [acquire];
@@ -971,6 +1065,27 @@ impl VulkanProducer {
             .signal_semaphores(&signal_sems);
 
         unsafe { self.device.queue_submit(self.queue, &[submit], fence) }.context("queue_submit")?;
+
+        if let Some(wait_sem) = imported_wait_sem {
+            let slot = &mut self.slots[slot_idx];
+            slot.to_destroy_sems.push(wait_sem);
+        }
+
+        if debug_dump_enabled {
+            // Ensure GPU completed the blit/copy before mapping the debug buffer.
+            if let Err(e) = self.wait_for_fence(fence, "DebugDump", slot_idx) {
+                warn!("debug staging dump skipped (fence wait failed): {e}");
+            } else if let (Some(buf), Some(mem)) = (debug_buffer, debug_memory) {
+                if let Err(e) = self.debug_dump_buffer_ppm(mem, debug_buffer_size, self.frame_id + 1) {
+                    warn!("debug staging dump failed: {e}");
+                }
+                unsafe {
+                    self.device.destroy_buffer(buf, None);
+                    self.device.free_memory(mem, None);
+                }
+                self.debug_dump_done = true;
+            }
+        }
 
         // Export DMABuf FD for the memory backing the exported surface.
         let (out_memory, out_modifier, out_stride, out_offset, out_size) = if use_linear_export {
@@ -1020,7 +1135,18 @@ impl VulkanProducer {
         &mut self,
         src: &Dmabuf,
         override_size: Option<(u32, u32)>,
+        wait_fence_fd: Option<RawFd>,
     ) -> anyhow::Result<RenderedFrame> {
+        struct FdGuard(Option<RawFd>);
+        impl Drop for FdGuard {
+            fn drop(&mut self) {
+                if let Some(fd) = self.0.take() {
+                    let _ = close(fd);
+                }
+            }
+        }
+
+        let mut wait_fd = FdGuard(wait_fence_fd);
         if src.num_planes() != 1 {
             anyhow::bail!("only single-plane dmabufs are supported (got {} planes)", src.num_planes());
         }
@@ -1029,9 +1155,14 @@ impl VulkanProducer {
         self.next_slot = (self.next_slot + 1) % self.slots.len();
         {
             let fence = self.slots[slot_idx].fence;
-            self.wait_for_fence(fence).context("wait_for_fences")?;
+            self.wait_for_fence(fence, "Passthrough", slot_idx).context("wait_for_fences")?;
             let slot = &mut self.slots[slot_idx];
             unsafe { self.device.reset_fences(&[slot.fence]) }.ok();
+            for sem in slot.to_destroy_sems.drain(..) {
+                unsafe {
+                    self.device.destroy_semaphore(sem, None);
+                }
+            }
             for (a, r) in slot.to_destroy.drain(..) {
                 unsafe {
                     self.device.destroy_semaphore(a, None);
@@ -1091,6 +1222,19 @@ impl VulkanProducer {
         let (acquire, acquire_fd) = self.create_exportable_semaphore()?;
         let (release, release_fd) = self.create_exportable_semaphore()?;
 
+        let mut imported_wait_sem: Option<vk::Semaphore> = None;
+        if let Some(fd) = wait_fd.0.take() {
+            match self.import_sync_fd_semaphore(fd) {
+                Ok(sem) => {
+                    imported_wait_sem = Some(sem);
+                }
+                Err(err) => {
+                    warn!("failed to import acquire sync fd into semaphore (passthrough): {err}");
+                    let _ = close(fd);
+                }
+            }
+        }
+
         // Submit a trivial no-op command buffer that waits on previous consumer release (backpressure)
         // and signals acquire. We intentionally submit a real command buffer (even empty) because
         // some driver stacks appear to produce external semaphore handles that CUDA can import
@@ -1098,8 +1242,12 @@ impl VulkanProducer {
         // Passthrough mode does not strictly depend on consumer release fences. Waiting on them
         // can deadlock the compositor if the consumer misses a single fence signal (e.g. CUDA import hiccup).
         // Keep the producer running and rely on the fixed-FPS pacing + slot fences for backpressure.
-        let wait_sems: Vec<vk::Semaphore> = Vec::new();
-        let wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
+        let mut wait_sems: Vec<vk::Semaphore> = Vec::new();
+        let mut wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
+        if let Some(wait_sem) = imported_wait_sem {
+            wait_sems.push(wait_sem);
+            wait_stages.push(vk::PipelineStageFlags::TRANSFER);
+        }
 
         let cmd = self.slots[slot_idx].cmd;
         unsafe { self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.ok();
@@ -1116,6 +1264,11 @@ impl VulkanProducer {
             .command_buffers(&cmd_bufs)
             .signal_semaphores(&signal_sems);
         unsafe { self.device.queue_submit(self.queue, &[submit], self.slots[slot_idx].fence) }.context("queue_submit")?;
+
+        if let Some(wait_sem) = imported_wait_sem {
+            let slot = &mut self.slots[slot_idx];
+            slot.to_destroy_sems.push(wait_sem);
+        }
 
         self.frame_id += 1;
         {
@@ -1456,16 +1609,83 @@ impl VulkanProducer {
         }
     }
 
-    fn wait_for_fence(&self, fence: vk::Fence) -> anyhow::Result<()> {
+    fn wait_for_fence(&self, fence: vk::Fence, label: &str, slot_idx: usize) -> anyhow::Result<()> {
         // Avoid indefinite hangs. If the GPU queue wedges (e.g. external semaphore never signals),
         // we prefer a fast failure so the supervisor can restart the compositor.
-        // 30s gives the CUDA consumer time to catch up under load without spurious restarts.
-        const WAIT_NS: u64 = 30_000_000_000; // 30s
-        match unsafe { self.device.wait_for_fences(&[fence], true, WAIT_NS) } {
-            Ok(_) => Ok(()),
-            Err(vk::Result::TIMEOUT) => anyhow::bail!("slot fence wait timed out (GPU queue stalled)"),
-            Err(e) => Err(anyhow::anyhow!("slot fence wait failed: {e:?}")),
+        // Default to 5s (configurable via env) so stalls are surfaced with logs.
+        let default_wait_ms = 5_000;
+        let wait_ms = std::env::var("METABONK_EYE_FENCE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default_wait_ms)
+            .max(default_wait_ms);
+        let wait_ns = wait_ms.saturating_mul(1_000_000);
+        info!(
+            "⏳ Waiting for {} fence (slot={}, timeout_ms={})...",
+            label,
+            slot_idx,
+            wait_ms
+        );
+        match unsafe { self.device.wait_for_fences(&[fence], true, wait_ns) } {
+            Ok(_) => {
+                info!("✅ {} fence signaled (slot={})", label, slot_idx);
+                Ok(())
+            }
+            Err(vk::Result::TIMEOUT) => {
+                warn!(
+                    "{} fence wait timed out (slot={}, timeout_ms={})",
+                    label,
+                    slot_idx,
+                    wait_ms
+                );
+                anyhow::bail!("slot fence wait timed out (GPU queue stalled)")
+            }
+            Err(e) => Err(anyhow::anyhow!("{} fence wait failed (slot={}): {e:?}", label, slot_idx)),
         }
+    }
+
+    fn debug_dump_buffer_ppm(&self, memory: vk::DeviceMemory, size: u64, frame_id: u64) -> anyhow::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let row_bytes = width.saturating_mul(4);
+        let needed = (row_bytes as u64).saturating_mul(self.height as u64);
+        if size < needed {
+            anyhow::bail!("debug buffer too small (size={size}, needed={needed})");
+        }
+
+        let ptr = unsafe {
+            self.device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        }
+        .context("map debug staging buffer")?;
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize) };
+
+        let ppm_path = format!("/tmp/debug_staging_{frame_id}.ppm");
+        let mut f = File::create(&ppm_path).context("create debug ppm")?;
+        writeln!(f, "P6")?;
+        writeln!(f, "{} {}", self.width, self.height)?;
+        writeln!(f, "255")?;
+        for y in 0..height {
+            let row_offset = y * row_bytes;
+            let row = &data[row_offset..row_offset + row_bytes];
+            for x in 0..width {
+                let px = x * 4;
+                let b = row[px];
+                let g = row[px + 1];
+                let r = row[px + 2];
+                f.write_all(&[r, g, b])?;
+            }
+        }
+
+        unsafe { self.device.unmap_memory(memory) };
+        info!(
+            "debug staging dump written: {} (convert with: convert {} /tmp/debug_staging_{frame_id}.png)",
+            ppm_path, ppm_path
+        );
+        Ok(())
     }
 
     fn export_memory_dmabuf_fd(&self, memory: vk::DeviceMemory) -> anyhow::Result<RawFd> {
@@ -1486,6 +1706,21 @@ impl VulkanProducer {
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
         let fd = unsafe { self.khr_sema_fd.get_semaphore_fd(&fd_info) }.context("vkGetSemaphoreFdKHR")?;
         Ok((sem, fd))
+    }
+
+    fn import_sync_fd_semaphore(&self, fd: RawFd) -> anyhow::Result<vk::Semaphore> {
+        let mut export = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let sem = unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None) }
+            .context("create sync-fd semaphore")?;
+        let import_info = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(sem)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .fd(fd);
+        unsafe { self.khr_sema_fd.import_semaphore_fd(&import_info) }
+            .context("vkImportSemaphoreFdKHR")?;
+        Ok(sem)
     }
 }
 
@@ -1520,6 +1755,9 @@ impl Drop for VulkanProducer {
                 for (a, r) in slot.to_destroy {
                     self.device.destroy_semaphore(a, None);
                     self.device.destroy_semaphore(r, None);
+                }
+                for sem in slot.to_destroy_sems {
+                    self.device.destroy_semaphore(sem, None);
                 }
                 if let Some(a) = slot.prev_acquire {
                     self.device.destroy_semaphore(a, None);
@@ -1771,6 +2009,28 @@ fn find_memory_type_bits(
         }
     }
     anyhow::bail!("no suitable memory type found for allowed bits 0x{allowed_type_bits:x}")
+}
+
+fn find_memory_type_with_flags(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    allowed_type_bits: u32,
+    required: vk::MemoryPropertyFlags,
+) -> anyhow::Result<u32> {
+    let props = unsafe { instance.get_physical_device_memory_properties(physical) };
+    for i in 0..props.memory_type_count {
+        let ok = (allowed_type_bits & (1 << i)) != 0;
+        if !ok {
+            continue;
+        }
+        let flags = props.memory_types[i as usize].property_flags;
+        if flags.contains(required) {
+            return Ok(i);
+        }
+    }
+    anyhow::bail!(
+        "no suitable memory type found for allowed bits 0x{allowed_type_bits:x} with flags {required:?}"
+    )
 }
 
 fn select_best_memory_type_bits(

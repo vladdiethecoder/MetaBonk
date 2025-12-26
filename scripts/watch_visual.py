@@ -24,6 +24,24 @@ from PIL import Image
 
 from pathlib import Path
 
+
+def _warn_deprecated_portal_capture() -> None:
+    """Warn that portal capture is not the production gold path.
+
+    MetaBonk's "gold" training path is Synthetic Eye (Smithay/Vulkan -> DMA-BUF -> CUDA),
+    which avoids desktop compositor dependencies and reduces latency and nondeterminism.
+    This script remains as an opt-in tool for "watch a normal Steam session" workflows.
+    """
+    if str(os.environ.get("METABONK_WATCH_VISUAL_ACK", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    print(
+        "[watch_visual] WARN: portal/ScreenCast capture is deprecated for production training.\n"
+        "[watch_visual] WARN: Use Synthetic Eye for the gold stack. To silence this warning, set:\n"
+        "  METABONK_WATCH_VISUAL_ACK=1",
+        file=sys.stderr,
+        flush=True,
+    )
+
 # Ensure repo root is on sys.path when executed as a script (so `import src.*` works).
 _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
@@ -331,6 +349,8 @@ def main() -> int:
     ap.add_argument("--max-elements", type=int, default=32)
     ap.add_argument("--hz", type=float, default=float(os.environ.get("METABONK_DEMO_HZ", "10")))
     args = ap.parse_args()
+
+    _warn_deprecated_portal_capture()
 
     lock = _acquire_singleton_lock(_repo_root)
     if lock is None:

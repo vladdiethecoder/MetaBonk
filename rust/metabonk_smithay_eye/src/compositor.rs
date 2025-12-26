@@ -3,14 +3,16 @@ use std::{
     collections::BinaryHeap,
     collections::HashMap,
     fs,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::Instant,
     time::Duration,
+    time::Instant,
 };
 
 use anyhow::Context;
+use nix::ioctl_readwrite;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use smithay::{
     delegate_compositor, delegate_seat, delegate_xdg_shell, delegate_xwayland_shell,
@@ -46,7 +48,7 @@ use smithay::{
             DmabufState,
             ImportNotifier,
         },
-        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjHandler, DrmSyncobjState},
+        drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState},
         output::OutputHandler,
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData},
         shm::{self, ShmHandler, ShmState},
@@ -65,6 +67,37 @@ use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_agent_v1::{self, ZmetabonkAgentV1};
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_orchestrator_v1::{self, ZmetabonkOrchestratorV1};
 use crate::protocols::wl_drm::server::wl_drm::{self, WlDrm};
+
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+#[allow(dead_code)]
+const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+ioctl_readwrite!(dma_buf_export_sync_file, b'b', 2, DmaBufExportSyncFile);
+
+fn export_dmabuf_read_sync_file(dmabuf: &Dmabuf) -> anyhow::Result<Option<OwnedFd>> {
+    let Some(handle) = dmabuf.handles().next() else {
+        return Ok(None);
+    };
+    let dmabuf_fd: RawFd = handle.as_raw_fd();
+    let mut arg = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: ioctl operates on the dmabuf fd and writes into `arg`.
+    unsafe { dma_buf_export_sync_file(dmabuf_fd, &mut arg) }.context("DMA_BUF_IOCTL_EXPORT_SYNC_FILE")?;
+    if arg.fd < 0 {
+        return Ok(None);
+    }
+    // SAFETY: kernel returned a new fd for us to own.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(arg.fd) }))
+}
 
 #[derive(Default)]
 struct ClientState {
@@ -188,6 +221,12 @@ struct AgentHandleData {
     pid: u32,
 }
 
+#[derive(Debug)]
+pub struct LatestDmabuf {
+    pub dmabuf: Dmabuf,
+    pub acquire_fence: Option<OwnedFd>,
+}
+
 pub struct EyeCompositor {
     compositor_state: CompositorState,
     xwayland_shell_state: XWaylandShellState,
@@ -218,7 +257,7 @@ pub struct EyeCompositor {
     x11_windows: Vec<X11Surface>,
     export_period: Arc<Mutex<Duration>>,
     export_size: Arc<Mutex<(u32, u32)>>,
-    latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
+    latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
     primary_surface: Option<ObjectId>,
     xwayland_ready_at: Option<Instant>,
     last_no_buffer_log_at: Instant,
@@ -237,7 +276,7 @@ impl EyeCompositor {
         output: Output,
         export_period: Arc<Mutex<Duration>>,
         export_size: Arc<Mutex<(u32, u32)>>,
-        latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
+        latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
         dmabuf_state: DmabufState,
         drm_syncobj_state: Option<DrmSyncobjState>,
         dmabuf_global: DmabufGlobal,
@@ -628,8 +667,76 @@ impl CompositorHandler for EyeCompositor {
                         }
                     }
                 }
+                let mut acquire_fd: Option<OwnedFd> = None;
+                if self.drm_syncobj_state.is_some() {
+                    let mut guard = data.cached_state.get::<DrmSyncobjCachedState>();
+                    let sync_state = guard.current();
+                    let has_acquire = sync_state.acquire_point.is_some();
+                    let has_release = sync_state.release_point.is_some();
+                    let pid = surface
+                        .client()
+                        .map(|c| Self::pid_for_client(&c))
+                        .unwrap_or(0);
+                    info!(
+                        pid,
+                        surface = ?surface.id(),
+                        acquire = has_acquire,
+                        release = has_release,
+                        "drm syncobj points on commit"
+                    );
+                    if !has_acquire {
+                        warn!(pid, surface = ?surface.id(), "drm syncobj commit missing acquire point");
+                    }
+                    if !has_release {
+                        warn!(pid, surface = ?surface.id(), "drm syncobj commit missing release point");
+                    }
+                    if let Some(point) = sync_state.acquire_point.as_ref() {
+                        match point.export_sync_file() {
+                            Ok(fd) => {
+                                acquire_fd = Some(fd);
+                            }
+                            Err(err) => {
+                                warn!("failed to export acquire sync_file fd: {err}");
+                            }
+                        }
+                    }
+                } else {
+                    let pid = surface
+                        .client()
+                        .map(|c| Self::pid_for_client(&c))
+                        .unwrap_or(0);
+                    warn!(pid, surface = ?surface.id(), "drm syncobj global disabled; no explicit sync points");
+                }
+
+                if acquire_fd.is_none() {
+                    let pid = surface
+                        .client()
+                        .map(|c| Self::pid_for_client(&c))
+                        .unwrap_or(0);
+                    match export_dmabuf_read_sync_file(&dmabuf) {
+                        Ok(Some(fd)) => {
+                            info!(
+                                pid,
+                                surface = ?surface.id(),
+                                fence_fd = fd.as_raw_fd(),
+                                "exported implicit dmabuf sync_file fence (read)"
+                            );
+                            acquire_fd = Some(fd);
+                        }
+                        Ok(None) => {
+                            info!(pid, surface = ?surface.id(), "no implicit dmabuf sync_file fence exported");
+                        }
+                        Err(err) => {
+                            warn!(pid, surface = ?surface.id(), "failed to export implicit dmabuf sync_file fence: {err}");
+                        }
+                    }
+                }
+
                 let mut g = self.latest_dmabuf.lock().unwrap();
-                *g = Some(dmabuf.clone());
+                *g = Some(LatestDmabuf {
+                    dmabuf: dmabuf.clone(),
+                    acquire_fence: acquire_fd,
+                });
             } else {
                 // Ignore SHM buffers to preserve the GPU-only contract. Do NOT clear latest_dmabuf here:
                 // some clients briefly commit SHM surfaces (cursor/overlays) even while the main window
@@ -1128,7 +1235,7 @@ pub fn spawn_wayland_xwayland_thread(
     main_dev: libc::dev_t,
     export_period: Arc<Mutex<Duration>>,
     export_size: Arc<Mutex<(u32, u32)>>,
-    latest_dmabuf: Arc<Mutex<Option<Dmabuf>>>,
+    latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
 ) -> std::thread::JoinHandle<anyhow::Result<()>> {
     std::thread::spawn(move || {
         // Assumes the parent has set XDG_RUNTIME_DIR to `run_dir` for this process.
@@ -1262,7 +1369,6 @@ pub fn spawn_wayland_xwayland_thread(
         let drm_syncobj_state: Option<DrmSyncobjState> = (|| {
             use smithay::backend::drm::DrmDeviceFd;
             use smithay::utils::DeviceFd;
-            use std::os::fd::OwnedFd;
             use std::os::unix::fs::MetadataExt;
 
             // Prefer the render node matching linux-dmabuf feedback main device.

@@ -5,17 +5,22 @@ mod protocols;
 mod vulkan_producer;
 mod xwayland_watchdog;
 
-use std::{fs, sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
+use std::{
+    fs,
+    os::fd::IntoRawFd,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use clap::Parser;
 use metabonk_frame_abi::{FrameV1, MsgType, PlaneV1, ResetV1};
-use smithay::backend::allocator::dmabuf::Dmabuf;
 use tracing::{debug, info, warn};
 
 use crate::{
     args::Args,
-    compositor::spawn_wayland_xwayland_thread,
+    compositor::{spawn_wayland_xwayland_thread, LatestDmabuf},
     frame_socket::FrameServer,
     vulkan_producer::{VkSelect, VulkanProducer},
 };
@@ -42,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let sock_path = args.resolved_frame_sock();
     let mut server = FrameServer::bind(&sock_path)?;
 
-    let latest_dmabuf: Arc<Mutex<Option<Dmabuf>>> = Arc::new(Mutex::new(None));
+    let latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>> = Arc::new(Mutex::new(None));
     let export_period: Arc<Mutex<Duration>> = Arc::new(Mutex::new(Duration::from_secs_f64(
         1.0 / f64::from(args.fps.max(1)),
     )));
@@ -128,7 +133,14 @@ fn main() -> anyhow::Result<()> {
         }
         prev_connected = connected_now;
 
-        let dmabuf = latest_dmabuf.lock().unwrap().clone();
+        let (dmabuf, acquire_fd) = {
+            let mut guard = latest_dmabuf.lock().unwrap();
+            if let Some(latest) = guard.as_mut() {
+                (Some(latest.dmabuf.clone()), latest.acquire_fence.take())
+            } else {
+                (None, None)
+            }
+        };
         if !saw_xwayland_dmabuf && dmabuf.is_some() {
             saw_xwayland_dmabuf = true;
             info!("XWayland DMA-BUF source detected; exporting composed frames");
@@ -166,18 +178,19 @@ fn main() -> anyhow::Result<()> {
         }
 
         let render_res = if let Some(d) = dmabuf.as_ref() {
+            let wait_fd = acquire_fd.map(|fd| fd.into_raw_fd());
             if args.xwayland && passthrough {
                 let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
-                producer.render_passthrough_dmabuf(d, Some((w, h)))
+                producer.render_passthrough_dmabuf(d, Some((w, h)), wait_fd)
             } else {
-                match producer.render_from_dmabuf(d) {
+                match producer.render_from_dmabuf(d, wait_fd) {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         if args.xwayland && passthrough {
                             // Optional fallback within GPU-only constraints.
                             warn!("render_from_dmabuf failed; falling back to passthrough: {e}");
                             let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
-                            producer.render_passthrough_dmabuf(d, Some((w, h)))
+                            producer.render_passthrough_dmabuf(d, Some((w, h)), None)
                         } else {
                             warn!("render_from_dmabuf failed with passthrough disabled: {e}");
                             Err(e)

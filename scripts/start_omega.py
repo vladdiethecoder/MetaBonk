@@ -20,6 +20,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import signal
 import subprocess
@@ -68,6 +69,17 @@ def _truthy(value: Optional[str]) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _file_sha256(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
 
 
 def _read_memavailable_mb() -> Optional[int]:
@@ -1375,6 +1387,34 @@ def main() -> int:
                         "Build it with: (cd rust && cargo build -p metabonk_smithay_eye --release) "
                         "or set METABONK_SYNTHETIC_EYE_BIN."
                     )
+                eye_path = Path(eye_bin)
+                eye_sha = _file_sha256(eye_path)
+                try:
+                    eye_stat = eye_path.stat()
+                    eye_size = eye_stat.st_size
+                    eye_mtime = int(eye_stat.st_mtime)
+                except Exception:
+                    eye_size = None
+                    eye_mtime = None
+                if eye_sha:
+                    print(
+                        "[start_omega] synthetic eye bin: "
+                        f"{eye_bin} (sha256={eye_sha} size={eye_size} mtime={eye_mtime})"
+                    )
+                else:
+                    print(f"[start_omega] synthetic eye bin: {eye_bin} (sha256=unavailable)")
+                expected_sha = str(os.environ.get("METABONK_SYNTHETIC_EYE_BIN_SHA256") or "").strip()
+                if expected_sha:
+                    if not eye_sha:
+                        raise SystemExit(
+                            "[start_omega] ERROR: METABONK_SYNTHETIC_EYE_BIN_SHA256 set but failed to hash "
+                            f"{eye_bin}"
+                        )
+                    if eye_sha.lower() != expected_sha.lower():
+                        raise SystemExit(
+                            "[start_omega] ERROR: synthetic eye bin sha256 mismatch: "
+                            f"expected {expected_sha} got {eye_sha}"
+                        )
 
                 default_root = None
                 try:

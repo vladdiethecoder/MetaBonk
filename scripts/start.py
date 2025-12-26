@@ -369,6 +369,20 @@ def main() -> int:
     # so we don't strand GPU-heavy instances.
     _cleanup_previous_job(repo_root)
 
+    # Gold-stack enforcement: Synthetic Eye is the canonical capture path for train/play.
+    # Allow opt-out only when explicitly acknowledged (e.g., bring-up/debug on unsupported hosts).
+    if args.mode in ("train", "play") and not bool(getattr(args, "synthetic_eye", False)):
+        if str(os.environ.get("METABONK_ALLOW_LEGACY_CAPTURE", "") or "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            raise SystemExit(
+                "[start] ERROR: --no-synthetic-eye is not allowed for train/play in the gold stack.\n"
+                "[start] ERROR: Set METABONK_ALLOW_LEGACY_CAPTURE=1 to override (debug only)."
+            )
+
     # Base env for everything we spawn.
     env = os.environ.copy()
     # Default Synthetic Eye passthrough off (use Vulkan export path).
@@ -620,8 +634,10 @@ def main() -> int:
             omega_cmd += ["--workers", "0"]
         if args.mode == "dream":
             omega_cmd += ["--experiment", args.experiment, "--device", args.device]
-        omega = _spawn("omega", omega_cmd, cwd=repo_root, env=env)
+        omega_log = logs_dir / "omega.log"
+        omega = _spawn("omega", omega_cmd, cwd=repo_root, env=env, stdout_path=omega_log)
         procs.append(omega)
+        print(f"[start] omega logs -> {omega_log}")
         # Persist job group so we can clean up if the launcher is killed abruptly.
         if omega and os.name == "posix":
             try:
@@ -673,9 +689,11 @@ def main() -> int:
             if args.ui_install or not (frontend / "node_modules").exists():
                 subprocess.check_call(["npm", "install"], cwd=str(frontend), env=env)
             ui_cmd = ["npm", "run", "dev", "--", "--host", args.ui_host, "--port", str(args.ui_port)]
-            ui = _spawn("ui", ui_cmd, cwd=frontend, env=env, job_pgid=job_pgid)
+            ui_log = logs_dir / "ui.log"
+            ui = _spawn("ui", ui_cmd, cwd=frontend, env=env, job_pgid=job_pgid, stdout_path=ui_log)
             procs.append(ui)
             print(f"[start] ui -> http://{args.ui_host}:{args.ui_port}")
+            print(f"[start] ui logs -> {ui_log}")
 
         if args.save_video_proof:
             proof_log = logs_dir / "proof.log"
@@ -718,6 +736,8 @@ def main() -> int:
             wenv = env.copy()
             wenv.setdefault("VISION_URL", f"http://127.0.0.1:{args.vision_port}")
             wenv.setdefault("LEARNER_URL", f"http://127.0.0.1:{args.learner_port}")
+            # watch_visual uses the ScreenCast portal; keep it explicitly "acknowledged" in this mode.
+            wenv.setdefault("METABONK_WATCH_VISUAL_ACK", "1")
             wcmd = [
                 py,
                 "-u",
