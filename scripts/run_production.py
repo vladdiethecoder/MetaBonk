@@ -13,11 +13,14 @@ It is designed for a single-GPU workstation (e.g., RTX 5090).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Optional
+from urllib import request as urlrequest
 
 
 def _truthy(v: str) -> bool:
@@ -80,6 +83,45 @@ def _apply_production_defaults(env: dict[str, str]) -> None:
     # Autonomous defaults.
     env.setdefault("METABONK_AUTONOMOUS_MODE", "1")
 
+    # Conservative supervisor watchdog (run_production only).
+    env.setdefault("METABONK_PROD_WATCHDOG", "1")
+
+
+def _fetch_json(url: str, *, timeout_s: float) -> Optional[dict[str, Any]]:
+    try:
+        req = urlrequest.Request(url, headers={"Accept": "application/json"})
+        with urlrequest.urlopen(req, timeout=max(0.5, float(timeout_s))) as resp:
+            raw = resp.read()
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _monitor_should_restart(orch_url: str, *, window_s: float) -> tuple[bool, str]:
+    """Return (should_restart, reason) based on orchestrator health.
+
+    This intentionally only watches for "late" heartbeats: it is the most
+    reliable signal that the control loop is stalled. Stream health can be
+    flaky on systems without PipeWire/encoders, so we avoid using it as a hard
+    gate here.
+    """
+    u = str(orch_url or "").rstrip("/")
+    if not u:
+        return False, ""
+    health = _fetch_json(f"{u}/overview/health?window={float(window_s):.1f}", timeout_s=1.0)
+    if not isinstance(health, dict):
+        return True, "orch_unreachable"
+    hb = health.get("heartbeat") if isinstance(health.get("heartbeat"), dict) else {}
+    try:
+        late = int(hb.get("late") or 0)
+    except Exception:
+        late = 0
+    if late > 0:
+        return True, f"late_heartbeats={late}"
+    return False, ""
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="MetaBonk production launcher")
@@ -126,8 +168,54 @@ def main() -> int:
     while True:
         print(f"[run_production] starting omega (attempt {restarts + 1})", flush=True)
         p = subprocess.Popen(cmd, env=env)
+        start_ts = time.time()
+        # Watchdog (optional): if the orchestrator reports stalled heartbeats for a sustained
+        # period, restart the whole omega stack. This is intentionally conservative.
+        watchdog_enabled = _truthy(env.get("METABONK_PROD_WATCHDOG", "1"))
         try:
-            ret = p.wait()
+            grace_s = float(env.get("METABONK_PROD_WATCHDOG_GRACE_S", "30.0"))
+        except Exception:
+            grace_s = 30.0
+        try:
+            poll_s = float(env.get("METABONK_PROD_WATCHDOG_POLL_S", "2.0"))
+        except Exception:
+            poll_s = 2.0
+        try:
+            max_bad = int(env.get("METABONK_PROD_WATCHDOG_MAX_BAD", "3"))
+        except Exception:
+            max_bad = 3
+        try:
+            window_s = float(env.get("METABONK_PROD_WATCHDOG_WINDOW_S", "30.0"))
+        except Exception:
+            window_s = 30.0
+        max_bad = max(1, int(max_bad))
+        poll_s = max(0.5, float(poll_s))
+        window_s = max(10.0, float(window_s))
+        orch_url = str(env.get("ORCHESTRATOR_URL", "http://127.0.0.1:8040") or "").strip()
+        bad = 0
+        try:
+            while True:
+                ret = p.poll()
+                if ret is not None:
+                    break
+                if watchdog_enabled and (time.time() - start_ts) >= float(grace_s):
+                    should_restart, reason = _monitor_should_restart(orch_url, window_s=window_s)
+                    if should_restart:
+                        bad += 1
+                        if bad >= max_bad:
+                            print(
+                                f"[run_production] watchdog triggered ({reason}); restarting omega",
+                                flush=True,
+                            )
+                            try:
+                                p.terminate()
+                            except Exception:
+                                pass
+                    else:
+                        bad = 0
+                time.sleep(poll_s)
+            if ret is None:
+                ret = 1
         except KeyboardInterrupt:
             try:
                 p.terminate()
@@ -158,4 +246,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
