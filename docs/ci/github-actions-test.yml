@@ -1,0 +1,31 @@
+name: MetaBonk Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run tests
+        env:
+          # Keep heavyweight or external-infra tests opt-in.
+          METABONK_ENABLE_INTEGRATION_TESTS: "0"
+          METABONK_RUN_BENCHMARKS: "0"
+        run: |
+          pytest -q
+
