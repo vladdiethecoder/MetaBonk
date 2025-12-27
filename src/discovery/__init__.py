@@ -12,7 +12,8 @@ from .input_enumerator import InputEnumerator
 from .input_explorer import InputExplorer, InteractionEnv
 from .effect_detector import EffectDetector
 from .action_semantics import ActionSemanticLearner
-from .action_space_constructor import LearnedActionSpace
+from .semantic_clusterer import SemanticClusterer
+from .action_space_constructor import ActionSpaceConstructor, LearnedActionSpace
 from .pipeline import AutonomousDiscoveryPipeline, DiscoveryArtifacts
 from .input_seed import select_seed_buttons
 
@@ -35,6 +36,8 @@ __all__ = [
     "InputEnumerator",
     "InputExplorer",
     "InteractionEnv",
+    "ActionSpaceConstructor",
     "LearnedActionSpace",
+    "SemanticClusterer",
     "select_seed_buttons",
 ]

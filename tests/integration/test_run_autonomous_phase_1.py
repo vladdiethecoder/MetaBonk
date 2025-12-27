@@ -47,14 +47,18 @@ def test_run_autonomous_phase_1_writes_effect_map(tmp_path: Path) -> None:
     assert out_path.exists()
 
     effect_map = json.loads(out_path.read_text(encoding="utf-8"))
-    assert "MOVE_RIGHT" in effect_map
+    assert "metadata" in effect_map and "results" in effect_map
+    assert "MOVE_RIGHT" in effect_map["results"]
 
     # Ensure at least one probe is reward-driven.
     saw_goal_progress = False
-    for _input_id, effects in effect_map.items():
-        if isinstance(effects, list):
-            for item in effects:
-                if isinstance(item, list) and len(item) == 2 and isinstance(item[1], dict):
-                    if item[1].get("category") == "goal_progress":
-                        saw_goal_progress = True
+    for _input_id, probes in effect_map["results"].items():
+        if not isinstance(probes, list):
+            continue
+        for probe in probes:
+            if not isinstance(probe, dict):
+                continue
+            eff = probe.get("effect")
+            if isinstance(eff, dict) and eff.get("category") == "goal_progress":
+                saw_goal_progress = True
     assert saw_goal_progress
