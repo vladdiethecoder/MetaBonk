@@ -9,6 +9,7 @@ from .paired import (
     EpisodeResult,
     DomainRandomization,
 )
+from .auto_curriculum import AutoCurriculum, TaskGenerator, TaskSpec
 
 __all__ = [
     "PAIREDCurriculum",
@@ -18,4 +19,7 @@ __all__ = [
     "LevelDifficulty",
     "EpisodeResult",
     "DomainRandomization",
+    "AutoCurriculum",
+    "TaskGenerator",
+    "TaskSpec",
 ]
