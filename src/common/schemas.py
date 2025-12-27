@@ -241,6 +241,43 @@ class RolloutBatch(MBBaseModel):
     eval_clip_url: Optional[str] = None
 
 
+class PixelRolloutBatch(MBBaseModel):
+    """On-policy rollout batch where observations are pixel tensors.
+
+    This is a pragmatic transport ABI for end-to-end vision RL:
+      - Workers collect uint8 RGB frames (CHW) at a configured resolution.
+      - Frames are concatenated (T*C*H*W bytes), zlib-compressed, then base64 encoded.
+      - Learner decodes to a uint8 tensor shaped (T, C, H, W).
+
+    Rationale: keep the HTTP/JSON transport while avoiding enormous float payloads.
+    """
+
+    instance_id: str
+    policy_name: str
+    hparams: Optional[Dict[str, Any]] = None
+
+    obs_width: int
+    obs_height: int
+    obs_channels: int = 3
+    obs_dtype: str = "uint8"
+    obs_zlib_b64: str
+
+    actions_cont: list[list[float]]
+    actions_disc: list[list[int]]
+    action_masks: Optional[list[list[int]]] = None
+    rewards: list[float]
+    dones: list[bool]
+    log_probs: Optional[list[float]] = None
+    values: Optional[list[float]] = None
+    seq_lens: Optional[list[int]] = None
+    truncated: Optional[bool] = None
+    episode_returns: Optional[list[float]] = None
+    episode_lengths: Optional[list[int]] = None
+    eval_mode: Optional[bool] = None
+    eval_seed: Optional[int] = None
+    eval_clip_url: Optional[str] = None
+
+
 class DemoBatch(MBBaseModel):
     """Supervised demo batch (e.g., 'watch me play' imitation updates).
 

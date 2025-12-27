@@ -13,6 +13,7 @@
     "@react-three/fiber": "^8.17.10",
     "@react-three/postprocessing": "^2.16.1",
     "@tanstack/react-query": "^5.62.0",
+    "@tauri-apps/api": "^2.9.1",
     "cytoscape": "^3.33.1",
     "leva": "^0.9.35",
     "maath": "^0.10.7",

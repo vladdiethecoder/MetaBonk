@@ -15,6 +15,7 @@ import base64
 import io
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -234,6 +235,31 @@ class PolicyLearner:
         self.net = net_cls(obs_dim, cfg).to(self.device)
         self.opt = optim.Adam(self.net.parameters(), lr=cfg.learning_rate)
         self.version = 0
+        self._amp_enabled = False
+        self._amp_dtype = torch.float16
+        self._amp_scaler = None
+        try:
+            want_amp = str(os.environ.get("METABONK_PPO_AMP", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+            if want_amp and self.device.type == "cuda":
+                dtype_s = str(os.environ.get("METABONK_PPO_AMP_DTYPE", "bf16") or "").strip().lower()
+                if dtype_s in ("bf16", "bfloat16"):
+                    self._amp_dtype = torch.bfloat16
+                else:
+                    self._amp_dtype = torch.float16
+                if self._amp_dtype == torch.bfloat16:
+                    try:
+                        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+                            self._amp_dtype = torch.float16
+                    except Exception:
+                        self._amp_dtype = torch.float16
+                if self._amp_dtype == torch.float16:
+                    from torch.cuda.amp import GradScaler
+
+                    self._amp_scaler = GradScaler()
+                self._amp_enabled = True
+        except Exception:
+            self._amp_enabled = False
+            self._amp_scaler = None
 
         # Dreamer-style latent actor (initialized lazily on first dream update).
         self.dream_actor: Optional[nn.Module] = None
@@ -348,6 +374,16 @@ class PolicyLearner:
         adv, returns = compute_gae(rewards, dones, values_plus, cfg.gamma, cfg.gae_lambda)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
+        amp_enabled = bool(getattr(self, "_amp_enabled", False)) and self.device.type == "cuda"
+        amp_dtype = getattr(self, "_amp_dtype", torch.float16)
+        scaler = getattr(self, "_amp_scaler", None)
+        if amp_enabled:
+            from torch.cuda.amp import autocast
+
+            amp_ctx = lambda: autocast(enabled=True, dtype=amp_dtype)  # noqa: E731
+        else:
+            amp_ctx = lambda: nullcontext()  # noqa: E731
+
         if not cfg.use_lstm:
             # Mini-batch updates (feed-forward).
             B = obs.shape[0]
@@ -369,37 +405,48 @@ class PolicyLearner:
                     mb_adv = adv[mb]
 
                     mb_mask = action_masks[mb] if action_masks is not None else None
-                    cont_dist, disc_dists, value = self.net.dist_and_value(
-                        mb_obs, action_mask=mb_mask
-                    )
-                    cont_lp = cont_dist.log_prob(mb_actions_cont).sum(-1)
-                    disc_lp = torch.zeros_like(cont_lp)
-                    disc_ent = torch.zeros_like(cont_lp)
-                    for i, dist in enumerate(disc_dists):
-                        disc_lp += dist.log_prob(mb_actions_disc[:, i])
-                        disc_ent += dist.entropy()
-                    new_lp = cont_lp + disc_lp
-                    entropy = cont_dist.entropy().sum(-1) + disc_ent
+                    with amp_ctx():
+                        cont_dist, disc_dists, value = self.net.dist_and_value(
+                            mb_obs, action_mask=mb_mask
+                        )
+                        cont_lp = cont_dist.log_prob(mb_actions_cont).sum(-1)
+                        disc_lp = torch.zeros_like(cont_lp)
+                        disc_ent = torch.zeros_like(cont_lp)
+                        for i, dist in enumerate(disc_dists):
+                            disc_lp += dist.log_prob(mb_actions_disc[:, i])
+                            disc_ent += dist.entropy()
+                        new_lp = cont_lp + disc_lp
+                        entropy = cont_dist.entropy().sum(-1) + disc_ent
 
-                    ratio = torch.exp(new_lp - mb_old_lp)
-                    unclipped = ratio * mb_adv
-                    clipped = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range) * mb_adv
-                    policy_loss = -torch.min(unclipped, clipped).mean()
+                        ratio = torch.exp(new_lp - mb_old_lp)
+                        unclipped = ratio * mb_adv
+                        clipped = torch.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range) * mb_adv
+                        policy_loss = -torch.min(unclipped, clipped).mean()
 
-                    value_loss = 0.5 * (mb_returns - value).pow(2).mean()
-                    entropy_loss = -cfg.entropy_coef * entropy.mean()
+                        value_loss = 0.5 * (mb_returns - value).pow(2).mean()
+                        entropy_loss = -cfg.entropy_coef * entropy.mean()
 
-                    loss = policy_loss + value_loss + entropy_loss
+                        loss = policy_loss + value_loss + entropy_loss
 
-                    self.opt.zero_grad()
-                    loss.backward()
-                    gn = nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
+                    self.opt.zero_grad(set_to_none=True)
+                    if scaler is not None and amp_enabled:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(self.opt)
+                        gn = nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
+                        try:
+                            scaler.step(self.opt)
+                            scaler.update()
+                        except Exception:
+                            self.opt.step()
+                    else:
+                        loss.backward()
+                        gn = nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
+                        self.opt.step()
                     try:
                         grad_norm_sum += float(gn)
                         grad_norm_n += 1
                     except Exception:
                         pass
-                    self.opt.step()
 
                     losses["policy_loss"] += float(policy_loss.detach().cpu())
                     losses["value_loss"] += float(value_loss.detach().cpu())
@@ -463,17 +510,18 @@ class PolicyLearner:
                 actions_disc_seq = actions_disc[start:end].unsqueeze(0)
                 mask_seq = action_masks[start:end].unsqueeze(0) if action_masks is not None else None
 
-                cont_dist, disc_dists, value_seq = self.net.dist_and_value_sequence(
-                    obs_seq, action_mask=mask_seq
-                )
-                cont_lp = cont_dist.log_prob(actions_cont_seq).sum(-1)
-                disc_lp = torch.zeros_like(cont_lp)
-                disc_ent = torch.zeros_like(cont_lp)
-                for i, dist in enumerate(disc_dists):
-                    disc_lp += dist.log_prob(actions_disc_seq[..., i])
-                    disc_ent += dist.entropy()
-                new_lp = cont_lp + disc_lp
-                entropy = cont_dist.entropy().sum(-1) + disc_ent
+                with amp_ctx():
+                    cont_dist, disc_dists, value_seq = self.net.dist_and_value_sequence(
+                        obs_seq, action_mask=mask_seq
+                    )
+                    cont_lp = cont_dist.log_prob(actions_cont_seq).sum(-1)
+                    disc_lp = torch.zeros_like(cont_lp)
+                    disc_ent = torch.zeros_like(cont_lp)
+                    for i, dist in enumerate(disc_dists):
+                        disc_lp += dist.log_prob(actions_disc_seq[..., i])
+                        disc_ent += dist.entropy()
+                    new_lp = cont_lp + disc_lp
+                    entropy = cont_dist.entropy().sum(-1) + disc_ent
 
                 train_slice = slice(burn_in, T)
                 mb_old_lp = old_log_probs[start:end][train_slice]
@@ -494,7 +542,10 @@ class PolicyLearner:
 
                 train_len = T - burn_in
                 scale = train_len / max(1, cfg.minibatch_size)
-                (loss * scale).backward()
+                if scaler is not None and amp_enabled:
+                    scaler.scale(loss * scale).backward()
+                else:
+                    (loss * scale).backward()
                 accum_steps += train_len
 
                 losses["policy_loss"] += float(policy_loss.detach().cpu()) * train_len
@@ -502,24 +553,42 @@ class PolicyLearner:
                 losses["entropy"] += float(mb_entropy.mean().detach().cpu()) * train_len
 
                 if accum_steps >= cfg.minibatch_size:
+                    if scaler is not None and amp_enabled:
+                        scaler.unscale_(self.opt)
                     gn = nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
                     try:
                         grad_norm_sum += float(gn)
                         grad_norm_n += 1
                     except Exception:
                         pass
-                    self.opt.step()
+                    if scaler is not None and amp_enabled:
+                        try:
+                            scaler.step(self.opt)
+                            scaler.update()
+                        except Exception:
+                            self.opt.step()
+                    else:
+                        self.opt.step()
                     self.opt.zero_grad(set_to_none=True)
                     accum_steps = 0
 
             if accum_steps > 0:
+                if scaler is not None and amp_enabled:
+                    scaler.unscale_(self.opt)
                 gn = nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
                 try:
                     grad_norm_sum += float(gn)
                     grad_norm_n += 1
                 except Exception:
                     pass
-                self.opt.step()
+                if scaler is not None and amp_enabled:
+                    try:
+                        scaler.step(self.opt)
+                        scaler.update()
+                    except Exception:
+                        self.opt.step()
+                else:
+                    self.opt.step()
                 self.opt.zero_grad(set_to_none=True)
 
         self.version += 1

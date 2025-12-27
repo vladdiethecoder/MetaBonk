@@ -34,6 +34,7 @@ from src.common.device import resolve_device
 from src.common.schemas import (
     RegisterWorkerRequest,
     RolloutBatch,
+    PixelRolloutBatch,
     WeightsResponse,
     DemoBatch,
     VisualRolloutBatch,
@@ -75,6 +76,7 @@ _last_push_ts: Optional[float] = None
 _tps_ema: float = 0.0
 _merge_lock = threading.Lock()
 _policy_obs_dim: Dict[str, int] = {}
+_policy_obs_kind: Dict[str, str] = {}
 _ppo_ckpt_lock = threading.Lock()
 _ppo_last_save_ts: Dict[str, float] = {}
 _demo_lock = threading.Lock()
@@ -456,6 +458,58 @@ def _get_or_create(policy_name: str, obs_dim: int) -> PolicyLearner:
     return learner
 
 
+def _get_or_create_pixels(policy_name: str) -> PolicyLearner:
+    """Create a vision-first PPO learner for pixel observations."""
+    if policy_name in _learners:
+        learner = _learners[policy_name]
+        if learner.net.__class__.__name__ != "VisionActorCritic":
+            raise RuntimeError(
+                f"policy {policy_name} already exists with net={learner.net.__class__.__name__}, expected VisionActorCritic"
+            )
+        return learner
+
+    want_dev = str(os.environ.get("METABONK_LEARNER_DEVICE") or os.environ.get("METABONK_DEVICE") or "").strip()
+    want_dev = resolve_device(want_dev, context="learner")
+
+    cfg = PPOConfig()
+    try:
+        from .ppo import apply_env_overrides
+
+        cfg = apply_env_overrides(cfg)
+    except Exception:
+        pass
+    if os.environ.get("METABONK_PPO_USE_LSTM", "0") in ("1", "true", "True"):
+        cfg.use_lstm = True
+    try:
+        if os.environ.get("METABONK_PPO_SEQ_LEN"):
+            cfg.seq_len = int(os.environ.get("METABONK_PPO_SEQ_LEN", str(cfg.seq_len)))
+    except Exception:
+        pass
+    try:
+        if os.environ.get("METABONK_PPO_BURN_IN"):
+            cfg.burn_in = int(os.environ.get("METABONK_PPO_BURN_IN", str(cfg.burn_in)))
+    except Exception:
+        pass
+
+    from .vision_actor_critic import VisionActorCritic
+
+    learner = PolicyLearner(
+        obs_dim=0,
+        cfg=cfg,
+        device=want_dev,
+        net_cls=VisionActorCritic,
+    )
+    _learners[policy_name] = learner
+    _policy_obs_kind[policy_name] = "pixels"
+
+    # Resume if a prior PPO ckpt exists (best-effort).
+    try:
+        _try_load_ppo_weights(learner, policy_name=policy_name, obs_dim=0)
+    except Exception:
+        pass
+    return learner
+
+
 def _get_or_create_world_model(policy_name: str, obs_dim: int, action_dim: int, device: torch.device) -> WorldModel:
     if policy_name in _world_models:
         return _world_models[policy_name]
@@ -580,10 +634,16 @@ async def read_root():
 async def register_worker(req: RegisterWorkerRequest):
     # Workers can provide obs_dim in capabilities so we can warm-start immediately.
     try:
-        od = req.capabilities.get("obs_dim") if isinstance(req.capabilities, dict) else None
-        if od is not None:
-            _policy_obs_dim[req.policy_name] = int(od)
-            _get_or_create(req.policy_name, obs_dim=int(od))
+        caps = req.capabilities if isinstance(req.capabilities, dict) else {}
+        kind = str(caps.get("obs_kind") or "").strip().lower()
+        if kind == "pixels":
+            _policy_obs_kind[req.policy_name] = "pixels"
+            _get_or_create_pixels(req.policy_name)
+        else:
+            od = caps.get("obs_dim")
+            if od is not None:
+                _policy_obs_dim[req.policy_name] = int(od)
+                _get_or_create(req.policy_name, obs_dim=int(od))
     except Exception:
         pass
     return {"ok": True, "instance_id": req.instance_id, "policy_name": req.policy_name}
@@ -592,16 +652,22 @@ async def register_worker(req: RegisterWorkerRequest):
 @app.get("/get_weights", response_model=WeightsResponse)
 async def get_weights(policy_name: str, since_version: int = -1):
     if policy_name not in _learners:
-        # Try to warm-start if we know the obs_dim from worker registration.
-        od = _policy_obs_dim.get(policy_name)
-        if od is None:
+        if _policy_obs_kind.get(policy_name) == "pixels":
             try:
-                od = int(os.environ.get("METABONK_DEFAULT_OBS_DIM", "204"))
+                _get_or_create_pixels(policy_name)
             except Exception:
-                od = None
-        if od is None:
-            return WeightsResponse(policy_name=policy_name, weights_b64=None, version=0)
-        _get_or_create(policy_name, obs_dim=int(od))
+                return WeightsResponse(policy_name=policy_name, weights_b64=None, version=0)
+        else:
+            # Try to warm-start if we know the obs_dim from worker registration.
+            od = _policy_obs_dim.get(policy_name)
+            if od is None:
+                try:
+                    od = int(os.environ.get("METABONK_DEFAULT_OBS_DIM", "204"))
+                except Exception:
+                    od = None
+            if od is None:
+                return WeightsResponse(policy_name=policy_name, weights_b64=None, version=0)
+            _get_or_create(policy_name, obs_dim=int(od))
     learner = _learners[policy_name]
     try:
         if int(since_version) >= 0 and int(learner.version) <= int(since_version):
@@ -911,6 +977,151 @@ async def push_rollout(batch: RolloutBatch):
     # Persist weights so restarts don't go back to zero knowledge.
     try:
         _maybe_save_ppo_weights(learner, policy_name=batch.policy_name, obs_dim=obs_dim)
+    except Exception:
+        pass
+    return {"ok": True, "losses": losses}
+
+
+@app.post("/push_rollout_pixels")
+async def push_rollout_pixels(batch: PixelRolloutBatch):
+    """Pixel rollout endpoint for end-to-end vision PPO."""
+    global _last_push_ts, _tps_ema
+    T = len(batch.rewards or [])
+    if T <= 0:
+        raise HTTPException(status_code=400, detail="empty rollout")
+    if len(batch.dones or []) != T:
+        raise HTTPException(status_code=400, detail="dones length mismatch")
+    if len(batch.actions_cont or []) != T or len(batch.actions_disc or []) != T:
+        raise HTTPException(status_code=400, detail="action length mismatch")
+    if str(batch.obs_dtype or "").lower() not in ("uint8", "u8"):
+        raise HTTPException(status_code=400, detail="unsupported obs_dtype (expected uint8)")
+
+    learner = _get_or_create_pixels(batch.policy_name)
+    if batch.hparams:
+        try:
+            _apply_hparams(learner, batch.hparams)
+        except Exception:
+            pass
+
+    if batch.eval_mode:
+        # Reuse eval metric logic (reward/done-only).
+        metrics = _eval_metrics_from_batch(
+            RolloutBatch(
+                instance_id=batch.instance_id,
+                policy_name=batch.policy_name,
+                hparams=batch.hparams,
+                obs=[[0.0] for _ in range(T)],
+                actions_cont=batch.actions_cont,
+                actions_disc=batch.actions_disc,
+                action_masks=batch.action_masks,
+                rewards=batch.rewards,
+                dones=batch.dones,
+                log_probs=batch.log_probs,
+                values=batch.values,
+                seq_lens=batch.seq_lens,
+                truncated=batch.truncated,
+                episode_returns=batch.episode_returns,
+                episode_lengths=batch.episode_lengths,
+                eval_mode=True,
+                eval_seed=batch.eval_seed,
+                eval_clip_url=batch.eval_clip_url,
+            )
+        )
+        _record_eval_metrics(metrics)
+        _last_metrics[batch.policy_name] = {**_last_metrics.get(batch.policy_name, {}), **_sanitize_metrics(metrics)}
+        return {"ok": True, "policy_name": batch.policy_name, "eval": metrics}
+
+    freeze_policy = _policy_in_env_list(batch.policy_name, "METABONK_FREEZE_POLICIES")
+    shuffle_reward = _policy_in_env_list(batch.policy_name, "METABONK_REWARD_SHUFFLE_POLICIES")
+
+    # Decode observations.
+    try:
+        import base64 as _b64
+        import zlib
+        import numpy as np  # type: ignore
+
+        comp = _b64.b64decode(batch.obs_zlib_b64.encode("ascii"))
+        raw = zlib.decompress(comp)
+        expected = int(T) * int(batch.obs_channels) * int(batch.obs_height) * int(batch.obs_width)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        if int(arr.size) != int(expected):
+            raise ValueError(f"decoded obs bytes mismatch: got={arr.size} expected={expected}")
+        obs_np = arr.reshape(
+            int(T), int(batch.obs_channels), int(batch.obs_height), int(batch.obs_width)
+        ).copy()
+        obs_t = torch.from_numpy(obs_np)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"failed to decode obs: {e}") from e
+
+    actions_cont_t = to_tensor(batch.actions_cont)
+    actions_disc_t = to_tensor(batch.actions_disc, dtype=torch.long)
+    rewards_t = to_tensor(batch.rewards)
+    dones_t = to_tensor(batch.dones, dtype=torch.bool)
+    action_masks_t = None
+    if batch.action_masks:
+        try:
+            action_masks_t = to_tensor(batch.action_masks, dtype=torch.long)
+        except Exception:
+            action_masks_t = None
+    old_lp_t = to_tensor(batch.log_probs) if batch.log_probs is not None else None
+    old_vals_t = to_tensor(batch.values) if batch.values is not None else None
+
+    device = getattr(learner, "device", torch.device("cpu"))
+    obs_t = obs_t.to(device)
+    actions_cont_t = actions_cont_t.to(device)
+    actions_disc_t = actions_disc_t.to(device)
+    rewards_t = rewards_t.to(device)
+    dones_t = dones_t.to(device)
+    if action_masks_t is not None:
+        action_masks_t = action_masks_t.to(device)
+    if old_lp_t is not None:
+        old_lp_t = old_lp_t.to(device)
+    if old_vals_t is not None:
+        old_vals_t = old_vals_t.to(device)
+
+    if shuffle_reward:
+        try:
+            perm = torch.randperm(rewards_t.shape[0], device=rewards_t.device)
+            rewards_t = rewards_t[perm]
+        except Exception:
+            pass
+
+    if freeze_policy:
+        metrics = {
+            "policy_name": batch.policy_name,
+            "ts": time.time(),
+            "frozen": True,
+            "batch_steps": int(T),
+        }
+        _last_metrics[batch.policy_name] = {**_last_metrics.get(batch.policy_name, {}), **_sanitize_metrics(metrics)}
+        return {"ok": True, "policy_name": batch.policy_name, "frozen": True, "metrics": metrics}
+
+    losses = learner.update_from_rollout(
+        obs=obs_t,
+        actions_cont=actions_cont_t,
+        actions_disc=actions_disc_t,
+        rewards=rewards_t,
+        dones=dones_t,
+        action_masks=action_masks_t,
+        old_log_probs=old_lp_t,
+        old_values=old_vals_t,
+        seq_lens=batch.seq_lens,
+    )
+    losses["policy_name"] = batch.policy_name
+    losses["ts"] = time.time()
+
+    now = losses["ts"]
+    if _last_push_ts is not None:
+        dt = max(1e-6, now - _last_push_ts)
+        tps = int(T) / dt
+        _tps_ema = tps if _tps_ema == 0.0 else (0.9 * _tps_ema + 0.1 * tps)
+    _last_push_ts = now
+    losses["batch_steps"] = int(T)
+    losses["learner_tps"] = _tps_ema
+    _last_metrics[batch.policy_name] = _sanitize_metrics(losses)
+
+    try:
+        _maybe_save_ppo_weights(learner, policy_name=batch.policy_name, obs_dim=0)
     except Exception:
         pass
     return {"ok": True, "losses": losses}

@@ -12,6 +12,7 @@ use metabonk_frame_abi::{HeaderV1, MsgType, MAGIC, VERSION};
 use std::io::IoSlice;
 
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use nix::{errno::Errno, sys::socket::recv};
 use tracing::{debug, info, warn};
 
 pub struct FrameServer {
@@ -55,29 +56,36 @@ impl FrameServer {
     }
 
     fn handle_optional_hello(&self, stream: &mut UnixStream) -> anyhow::Result<()> {
+        let raw_fd = stream.as_raw_fd();
         let mut hdr = [0u8; HeaderV1::LEN];
-        // Best-effort: peek a header without blocking too long. If no HELLO is sent, proceed.
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(10)))
-            .ok();
-        let n = match stream.read(&mut hdr) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(_) => {
-                stream.set_read_timeout(None).ok();
-                return Ok(());
+        // Best-effort: peek without blocking. If no HELLO is queued, proceed.
+        match recv(raw_fd, &mut hdr, MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT) {
+            Ok(n) => {
+                if n < HeaderV1::LEN {
+                    return Ok(());
+                }
             }
-        };
-        stream.set_read_timeout(None).ok();
-        if n < HeaderV1::LEN {
-            return Ok(());
+            Err(Errno::EAGAIN) => return Ok(()),
+            Err(err) => return Err(anyhow::anyhow!("recv(MSG_PEEK) failed: {err}")),
         }
+
         if &hdr[0..8] != &MAGIC[..] || u16::from_le_bytes([hdr[8], hdr[9]]) != VERSION {
             return Ok(());
         }
-        let msg_type = u16::from_le_bytes([hdr[10], hdr[11]]);
-        if msg_type == MsgType::Hello as u16 {
-            debug!("received HELLO");
+        let header = match HeaderV1::decode(&hdr) {
+            Ok(h) => h,
+            Err(_) => return Ok(()),
+        };
+        if header.msg_type != MsgType::Hello {
+            return Ok(());
+        }
+        debug!("received HELLO");
+
+        // Consume the HELLO so subsequent reads see the next message (e.g., PING).
+        stream.read_exact(&mut hdr).context("read hello header")?;
+        if header.payload_len > 0 {
+            let mut payload = vec![0u8; header.payload_len as usize];
+            stream.read_exact(&mut payload).context("read hello payload")?;
         }
         Ok(())
     }
@@ -124,6 +132,48 @@ impl FrameServer {
                 warn!("sendmsg failed: {err}");
                 self.stream = None;
                 Err(anyhow::anyhow!("sendmsg failed: {err}"))
+            }
+        }
+    }
+
+    pub fn recv_message_type(&mut self) -> anyhow::Result<MsgType> {
+        self.accept_if_needed()?;
+        let Some(stream) = self.stream.as_mut() else {
+            anyhow::bail!("no worker connection");
+        };
+
+        let mut hdr_bytes = [0u8; HeaderV1::LEN];
+        if let Err(err) = stream.read_exact(&mut hdr_bytes) {
+            self.stream = None;
+            return Err(anyhow::anyhow!("read header failed: {err}"));
+        }
+        let header = HeaderV1::decode(&hdr_bytes).map_err(|e| anyhow::anyhow!("decode header failed: {e}"))?;
+        if header.fd_count != 0 {
+            warn!(
+                msg_type = ?header.msg_type,
+                fd_count = header.fd_count,
+                "received control message with unexpected fd_count; fds will be dropped"
+            );
+        }
+        let payload_len = header.payload_len as usize;
+        if payload_len > 0 {
+            // Payload is currently unused for control messages; drain it for framing correctness.
+            let mut payload = vec![0u8; payload_len];
+            if let Err(err) = stream.read_exact(&mut payload) {
+                self.stream = None;
+                return Err(anyhow::anyhow!("read payload failed: {err}"));
+            }
+        }
+        Ok(header.msg_type)
+    }
+
+    pub fn wait_for_ping(&mut self) -> anyhow::Result<()> {
+        loop {
+            let msg = self.recv_message_type()?;
+            match msg {
+                MsgType::Ping => return Ok(()),
+                // Ignore other control messages for now.
+                _ => continue,
             }
         }
     }

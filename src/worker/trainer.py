@@ -12,7 +12,7 @@ import io
 import time
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import torch
 
@@ -46,15 +46,24 @@ class Trainer:
                 pass
         if os.environ.get("METABONK_PPO_USE_LSTM", "0") in ("1", "true", "True"):
             self.cfg.use_lstm = True
-        net_cls = ActorCritic
-        # LNN Pilot backend is mandatory for pilot policies.
-        if "pilot" in (self.policy_name or "").lower():
+        net_cls: type[torch.nn.Module] = ActorCritic
+        obs_backend = str(os.environ.get("METABONK_OBS_BACKEND", "detections") or "").strip().lower()
+        if obs_backend in ("pixels", "hybrid"):
             try:
-                from src.learner.liquid_policy import LiquidActorCritic
+                from src.learner.vision_actor_critic import VisionActorCritic
 
-                net_cls = LiquidActorCritic
+                net_cls = VisionActorCritic
             except Exception:
                 net_cls = ActorCritic
+        else:
+            # LNN Pilot backend is mandatory for pilot policies.
+            if "pilot" in (self.policy_name or "").lower():
+                try:
+                    from src.learner.liquid_policy import LiquidActorCritic
+
+                    net_cls = LiquidActorCritic
+                except Exception:
+                    net_cls = ActorCritic
         self.net = net_cls(self.obs_dim, self.cfg).to(self.device)
         self.net.eval()
         self.lstm_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -67,14 +76,20 @@ class Trainer:
 
     @torch.no_grad()
     def act(
-        self, obs: List[float], action_mask: Optional[List[int]] = None
+        self, obs: Any, action_mask: Optional[List[int]] = None
     ) -> Tuple[List[float], List[int], float, float]:
         """Select an action given observation.
 
         Returns:
             actions_cont, actions_disc, log_prob, value
         """
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if isinstance(obs, torch.Tensor):
+            obs_t = obs.detach()
+            if obs_t.dim() in (1, 3):
+                obs_t = obs_t.unsqueeze(0)
+            obs_t = obs_t.to(device=self.device)
+        else:
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = None
         if action_mask is not None:
             mask_t = torch.tensor(action_mask, dtype=torch.long, device=self.device).unsqueeze(0)

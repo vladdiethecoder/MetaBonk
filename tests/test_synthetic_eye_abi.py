@@ -108,3 +108,34 @@ def test_frame_abi_reset_parses():
     finally:
         a.close()
         b.close()
+
+
+def test_frame_abi_send_ping_header():
+    from src.worker import frame_abi
+
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        cli = frame_abi.FrameSocketClient("/tmp/unused.sock")
+        cli.sock = a
+        cli.send_ping()
+
+        hdr = b.recv(frame_abi._HDR_STRUCT.size)  # type: ignore[attr-defined]
+        magic, ver, msg_type, payload_len, fd_count = frame_abi._HDR_STRUCT.unpack(hdr)  # type: ignore[attr-defined]
+        assert magic == frame_abi.MAGIC
+        assert int(ver) == frame_abi.VERSION
+        assert int(msg_type) == frame_abi.MSG_PING
+        assert int(payload_len) == 0
+        assert int(fd_count) == 0
+    finally:
+        try:
+            cli.close()
+        except Exception:
+            pass
+        try:
+            a.close()
+        except Exception:
+            pass
+        try:
+            b.close()
+        except Exception:
+            pass

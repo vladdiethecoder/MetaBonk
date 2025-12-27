@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
     SyntheticEyeCudaIngestor = None  # type: ignore
 from .trainer import Trainer
 from .perception import construct_observation
-from .rollout import LearnerClient, RolloutBuffer
+from .rollout import LearnerClient, RolloutBuffer, PixelRolloutBuffer
 from .nvenc_streamer import NVENCConfig, NVENCStreamer
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
@@ -284,23 +284,113 @@ class WorkerService:
         # (driver/gi/gstreamer mismatches). For stream HUD purposes we only need NVENC,
         # so keep capture opt-in and default it off.
         self._gst_capture_enabled = os.environ.get("METABONK_GST_CAPTURE", "0") in ("1", "true", "True")
+
+        # Synthetic Eye lock-step: advance one frame per step (PING -> next FRAME).
+        self._synthetic_eye_lockstep = False
+        self._synthetic_eye_lockstep_wait_s = 0.0
+        if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            self._synthetic_eye_lockstep = str(os.environ.get("METABONK_SYNTHETIC_EYE_LOCKSTEP", "0") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if not self._synthetic_eye_lockstep:
+                self._synthetic_eye_lockstep = str(os.environ.get("METABONK_EYE_LOCKSTEP", "0") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            try:
+                self._synthetic_eye_lockstep_wait_s = float(
+                    os.environ.get(
+                        "METABONK_SYNTHETIC_EYE_LOCKSTEP_WAIT_S",
+                        os.environ.get("METABONK_EYE_LOCKSTEP_WAIT_S", "0.5"),
+                    )
+                )
+            except Exception:
+                self._synthetic_eye_lockstep_wait_s = 0.5
+            self._synthetic_eye_lockstep_wait_s = max(0.0, float(self._synthetic_eye_lockstep_wait_s))
+
+        # Observation backend (policy input): detections (default) or pixels (end-to-end vision).
+        self._obs_backend = str(os.environ.get("METABONK_OBS_BACKEND", "detections") or "").strip().lower()
+        if not self._obs_backend:
+            self._obs_backend = "detections"
+        if self._obs_backend not in ("detections", "pixels", "hybrid"):
+            raise ValueError(f"invalid METABONK_OBS_BACKEND={self._obs_backend!r}")
+        self._pixel_obs_enabled = self._obs_backend in ("pixels", "hybrid")
+        self._pixel_obs_w = 0
+        self._pixel_obs_h = 0
+        self._pixel_ui_grid = str(os.environ.get("METABONK_PIXEL_UI_GRID", "") or "").strip().lower()
+        if not self._pixel_ui_grid:
+            # Reuse menu grid default but bias larger for pixel policies.
+            self._pixel_ui_grid = str(os.environ.get("METABONK_MENU_GRID", "8x8") or "8x8").strip().lower()
+        self._pixel_lock = threading.Lock()
+        self._latest_pixel_obs = None
+        self._latest_pixel_frame_id: Optional[int] = None
+        self._latest_pixel_ts: float = 0.0
+        self._latest_pixel_src_size: Optional[tuple[int, int]] = None
+        if self._pixel_obs_enabled:
+            if self._frame_source not in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+                raise RuntimeError(
+                    f"METABONK_OBS_BACKEND={self._obs_backend} requires METABONK_FRAME_SOURCE=synthetic_eye (got {self._frame_source!r})"
+                )
+            try:
+                import torch  # type: ignore
+
+                if not torch.cuda.is_available():
+                    raise RuntimeError("torch.cuda.is_available() is false")
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError(
+                    f"METABONK_OBS_BACKEND={self._obs_backend} requires torch+CUDA available: {e}"
+                ) from e
+            try:
+                self._pixel_obs_w = int(os.environ.get("METABONK_PIXEL_OBS_W", "128"))
+                self._pixel_obs_h = int(os.environ.get("METABONK_PIXEL_OBS_H", "128"))
+            except Exception:
+                self._pixel_obs_w = 128
+                self._pixel_obs_h = 128
+            if self._pixel_obs_w <= 0 or self._pixel_obs_h <= 0:
+                raise ValueError("METABONK_PIXEL_OBS_W/H must be positive")
+
         self._obs_dim_raw = int(obs_dim)
         env_stack = os.environ.get("METABONK_FRAME_STACK")
         try:
             stack = int(frame_stack) if frame_stack is not None else int(env_stack or 1)
         except Exception:
             stack = 1
-        self._frame_stack = max(1, stack)
+        # Pixel observations are already "high bandwidth"; prefer temporal memory (LSTM) to channel stacking.
+        if self._pixel_obs_enabled:
+            self._frame_stack = 1
+        else:
+            self._frame_stack = max(1, stack)
         self._obs_stack = deque(maxlen=self._frame_stack)
         stacked_dim = self._obs_dim_raw * self._frame_stack
-        self.trainer = Trainer(policy_name=policy_name, hparams=self.hparams, obs_dim=stacked_dim)
+        trainer_obs_dim = 0 if self._pixel_obs_enabled else stacked_dim
+        self.trainer = Trainer(policy_name=policy_name, hparams=self.hparams, obs_dim=int(trainer_obs_dim))
         self.learner = LearnerClient(self.learner_url)
-        self.rollout = RolloutBuffer(
-            instance_id=instance_id,
-            policy_name=policy_name,
-            hparams=self.hparams,
-            max_size=int(self.hparams.get("batch_size", 2048)),
-        )
+        if self._pixel_obs_enabled:
+            try:
+                max_size = int(os.environ.get("METABONK_PIXEL_ROLLOUT_MAX_SIZE", "256"))
+            except Exception:
+                max_size = 256
+            self.rollout = PixelRolloutBuffer(
+                instance_id=instance_id,
+                policy_name=policy_name,
+                hparams=self.hparams,
+                obs_width=int(self._pixel_obs_w),
+                obs_height=int(self._pixel_obs_h),
+                obs_channels=3,
+                max_size=max(1, int(max_size)),
+            )
+        else:
+            self.rollout = RolloutBuffer(
+                instance_id=instance_id,
+                policy_name=policy_name,
+                hparams=self.hparams,
+                max_size=int(self.hparams.get("batch_size", 2048)),
+            )
         self.rollout.eval_mode = os.environ.get("METABONK_EVAL_MODE", "0") in ("1", "true", "True")
         try:
             self.rollout.eval_seed = int(os.environ.get("METABONK_EVAL_SEED", "0")) or None
@@ -794,6 +884,20 @@ class WorkerService:
             except Exception:
                 self._use_sima2 = False
                 self._sima2_controller = None
+        # Optional MetaBonk2 tripartite controller backend (inference-first).
+        self._use_metabonk2 = os.environ.get("METABONK_USE_METABONK2", "0") in ("1", "true", "True")
+        self._metabonk2_controller = None
+        self._metabonk2_time_budget_ms = None
+        try:
+            raw_budget = os.environ.get("METABONK2_TIME_BUDGET_MS")
+            if raw_budget is not None and str(raw_budget).strip():
+                self._metabonk2_time_budget_ms = float(raw_budget)
+        except Exception:
+            self._metabonk2_time_budget_ms = None
+        # Avoid ambiguous dual overrides; MetaBonk2 takes precedence.
+        if self._use_metabonk2 and self._use_sima2:
+            self._use_sima2 = False
+            self._sima2_controller = None
         # Optional ResearchPlugin shared memory (deterministic MMF).
         self._use_research_shm = os.environ.get("METABONK_USE_RESEARCH_SHM", "0") in ("1", "true", "True")
         self._research_shm = None
@@ -1277,6 +1381,7 @@ class WorkerService:
                 }
             )
             self._init_input_backend()
+            self._init_metabonk2_controller()
             self._bind_input_window()
             # Synthetic Eye: start the socket reader thread early so the producer does not block on accept()
             # and so we can begin consuming frames immediately.
@@ -1342,6 +1447,7 @@ class WorkerService:
         except Exception as e:
             raise RuntimeError(f"[worker:{self.instance_id}] failed to discover gamescope Xwayland display: {e}") from e
         self._init_input_backend()
+        self._init_metabonk2_controller()
         self._bind_input_window()
         # Synthetic Eye: start the socket reader thread early so the producer does not block on accept()
         # and so we can begin consuming frames immediately.
@@ -1427,10 +1533,12 @@ class WorkerService:
                             if bool(getattr(self, "_capture_disabled", False)) or bool(getattr(self, "_capture_disabled_env", False)):
                                 self._synthetic_eye_ingestor.note_frame(frame)
                             else:
-                                if (
+                                want_pixels = bool(getattr(self, "_pixel_obs_enabled", False))
+                                want_audit = (
                                     os.environ.get("METABONK_VISION_AUDIT", "0") == "1"
                                     and int(frame.frame_id) % 60 == 0
-                                ):
+                                )
+                                if want_pixels or want_audit:
                                     h = None
                                     try:
                                         h = self._synthetic_eye_ingestor.begin(frame)
@@ -1464,16 +1572,69 @@ class WorkerService:
                                                 stream=h.stream,
                                             )
                                             raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
-                                            obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
-                                            mean_val = float(obs.mean().item())
-                                            std_val = float(obs.std().item())
-                                            self._dump_frame_to_png(obs, int(frame.frame_id), mean_val, std_val)
-                                            print(
-                                                f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
-                                                f"shape={tuple(obs.shape)} mean={mean_val:.4f} std={std_val:.4f} "
-                                                f"device={obs.device}",
-                                                flush=True,
-                                            )
+                                            obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
+
+                                            if want_pixels:
+                                                obs_small = None
+                                                try:
+                                                    import torch  # type: ignore
+                                                    import torch.nn.functional as F  # type: ignore
+
+                                                    for dt in (torch.float16, torch.float32):
+                                                        try:
+                                                            obs_f = obs_u8.unsqueeze(0).to(dtype=dt).div(255.0)
+                                                            obs_f = F.interpolate(
+                                                                obs_f,
+                                                                size=(int(self._pixel_obs_h), int(self._pixel_obs_w)),
+                                                                mode="bilinear",
+                                                                align_corners=False,
+                                                            )
+                                                            obs_small = (
+                                                                (obs_f.clamp(0.0, 1.0) * 255.0)
+                                                                .to(dtype=torch.uint8)
+                                                                .squeeze(0)
+                                                                .contiguous()
+                                                            )
+                                                            break
+                                                        except Exception:
+                                                            obs_small = None
+                                                            continue
+                                                except Exception:
+                                                    obs_small = None
+                                                if obs_small is not None:
+                                                    try:
+                                                        ts = float(getattr(frame, "timestamp", 0.0) or 0.0) or time.time()
+                                                    except Exception:
+                                                        ts = time.time()
+                                                    with self._pixel_lock:
+                                                        self._latest_pixel_obs = obs_small
+                                                        try:
+                                                            self._latest_pixel_frame_id = int(frame.frame_id)
+                                                        except Exception:
+                                                            self._latest_pixel_frame_id = None
+                                                        self._latest_pixel_ts = float(ts)
+                                                        try:
+                                                            self._latest_pixel_src_size = (
+                                                                int(frame.width),
+                                                                int(frame.height),
+                                                            )
+                                                        except Exception:
+                                                            self._latest_pixel_src_size = None
+
+                                            if want_audit:
+                                                try:
+                                                    obs_f32 = obs_u8.float().div(255.0)
+                                                    mean_val = float(obs_f32.mean().item())
+                                                    std_val = float(obs_f32.std().item())
+                                                    self._dump_frame_to_png(obs_f32, int(frame.frame_id), mean_val, std_val)
+                                                    print(
+                                                        f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                        f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                        f"device={obs_f32.device}",
+                                                        flush=True,
+                                                    )
+                                                except Exception:
+                                                    pass
                                         except Exception as e:
                                             print(
                                                 f"[VISION] worker={self.instance_id} tensor bridge failed: {e}",
@@ -1811,6 +1972,70 @@ class WorkerService:
                     self._obs_fps = float((len(self._obs_frame_times) - 1) / dt)
         except Exception:
             pass
+
+    def _get_latest_pixel_obs(self):
+        if not bool(getattr(self, "_pixel_obs_enabled", False)):
+            return None, None, None, None
+        try:
+            lock = getattr(self, "_pixel_lock", None)
+        except Exception:
+            lock = None
+        if lock is None:
+            return None, None, None, None
+        with lock:
+            obs = getattr(self, "_latest_pixel_obs", None)
+            frame_id = getattr(self, "_latest_pixel_frame_id", None)
+            ts = float(getattr(self, "_latest_pixel_ts", 0.0) or 0.0)
+            src_size = getattr(self, "_latest_pixel_src_size", None)
+        return obs, frame_id, ts, src_size
+
+    def _lockstep_request_next_frame(self, baseline_frame_id: Optional[int]) -> None:
+        if not bool(getattr(self, "_synthetic_eye_lockstep", False)):
+            return
+        try:
+            if not hasattr(self.stream, "request_frame"):
+                return
+        except Exception:
+            return
+        try:
+            ok = bool(getattr(self.stream, "request_frame")())
+        except Exception:
+            ok = False
+        if not ok:
+            return
+        try:
+            wait_s = float(getattr(self, "_synthetic_eye_lockstep_wait_s", 0.0) or 0.0)
+        except Exception:
+            wait_s = 0.0
+        if wait_s <= 0:
+            return
+        deadline = time.time() + wait_s
+        while not self._stop.is_set():
+            _obs, frame_id, _ts, _src = self._get_latest_pixel_obs()
+            if frame_id is not None:
+                try:
+                    if baseline_frame_id is None or int(frame_id) != int(baseline_frame_id):
+                        break
+                except Exception:
+                    break
+            if time.time() >= deadline:
+                break
+            self._stop.wait(0.001)
+
+    @staticmethod
+    def _parse_grid_spec(spec: str, *, default_rows: int = 8, default_cols: int = 8) -> tuple[int, int]:
+        raw = str(spec or "").strip().lower()
+        if not raw:
+            return int(default_rows), int(default_cols)
+        try:
+            parts = raw.split("x")
+            rows = int(parts[0])
+            cols = int(parts[1]) if len(parts) > 1 else rows
+            rows = max(1, rows)
+            cols = max(1, cols)
+            return rows, cols
+        except Exception:
+            return int(default_rows), int(default_cols)
 
     @staticmethod
     def _maybe_swizzle_channels(raw_tensor, drm_fourcc: int):
@@ -2931,6 +3156,22 @@ class WorkerService:
             self._input_backend = None
             self._input_menu_bootstrap = False
 
+    def _init_metabonk2_controller(self) -> None:
+        if not getattr(self, "_use_metabonk2", False) or self._metabonk2_controller is not None:
+            return
+        try:
+            from src.metabonk2.controller import MetaBonk2Controller, MetaBonk2ControllerConfig
+
+            specs = self._input_buttons or self._parse_input_buttons()
+            cfg = MetaBonk2ControllerConfig(
+                log_reasoning=os.environ.get("METABONK2_LOG", "0") in ("1", "true", "True"),
+                override_discrete=os.environ.get("METABONK2_OVERRIDE_DISCRETE", "1") in ("1", "true", "True"),
+            )
+            self._metabonk2_controller = MetaBonk2Controller(button_specs=specs, cfg=cfg)
+        except Exception:
+            self._use_metabonk2 = False
+            self._metabonk2_controller = None
+
     def _input_should_bootstrap(self, menu_hint: Optional[bool], game_state: dict) -> bool:
         if not self._input_backend or not self._input_menu_bootstrap:
             return False
@@ -3637,7 +3878,20 @@ class WorkerService:
 
     def _rollout_loop(self):
         # Register and warm weights.
-        self.learner.register(self.instance_id, self.policy_name, obs_dim=self.trainer.obs_dim)
+        caps: dict = {}
+        reg_obs_dim: Optional[int] = self.trainer.obs_dim
+        if bool(getattr(self, "_pixel_obs_enabled", False)):
+            reg_obs_dim = None
+            caps.update(
+                {
+                    "obs_kind": "pixels",
+                    "obs_width": int(getattr(self, "_pixel_obs_w", 0) or 0),
+                    "obs_height": int(getattr(self, "_pixel_obs_h", 0) or 0),
+                    "obs_channels": 3,
+                    "obs_dtype": "uint8",
+                }
+            )
+        self.learner.register(self.instance_id, self.policy_name, obs_dim=reg_obs_dim, capabilities=caps)
         last_pull = 0.0
         loop_t0 = time.time()
         learned_reward_grace_s = float(os.environ.get("METABONK_LEARNED_REWARD_GRACE_S", "5.0"))
@@ -4387,17 +4641,75 @@ class WorkerService:
                             forced_ui_click = None
             # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END
 
+            pixel_tensor = None
+            pixel_frame_id = None
+            pixel_src_size = None
+            if bool(getattr(self, "_pixel_obs_enabled", False)):
+                try:
+                    pixel_tensor, pixel_frame_id, _, pixel_src_size = self._get_latest_pixel_obs()
+                except Exception:
+                    pixel_tensor = None
+                    pixel_frame_id = None
+                    pixel_src_size = None
+                if frame_size is None and pixel_src_size is not None:
+                    try:
+                        frame_size = (int(pixel_src_size[0]), int(pixel_src_size[1]))
+                    except Exception:
+                        frame_size = frame_size
+                if (
+                    self._use_learned_reward
+                    and reward_frame_hwc is None
+                    and pixel_tensor is not None
+                ):
+                    try:
+                        import numpy as np  # type: ignore
+
+                        reward_frame_hwc = (
+                            pixel_tensor.detach()
+                            .to(device="cpu", non_blocking=False)
+                            .permute(1, 2, 0)
+                            .contiguous()
+                            .numpy()
+                        )
+                        if reward_frame_hwc is not None:
+                            reward_frame_hwc = np.asarray(reward_frame_hwc, dtype=np.uint8)
+                    except Exception:
+                        reward_frame_hwc = None
+                if pixel_tensor is None:
+                    if bool(getattr(self, "_synthetic_eye_lockstep", False)):
+                        # Prime the lock-step pipeline: request the first frame.
+                        self._lockstep_request_next_frame(None)
+                    now_wait = time.time()
+                    last_warn = float(getattr(self, "_pixel_wait_warn_ts", 0.0) or 0.0)
+                    if (now_wait - last_warn) > 5.0:
+                        self._pixel_wait_warn_ts = now_wait
+                        print(
+                            f"[worker:{self.instance_id}] waiting for pixel observations from Synthetic Eye...",
+                            flush=True,
+                        )
+                    self._stop.wait(0.01)
+                    continue
+
             ui_elements_cache = None
             action_mask_cache = None
             try:
-                from .perception import parse_detections, build_ui_candidates
+                from .perception import parse_detections, build_ui_candidates, build_grid_ui_elements
 
-                dets_parsed = parse_detections(detections)
-                ui_elements_cache, action_mask_cache, _ = build_ui_candidates(
-                    dets_parsed,
-                    frame_size=frame_size,
-                    menu_hint=menu_hint,
-                )
+                if bool(getattr(self, "_pixel_obs_enabled", False)) and not detections:
+                    rows, cols = self._parse_grid_spec(str(getattr(self, "_pixel_ui_grid", "")))
+                    ui_elements_cache, action_mask_cache = build_grid_ui_elements(
+                        frame_size,
+                        max_elements=32,
+                        rows=rows,
+                        cols=cols,
+                    )
+                else:
+                    dets_parsed = parse_detections(detections)
+                    ui_elements_cache, action_mask_cache, _ = build_ui_candidates(
+                        dets_parsed,
+                        frame_size=frame_size,
+                        menu_hint=menu_hint,
+                    )
             except Exception:
                 ui_elements_cache = None
                 action_mask_cache = None
@@ -4405,6 +4717,7 @@ class WorkerService:
             obs, action_mask = construct_observation(
                 detections,
                 obs_dim=self._obs_dim_raw,
+                pixel_tensor=pixel_tensor,
                 frame_size=frame_size,
                 menu_hint=menu_hint,
                 ui_override=ui_elements_cache,
@@ -4414,6 +4727,14 @@ class WorkerService:
 
             # Default policy action (PPO).
             action_mask_for_policy = action_mask if self._input_backend is None else None
+            if action_mask_for_policy is not None:
+                try:
+                    branches = list(getattr(self.trainer.cfg, "discrete_branches", []) or [])
+                    expected = int(branches[0]) if branches else None
+                    if expected is not None and len(action_mask_for_policy) != expected:
+                        action_mask_for_policy = None
+                except Exception:
+                    action_mask_for_policy = None
             action_source = self._action_source if self._gameplay_started else "policy"
             if self._gameplay_started and action_source == "random":
                 a_cont, a_disc = self._sample_random_action(action_mask_for_policy or action_mask)
@@ -4445,6 +4766,57 @@ class WorkerService:
                             flush=True,
                         )
             action_mask_for_rollout = action_mask_for_policy
+
+            # Optional MetaBonk2 backend override (tripartite mind).
+            if (
+                self._use_metabonk2
+                and self._metabonk2_controller is not None
+                and latest_image_bytes is not None
+                and not (self._gameplay_started and action_source == "random")
+            ):
+                try:
+                    import io
+                    import numpy as np
+                    from PIL import Image
+
+                    img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
+                    frame_arr = np.asarray(img)
+                    mb2_cont, mb2_disc = self._metabonk2_controller.step(
+                        frame_arr,
+                        game_state,
+                        time_budget_ms=self._metabonk2_time_budget_ms,
+                    )
+
+                    # Override discrete controls only when using OS-level input backend. In BonkLink
+                    # mode discrete actions can be semantic (e.g., UI click index).
+                    if (
+                        self._input_backend is not None
+                        and getattr(self._metabonk2_controller, "cfg", None) is not None
+                        and bool(getattr(self._metabonk2_controller.cfg, "override_discrete", False))
+                        and mb2_disc is not None
+                    ):
+                        if len(a_disc) > 0:
+                            disc = [int(x) for x in list(mb2_disc)]
+                            disc = disc[: len(a_disc)] + [0] * max(0, len(a_disc) - len(disc))
+                            a_disc = disc
+                        else:
+                            a_disc = [int(x) for x in list(mb2_disc)]
+
+                    # Continuous overrides are opt-in to avoid clobbering aim policies.
+                    if os.environ.get("METABONK2_OVERRIDE_CONT", "0") in ("1", "true", "True"):
+                        if mb2_cont is not None and len(mb2_cont) > 0:
+                            cont = [float(x) for x in list(mb2_cont)]
+                            if len(a_cont) > 0:
+                                merged = list(a_cont)
+                                for i in range(min(len(merged), len(cont))):
+                                    merged[i] = float(cont[i])
+                                a_cont = merged
+                            else:
+                                a_cont = cont
+                    lp = 0.0
+                    val = 0.0
+                except Exception:
+                    pass
 
             # Optional SIMA2 backend override (inference).
             if (
@@ -6134,9 +6506,15 @@ class WorkerService:
             if not (self._use_sima2 and not self._sima2_push_rollouts):
                 if done or self.rollout.ready():
                     batch = self.rollout.flush()
-                    self.learner.push_rollout(batch)
+                    if hasattr(batch, "obs_zlib_b64"):
+                        self.learner.push_rollout_pixels(batch)  # type: ignore[arg-type]
+                    else:
+                        self.learner.push_rollout(batch)  # type: ignore[arg-type]
 
-            self._stop.wait(0.05)
+            if bool(getattr(self, "_synthetic_eye_lockstep", False)) and bool(getattr(self, "_pixel_obs_enabled", False)):
+                self._lockstep_request_next_frame(pixel_frame_id)
+            else:
+                self._stop.wait(0.05)
 
     def _post_buildlab_clip(
         self,
@@ -6167,7 +6545,10 @@ class WorkerService:
         except Exception:
             return
 
-    def _stack_observation(self, obs: List[float]) -> List[float]:
+    def _stack_observation(self, obs):
+        # Pixel observations are tensors; do not attempt vector stacking here.
+        if not isinstance(obs, list):
+            return obs
         if self._frame_stack <= 1:
             return obs
         self._obs_stack.append(list(obs))
@@ -6347,6 +6728,11 @@ class WorkerService:
                 out["sima2"] = self._sima2_controller.get_status()
             except Exception:
                 out["sima2"] = {"enabled": True}
+        if self._use_metabonk2 and self._metabonk2_controller is not None:
+            try:
+                out["metabonk2"] = self._metabonk2_controller.get_status()
+            except Exception:
+                out["metabonk2"] = {"enabled": True}
         return out
 
     def get_config(self) -> InstanceConfig:

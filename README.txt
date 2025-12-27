@@ -83,6 +83,9 @@ Documentation
 - **Robust Headless Streaming**: `docs/robust_headless_streaming.md`
 - **Agentic Direct Render Streaming**: `docs/agentic_direct_render_streaming.md`
 - **Bridges**: `docs/bonklink_bridge.md` & `docs/research_plugin_build.md`
+- **Synthetic Eye**: `docs/synthetic_eye.md` & `docs/synthetic_eye_abi.md`
+- **MetaBonk2 Controller**: `docs/metabonk2.md`
+- **Compositor Paradigms**: `docs/compositor_paradigms.md`
 
 Design Philosophy
 -----------------
@@ -123,3 +126,42 @@ Environment Variables
 - METABONK_BONKLINK_DRAIN: Drain socket to latest BonkLink packet (default 0)
 - METABONK_PPO_CONTINUOUS_DIM: Override PPO continuous action dim (e.g., 3 for scroll)
 - METABONK_PPO_DISCRETE_BRANCHES: Override PPO discrete branches (e.g., "2,2,2,2,2")
+- METABONK_OBS_BACKEND: Policy observation backend ("detections" default, "pixels" for end-to-end vision RL, "hybrid")
+- METABONK_PIXEL_OBS_W: Pixel observation width when METABONK_OBS_BACKEND=pixels (default 128)
+- METABONK_PIXEL_OBS_H: Pixel observation height when METABONK_OBS_BACKEND=pixels (default 128)
+- METABONK_PIXEL_ROLLOUT_MAX_SIZE: Steps per pixel rollout flush (default 256; keep small for HTTP payload size)
+- METABONK_PIXEL_UI_GRID: Grid spec for UI click candidates when no detections (e.g. "8x8"; default METABONK_MENU_GRID or 8x8)
+- METABONK_VISION_ENCODER_CKPT: Optional encoder pretrain ckpt to warm-start VisionActorCritic (from scripts/pretrain_vision_mae.py)
+- METABONK_VISION_AUG: Enable DrQ-style random shift augmentation for vision policies (default 1)
+- METABONK_VISION_AUG_SHIFT: Random shift padding in pixels (default 4)
+- METABONK_SYNTHETIC_EYE_LOCKSTEP: Lock-step Synthetic Eye (PING -> next FRAME), requires metabonk_smithay_eye --lockstep or METABONK_EYE_LOCKSTEP=1 (default 0)
+- METABONK_EYE_LOCKSTEP: Lock-step export mode on the Synthetic Eye producer (default 0)
+- METABONK_EYE_LOCKSTEP_WAIT_S: Producer wait time for next client DMA-BUF commit in lock-step (default 0.5)
+- METABONK_SYNTHETIC_EYE_LOCKSTEP_WAIT_S: Worker wait time for next frame in lock-step (default 0.5)
+- METABONK_PPO_AMP: Enable mixed precision in learner PPO updates (default 0; set 1 for CUDA)
+- METABONK_PPO_AMP_DTYPE: AMP dtype ("bf16" default, or "fp16")
+- METABONK_USE_METABONK2: Enable MetaBonk 2.0 tripartite controller (System1/System2 + hierarchical actions)
+- METABONK2_TIME_BUDGET_MS: Time budget passed to metacognition (default 150ms)
+- METABONK2_OVERRIDE_DISCRETE: When using OS input backend, override discrete key/mouse buttons (default 1 when MetaBonk2 enabled)
+- METABONK2_OVERRIDE_CONT: Override continuous mouse deltas from MetaBonk2 (default 0; opt-in to avoid clobbering aim policies)
+- METABONK2_LOG: Emit `[MetaBonk2]` trace lines (default 0)
+
+Dev UI
+------
+The Dev UI includes a `/reasoning` page that polls the selected worker's `/status`
+endpoint and visualizes the `metabonk2` debug state (mode/intent/skill + System2 plan).
+
+Path A: Pixel PPO (end-to-end vision)
+-------------------------------------
+To feed Synthetic Eye pixels directly into PPO (instead of detection vectors), run the worker with:
+- METABONK_FRAME_SOURCE=synthetic_eye
+- METABONK_OBS_BACKEND=pixels
+- METABONK_PIXEL_OBS_W=128 METABONK_PIXEL_OBS_H=128
+- METABONK_PIXEL_ROLLOUT_MAX_SIZE=256
+
+Optional (recommended): enable deterministic stepping with lock-step export:
+- METABONK_SYNTHETIC_EYE_LOCKSTEP=1
+
+The worker will send pixel rollouts to the learner via `/push_rollout_pixels`.
+Optional: enable mixed precision on the learner with `METABONK_PPO_AMP=1` (and `METABONK_PPO_AMP_DTYPE=bf16`).
+Optional: MAE pretrain the encoder with `python scripts/pretrain_vision_mae.py` and set `METABONK_VISION_ENCODER_CKPT`.

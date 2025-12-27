@@ -22,6 +22,12 @@ Binary: `rust/target/release/metabonk_smithay_eye`
 ./rust/target/release/metabonk_smithay_eye --id omega-0 --width 1280 --height 720 --fps 60
 ```
 
+Lock-step (deterministic 1 step → 1 frame):
+
+```bash
+./rust/target/release/metabonk_smithay_eye --id omega-0 --xwayland --lockstep
+```
+
 This creates (default):
 
 - frame socket: `$XDG_RUNTIME_DIR/metabonk/omega-0/frame.sock`
@@ -47,6 +53,9 @@ Key env vars:
 
 - `METABONK_FRAME_SOURCE=synthetic_eye`
 - `METABONK_FRAME_SOCK=$XDG_RUNTIME_DIR/metabonk/<instance_id>/frame.sock`
+- `METABONK_SYNTHETIC_EYE_LOCKSTEP=1` (worker: request frames via `PING`)
+- `METABONK_EYE_FORCE_FOCUS=1` (force focus to avoid Proton/XWayland focus-throttling → black frames)
+- `METABONK_EYE_IMPORT_OPAQUE_OPTIMAL=1` (force modifier-safe import path for ambiguous DMA-BUF modifiers)
 
 ## ABI
 

@@ -76,6 +76,21 @@ class SyntheticEyeStream:
         self.frames_dropped: int = 0
         self.resets: int = 0
 
+    def request_frame(self) -> bool:
+        """Request the next frame from the compositor (lock-step mode).
+
+        Returns True if the request was sent, False if not connected yet.
+        """
+        try:
+            if self._client.sock is None:
+                return False
+            self._client.send_ping()
+            return True
+        except Exception as e:
+            self.last_error = f"synthetic_eye send_ping failed: {e}"
+            self.last_error_ts = time.time()
+            return False
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return

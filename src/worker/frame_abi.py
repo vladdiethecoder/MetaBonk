@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import socket
 import struct
+import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -205,31 +206,48 @@ class FrameSocketClient:
         self.path = str(path)
         self.connect_timeout_s = float(connect_timeout_s)
         self.sock: Optional[socket.socket] = None
+        self._lock = threading.Lock()
 
     def connect(self) -> None:
-        if self.sock is not None:
-            return
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(self.connect_timeout_s)
-        s.connect(self.path)
-        s.settimeout(None)
-        self.sock = s
-        self.send_hello()
+        with self._lock:
+            if self.sock is not None:
+                return
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(self.connect_timeout_s)
+            s.connect(self.path)
+            s.settimeout(None)
+            self.sock = s
+            # Inline HELLO to avoid lock re-entrancy.
+            hdr = _HDR_STRUCT.pack(MAGIC, VERSION, MSG_HELLO, 0, 0)
+            self.sock.sendall(hdr)
 
     def close(self) -> None:
-        if self.sock is None:
-            return
-        try:
-            self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
+        with self._lock:
+            if self.sock is None:
+                return
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
     def send_hello(self) -> None:
-        if self.sock is None:
-            return
-        hdr = _HDR_STRUCT.pack(MAGIC, VERSION, MSG_HELLO, 0, 0)
-        self.sock.sendall(hdr)
+        with self._lock:
+            if self.sock is None:
+                return
+            hdr = _HDR_STRUCT.pack(MAGIC, VERSION, MSG_HELLO, 0, 0)
+            self.sock.sendall(hdr)
+
+    def send_ping(self) -> None:
+        """Send a PING control message.
+
+        In lock-step mode, the compositor interprets PING as "request the next FRAME".
+        """
+        with self._lock:
+            if self.sock is None:
+                return
+            hdr = _HDR_STRUCT.pack(MAGIC, VERSION, MSG_PING, 0, 0)
+            self.sock.sendall(hdr)
 
     def recv(self) -> Tuple[str, object]:
         if self.sock is None:

@@ -8,7 +8,11 @@ mod xwayland_watchdog;
 use std::{
     fs,
     os::fd::{AsRawFd, IntoRawFd},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+        Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -41,6 +45,16 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let lockstep: bool = args.lockstep
+        || std::env::var("METABONK_EYE_LOCKSTEP")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+    let lockstep: bool = lockstep
+        || std::env::var("METABONK_SYNTHETIC_EYE_LOCKSTEP")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
     let run_dir = args.resolved_run_dir();
     fs::create_dir_all(&run_dir).with_context(|| format!("create_dir_all({run_dir})"))?;
 
@@ -48,6 +62,8 @@ fn main() -> anyhow::Result<()> {
     let mut server = FrameServer::bind(&sock_path)?;
 
     let latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>> = Arc::new(Mutex::new(None));
+    let dmabuf_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let lockstep_tokens: Option<Arc<AtomicU64>> = lockstep.then(|| Arc::new(AtomicU64::new(0)));
     let export_period: Arc<Mutex<Duration>> = Arc::new(Mutex::new(Duration::from_secs_f64(
         1.0 / f64::from(args.fps.max(1)),
     )));
@@ -92,6 +108,8 @@ fn main() -> anyhow::Result<()> {
             export_period.clone(),
             export_size.clone(),
             latest_dmabuf.clone(),
+            lockstep_tokens.clone(),
+            dmabuf_seq.clone(),
         );
     } else {
         // Legacy mode: no Wayland compositor. Still emit the frame socket location for the worker.
@@ -103,6 +121,7 @@ fn main() -> anyhow::Result<()> {
     let mut saw_xwayland_dmabuf = false;
     let start = std::time::Instant::now();
     let mut last_ok_frame_at = Instant::now();
+    let mut last_ping_at = Instant::now();
     let mut consecutive_failures: u32 = 0;
     let mut prev_connected: bool = false;
     let mut last_reset_sent_at: Option<Instant> = None;
@@ -122,7 +141,42 @@ fn main() -> anyhow::Result<()> {
     } else if args.xwayland {
         info!("synthetic_eye passthrough disabled (METABONK_SYNTHETIC_EYE_PASSTHROUGH=0): using Vulkan export path");
     }
+    if lockstep {
+        info!("lock-step export enabled: one worker PING -> one exported FRAME");
+    }
     loop {
+        if lockstep {
+            if let Err(e) = server.wait_for_ping() {
+                warn!("lock-step: ping wait failed: {e}");
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            last_ping_at = Instant::now();
+            if let Some(tokens) = lockstep_tokens.as_ref() {
+                // One ping -> allow one frame-callback batch. Then wait for a new DMA-BUF commit
+                // before exporting, so the worker observes the post-action frame (best-effort).
+                let before = dmabuf_seq.load(Ordering::Acquire);
+                tokens.fetch_add(1, Ordering::Release);
+                if args.xwayland {
+                    let deadline = Instant::now()
+                        + Duration::from_secs_f64(
+                            std::env::var("METABONK_EYE_LOCKSTEP_WAIT_S")
+                                .ok()
+                                .and_then(|v| v.parse::<f64>().ok())
+                                .unwrap_or(0.5)
+                                .max(0.01),
+                        );
+                    while dmabuf_seq.load(Ordering::Acquire) == before {
+                        if Instant::now() >= deadline {
+                            warn!("lock-step: timed out waiting for next client DMA-BUF commit");
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+
         let t0 = std::time::Instant::now();
         let connected_now = server.is_connected();
         if prev_connected && !connected_now {
@@ -321,7 +375,13 @@ fn main() -> anyhow::Result<()> {
 
         // Watchdog: if we haven't successfully delivered frames recently, exit so the launcher can restart us.
         // Keep this conservative: transient backpressure from the CUDA consumer should not trigger restarts.
-        if last_ok_frame_at.elapsed() > Duration::from_secs(60) || consecutive_failures >= 300 {
+        if (!lockstep && last_ok_frame_at.elapsed() > Duration::from_secs(60))
+            || (lockstep
+                && server.is_connected()
+                && last_ping_at.elapsed() < Duration::from_secs(60)
+                && last_ok_frame_at.elapsed() > Duration::from_secs(60))
+            || consecutive_failures >= 300
+        {
             anyhow::bail!(
                 "synthetic eye stalled: last_ok_frame_age_s={} consecutive_failures={}",
                 last_ok_frame_at.elapsed().as_secs_f64(),
@@ -329,10 +389,12 @@ fn main() -> anyhow::Result<()> {
             );
         }
         phase = phase.wrapping_add(1);
-        let elapsed = t0.elapsed();
-        let period = export_period.lock().map(|p| *p).unwrap_or(Duration::from_millis(16));
-        if elapsed < period {
-            thread::sleep(period - elapsed);
+        if !lockstep {
+            let elapsed = t0.elapsed();
+            let period = export_period.lock().map(|p| *p).unwrap_or(Duration::from_millis(16));
+            if elapsed < period {
+                thread::sleep(period - elapsed);
+            }
         }
     }
 }

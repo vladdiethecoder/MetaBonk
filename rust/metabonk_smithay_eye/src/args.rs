@@ -71,6 +71,14 @@ pub struct Args {
     /// Consecutive heartbeat failures before restart.
     #[arg(long, default_value_t = 3)]
     pub xwayland_fail_threshold: u32,
+
+    /// Lock-step mode: export exactly one frame per worker PING message.
+    ///
+    /// This is intended for deterministic RL stepping (one action -> one frame).
+    /// When enabled, the compositor will only advance frame callbacks and export
+    /// frames when the worker requests them.
+    #[arg(long, default_value_t = false)]
+    pub lockstep: bool,
 }
 
 impl Args {

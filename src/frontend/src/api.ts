@@ -585,6 +585,12 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T;
 }
 
+export async function fetchWorkerStatus(controlUrl: string): Promise<Record<string, any>> {
+  const base = String(controlUrl ?? "").replace(/\/+$/, "");
+  if (!base) throw new Error("missing control_url");
+  return fetchJson<Record<string, any>>(`${base}/status`);
+}
+
 export async function fetchStatus(): Promise<OrchestratorStatus> {
   return fetchJson<OrchestratorStatus>(`${ORCH}/status`);
 }

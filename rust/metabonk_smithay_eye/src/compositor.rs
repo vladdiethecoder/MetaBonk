@@ -6,6 +6,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::Duration,
     time::Instant,
@@ -363,6 +364,8 @@ pub struct EyeCompositor {
     saw_any_buffer: bool,
     saw_any_dmabuf: bool,
     commit_calls: u64,
+    lockstep_tokens: Option<Arc<AtomicU64>>,
+    dmabuf_seq: Arc<AtomicU64>,
 }
 
 impl EyeCompositor {
@@ -374,6 +377,8 @@ impl EyeCompositor {
         export_period: Arc<Mutex<Duration>>,
         export_size: Arc<Mutex<(u32, u32)>>,
         latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
+        lockstep_tokens: Option<Arc<AtomicU64>>,
+        dmabuf_seq: Arc<AtomicU64>,
         dmabuf_state: DmabufState,
         drm_syncobj_state: Option<DrmSyncobjState>,
         dmabuf_global: DmabufGlobal,
@@ -448,6 +453,8 @@ impl EyeCompositor {
             saw_any_buffer: false,
             saw_any_dmabuf: false,
             commit_calls: 0,
+            lockstep_tokens,
+            dmabuf_seq,
         }
     }
 
@@ -623,11 +630,19 @@ impl EyeCompositor {
             return;
         }
 
-        let agent = self.ensure_agent(pid);
+        let lockstep_enabled = self.lockstep_tokens.is_some();
         let now = Instant::now();
-        let elapsed = now.duration_since(agent.last_frame_time);
-        let target = agent.target_interval;
-        let due = if agent.tier == AgentTier::Featured || elapsed >= target {
+        let (elapsed, target, tier) = {
+            let agent = self.ensure_agent(pid);
+            (
+                now.duration_since(agent.last_frame_time),
+                agent.target_interval,
+                agent.tier,
+            )
+        };
+        let due = if lockstep_enabled {
+            now
+        } else if tier == AgentTier::Featured || elapsed >= target {
             now
         } else {
             now + (target - elapsed)
@@ -650,6 +665,14 @@ impl EyeCompositor {
         let time_dur: Duration = time.into();
         let time_ms = time_dur.as_millis() as u32;
 
+        let lockstep_tokens = self.lockstep_tokens.as_ref();
+        if let Some(tokens) = lockstep_tokens {
+            if tokens.load(Ordering::Acquire) == 0 {
+                return;
+            }
+        }
+        let mut drained_any = false;
+
         while let Some(Reverse(head)) = self.pending_frame_callbacks.peek() {
             if head.due > now {
                 break;
@@ -657,6 +680,7 @@ impl EyeCompositor {
 
             let Reverse(entry) = self.pending_frame_callbacks.pop().unwrap();
             entry.callback.done(time_ms);
+            drained_any = true;
 
             if let Some(agent) = self.agents.get_mut(&entry.pid) {
                 agent.last_frame_time = now;
@@ -668,6 +692,13 @@ impl EyeCompositor {
                         h.telemetry(fps, 0);
                     }
                 }
+            }
+        }
+
+        if drained_any {
+            if let Some(tokens) = lockstep_tokens {
+                // Consume exactly one step budget per drained batch, regardless of how many callbacks fired.
+                let _ = tokens.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
             }
         }
     }
@@ -1007,6 +1038,7 @@ impl CompositorHandler for EyeCompositor {
                     acquire_fence: acquire_fd,
                     buffer: buf.clone(),
                 });
+                self.dmabuf_seq.fetch_add(1, Ordering::Release);
             } else {
                 // Ignore SHM buffers to preserve the GPU-only contract. Do NOT clear latest_dmabuf here:
                 // some clients briefly commit SHM surfaces (cursor/overlays) even while the main window
@@ -1548,6 +1580,8 @@ pub fn spawn_wayland_xwayland_thread(
     export_period: Arc<Mutex<Duration>>,
     export_size: Arc<Mutex<(u32, u32)>>,
     latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
+    lockstep_tokens: Option<Arc<AtomicU64>>,
+    dmabuf_seq: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<anyhow::Result<()>> {
     std::thread::spawn(move || {
         // Assumes the parent has set XDG_RUNTIME_DIR to `run_dir` for this process.
@@ -1759,6 +1793,8 @@ pub fn spawn_wayland_xwayland_thread(
             export_period,
             export_size,
             latest_dmabuf,
+            lockstep_tokens,
+            dmabuf_seq,
             dmabuf_state,
             drm_syncobj_state,
             dmabuf_global,

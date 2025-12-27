@@ -325,12 +325,14 @@ def derive_state_onehot(dets: List[ParsedDet], num_states: int = 4) -> List[floa
 def construct_observation(
     raw_detections: Sequence[Dict[str, Any]],
     obs_dim: int,
+    # Optional pixel observation for end-to-end vision RL.
+    pixel_tensor: Optional[Any] = None,
     frame_size: Optional[Tuple[int, int]] = None,
     max_elements: int = 32,
     menu_hint: Optional[bool] = None,
     ui_override: Optional[List[List[float]]] = None,
     action_mask_override: Optional[List[int]] = None,
-) -> Tuple[List[float], List[int]]:
+) -> Tuple[Any, List[int]]:
     """Construct flat obs vector and action mask.
 
     Global features layout (first 8 floats):
@@ -361,6 +363,11 @@ def construct_observation(
         if state in mapping and mapping[state] < len(onehot):
             onehot[mapping[state]] = 1.0
         state_oh = onehot
+
+    # Vision-first path: return pixel tensor directly as the observation but keep
+    # the action mask (used by UI-index discrete action space).
+    if pixel_tensor is not None:
+        return pixel_tensor, mask
 
     global_feats = [0.0] * 8
 

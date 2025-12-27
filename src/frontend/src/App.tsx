@@ -11,8 +11,10 @@ import NeuroSynaptic from "./pages/NeuroSynaptic";
 import Runs from "./pages/Runs";
 import Instances from "./pages/Instances";
 import Skills from "./pages/Skills";
+import Reasoning from "./pages/Reasoning";
 import Spy from "./pages/Spy";
 import Stream from "./pages/Stream";
+import Supervisor from "./pages/Supervisor";
 
 const BuildLab = lazy(() => import("./pages/BuildLab"));
 const CCTV3D = lazy(() => import("./pages/CCTV3D"));
@@ -60,8 +62,10 @@ export default function App() {
   const nav = [
     { to: "/", label: "Neuro" },
     { to: "/overview", label: "Overview" },
+    { to: "/supervisor", label: "Supervisor" },
     { to: "/runs", label: "Runs" },
     { to: "/instances", label: "Instances" },
+    { to: "/reasoning", label: "Reasoning" },
     { to: "/build", label: "Build Lab" },
     { to: "/skills", label: "Skills" },
     { to: "/spy", label: "Spy" },
@@ -91,8 +95,10 @@ export default function App() {
           <Suspense fallback={<div className="card">loading…</div>}>
             <Routes>
               <Route path="/overview" element={<ErrorBoundary label="Overview"><Overview /></ErrorBoundary>} />
+              <Route path="/supervisor" element={<ErrorBoundary label="Supervisor"><Supervisor /></ErrorBoundary>} />
               <Route path="/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />
               <Route path="/instances" element={<ErrorBoundary label="Instances"><Instances /></ErrorBoundary>} />
+              <Route path="/reasoning" element={<ErrorBoundary label="Reasoning"><Reasoning /></ErrorBoundary>} />
               <Route path="/build" element={<ErrorBoundary label="Build Lab"><BuildLab /></ErrorBoundary>} />
               <Route path="/skills" element={<ErrorBoundary label="Skills"><Skills /></ErrorBoundary>} />
               <Route path="/spy" element={<ErrorBoundary label="Spy"><Spy /></ErrorBoundary>} />

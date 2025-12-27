@@ -43,6 +43,31 @@ The goal is to keep this ABI stable so compositor and worker can evolve independ
 
 Both payloads are currently empty. (Reserved for future capability negotiation.)
 
+## Lock-step mode (optional)
+
+The Synthetic Eye exporter can run in **lock-step** mode for deterministic RL:
+
+- the compositor exports **exactly one** `FRAME` per worker `PING`
+- the compositor **throttles Wayland frame callbacks** so the game/client only advances when requested
+
+This enables a strict **1 action → 1 frame** stepping loop when the worker sends `PING` after applying an action.
+
+### Enable
+
+- Producer (Rust): start `metabonk_smithay_eye` with `--lockstep` or set `METABONK_EYE_LOCKSTEP=1`
+  (also accepts `METABONK_SYNTHETIC_EYE_LOCKSTEP=1` for convenience).
+- Consumer (Python worker): set `METABONK_SYNTHETIC_EYE_LOCKSTEP=1` so the worker sends `PING` each step.
+
+### Timeouts
+
+- Producer wait for the next client DMA-BUF commit: `METABONK_EYE_LOCKSTEP_WAIT_S` (default `0.5`)
+- Worker wait for the next frame to arrive: `METABONK_SYNTHETIC_EYE_LOCKSTEP_WAIT_S` (default `0.5`)
+
+Notes:
+
+- In lock-step mode, `fps` is treated as a legacy/default pacing knob and may not match the effective step rate.
+- `PONG` is reserved for liveness/diagnostics; lock-step uses `PING` as a "step request".
+
 ## FRAME (per-frame payload + FDs)
 
 ### Payload (FrameV1, little-endian)
