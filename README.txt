@@ -86,6 +86,7 @@ Documentation
 - **Synthetic Eye**: `docs/synthetic_eye.md` & `docs/synthetic_eye_abi.md`
 - **MetaBonk2 Controller**: `docs/metabonk2.md`
 - **Compositor Paradigms**: `docs/compositor_paradigms.md`
+- **Zero‑Copy Desktop RL (Smithay + PyTorch + Tauri)**: `docs/zero_copy_desktop_rl.md`
 
 Design Philosophy
 -----------------
