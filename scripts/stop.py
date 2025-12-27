@@ -21,6 +21,27 @@ def _job_state_path(repo_root: Path) -> Path:
     return repo_root / "temp" / "metabonk_last_job.json"
 
 
+def _wine_z_drive_variants(posix_path: Path) -> tuple[str, ...]:
+    """Return likely Wine/Proton argv path spellings for a local POSIX path.
+
+    Wine commonly maps the host filesystem to the Z: drive, so a path like
+    `/mnt/.../MetaBonk/temp/megabonk_instances` can appear in `ps` output as:
+      - `Z:/mnt/.../MetaBonk/temp/megabonk_instances`
+      - `Z:\\mnt\\...\\MetaBonk\\temp\\megabonk_instances`
+    """
+
+    s = str(posix_path)
+    win_slash = "Z:" + s
+    win_backslash = "Z:" + s.replace("/", "\\")
+    return (
+        s,
+        win_slash,
+        win_backslash,
+        win_slash.lower(),
+        win_backslash.lower(),
+    )
+
+
 def _kill_pgid(pgid: int) -> None:
     if os.name != "posix":
         raise SystemExit("stop.py only supports posix killpg()")
@@ -63,9 +84,11 @@ def _find_metabonk_pgids(lines: Iterable[str], user: str, *, repo_root: Path) ->
         "scripts/start.py",
         "scripts/watch_visual.py",
     )
-    repo_sentinels = (
-        str((repo_root / "temp" / "compatdata").resolve()),
-        str((repo_root / "temp" / "megabonk_instances").resolve()),
+    temp_root = (repo_root / "temp").resolve()
+    repo_sentinels = tuple(
+        s
+        for p in (temp_root / "compatdata", temp_root / "megabonk_instances")
+        for s in _wine_z_drive_variants(p)
     )
     pgids: set[int] = set()
     for ln in lines:
@@ -107,6 +130,12 @@ def _collect_metabonk_pids(repo_root: Path, *, user: str) -> set[int]:
     # Strategy:
     #   - Only match processes that very likely belong to this repo/job ("strong" needles)
     #   - Then kill their children recursively (catches Proton/Wine helpers).
+    temp_root = (repo_root / "temp").resolve()
+    repo_sentinels = tuple(
+        s
+        for p in (temp_root / "compatdata", temp_root / "megabonk_instances")
+        for s in _wine_z_drive_variants(p)
+    )
     strong_needles = (
         "src.worker.main",
         "src.orchestrator.main",
@@ -115,9 +144,8 @@ def _collect_metabonk_pids(repo_root: Path, *, user: str) -> set[int]:
         "scripts/start_omega.py",
         "scripts/start.py",
         "scripts/watch_visual.py",
-        # repo-local roots we control (strong signals)
-        str((repo_root / "temp" / "compatdata").resolve()),
-        str((repo_root / "temp" / "megabonk_instances").resolve()),
+        # repo-local roots we control (strong signals, incl Wine Z: mappings)
+        *repo_sentinels,
     )
 
     pids: set[int] = set()
@@ -156,6 +184,12 @@ def _remaining_metabonk_pids(repo_root: Path, *, user: str) -> set[int]:
     except Exception:
         return set()
 
+    temp_root = (repo_root / "temp").resolve()
+    repo_sentinels = tuple(
+        s
+        for p in (temp_root / "compatdata", temp_root / "megabonk_instances")
+        for s in _wine_z_drive_variants(p)
+    )
     strong_needles = (
         "src.worker.main",
         "src.orchestrator.main",
@@ -164,8 +198,7 @@ def _remaining_metabonk_pids(repo_root: Path, *, user: str) -> set[int]:
         "scripts/start_omega.py",
         "scripts/start.py",
         "scripts/watch_visual.py",
-        str((repo_root / "temp" / "compatdata").resolve()),
-        str((repo_root / "temp" / "megabonk_instances").resolve()),
+        *repo_sentinels,
     )
 
     pids: set[int] = set()

@@ -1429,6 +1429,18 @@ def main() -> int:
                 frame_sock = f"{run_root}/{iid}/frame.sock"
                 wenv["METABONK_FRAME_SOURCE"] = "synthetic_eye"
                 wenv["METABONK_FRAME_SOCK"] = frame_sock
+                # Prevent Unity/Unreal focus throttling (black/frozen frames) by ensuring the
+                # Synthetic Eye compositor keeps keyboard focus on the active capture surface.
+                wenv.setdefault("METABONK_EYE_FORCE_FOCUS", "1")
+                # XWayland on some stacks presents via wl_drm PRIME buffers, which do not carry
+                # DRM modifier metadata. Importing those as LINEAR dma-bufs can produce stable
+                # banding/black frames. Prefer the OPTIMAL-tiling DMA_BUF_EXT import path, which
+                # lets the driver interpret the underlying layout correctly.
+                wenv.setdefault("METABONK_EYE_IMPORT_OPAQUE_OPTIMAL", "1")
+                # Steam cold-start + Proton game boot can take >60s before XWayland starts
+                # producing DMA-BUFs. Increase the wait timeout to avoid spurious "no DMABUF"
+                # failures during startup (override per-run if you want faster fail-fast).
+                wenv.setdefault("METABONK_XWAYLAND_DMABUF_WAIT_S", "180")
                 # Force X11 path for the game: remove Wayland env vars so SDL/Proton
                 # doesn't attempt a native Wayland connection.
                 wenv.pop("WAYLAND_DISPLAY", None)

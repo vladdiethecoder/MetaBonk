@@ -61,12 +61,102 @@ use smithay::{
     },
 };
 use smithay::reexports::wayland_server::protocol::wl_shm;
+use smithay::backend::input::KeyState;
+use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
+use smithay::utils::{IsAlive, Serial};
+use smithay::wayland::seat::WaylandFocus;
+use std::borrow::Cow;
 use tracing::{info, warn};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::utils::Buffer as SurfaceBuffer;
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_agent_v1::{self, ZmetabonkAgentV1};
 use crate::protocols::ext_metabonk_control_v1::server::zmetabonk_orchestrator_v1::{self, ZmetabonkOrchestratorV1};
 use crate::protocols::wl_drm::server::wl_drm::{self, WlDrm};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl KeyboardFocusTarget {
+    fn from_wl_surface(surface: &WlSurface, x11: Option<&X11Surface>) -> Self {
+        if let Some(win) = x11 {
+            KeyboardFocusTarget::X11(win.clone())
+        } else {
+            KeyboardFocusTarget::Wayland(surface.clone())
+        }
+    }
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => surface.alive(),
+            KeyboardFocusTarget::X11(window) => window.alive(),
+        }
+    }
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => Some(Cow::Borrowed(surface)),
+            KeyboardFocusTarget::X11(window) => window.wl_surface().map(Cow::Owned),
+        }
+    }
+}
+
+impl KeyboardTarget<EyeCompositor> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<EyeCompositor>,
+        data: &mut EyeCompositor,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            KeyboardFocusTarget::X11(window) => KeyboardTarget::enter(window, seat, data, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<EyeCompositor>, data: &mut EyeCompositor, serial: Serial) {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            KeyboardFocusTarget::X11(window) => KeyboardTarget::leave(window, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<EyeCompositor>,
+        data: &mut EyeCompositor,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => KeyboardTarget::key(surface, seat, data, key, state, serial, time),
+            KeyboardFocusTarget::X11(window) => KeyboardTarget::key(window, seat, data, key, state, serial, time),
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<EyeCompositor>,
+        data: &mut EyeCompositor,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            KeyboardFocusTarget::Wayland(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+            KeyboardFocusTarget::X11(window) => KeyboardTarget::modifiers(window, seat, data, modifiers, serial),
+        }
+    }
+}
 
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -81,7 +171,7 @@ struct DmaBufExportSyncFile {
 
 ioctl_readwrite!(dma_buf_export_sync_file, b'b', 2, DmaBufExportSyncFile);
 
-fn export_dmabuf_read_sync_file(dmabuf: &Dmabuf) -> anyhow::Result<Option<OwnedFd>> {
+pub(crate) fn export_dmabuf_read_sync_file(dmabuf: &Dmabuf) -> anyhow::Result<Option<OwnedFd>> {
     let Some(handle) = dmabuf.handles().next() else {
         return Ok(None);
     };
@@ -225,6 +315,7 @@ struct AgentHandleData {
 pub struct LatestDmabuf {
     pub dmabuf: Dmabuf,
     pub acquire_fence: Option<OwnedFd>,
+    pub buffer: SurfaceBuffer,
 }
 
 pub struct EyeCompositor {
@@ -242,7 +333,7 @@ pub struct EyeCompositor {
     #[allow(dead_code)]
     metabonk_control_global: smithay::reexports::wayland_server::backend::GlobalId,
     #[allow(dead_code)]
-    wl_drm_global: smithay::reexports::wayland_server::backend::GlobalId,
+    wl_drm_global: Option<smithay::reexports::wayland_server::backend::GlobalId>,
     metabonk_orchestrators: Vec<ZmetabonkOrchestratorV1>,
     metabonk_agent_handles: HashMap<u32, Vec<ZmetabonkAgentV1>>,
     agents: HashMap<u32, AgentState>,
@@ -259,6 +350,12 @@ pub struct EyeCompositor {
     export_size: Arc<Mutex<(u32, u32)>>,
     latest_dmabuf: Arc<Mutex<Option<LatestDmabuf>>>,
     primary_surface: Option<ObjectId>,
+    primary_surface_size: Option<(u32, u32)>,
+    primary_surface_score: u64,
+    forced_wl_surface: Option<u32>,
+    force_focus: bool,
+    last_forced_focus_at: Instant,
+    wl_surface_to_x11: HashMap<u32, X11Surface>,
     xwayland_ready_at: Option<Instant>,
     last_no_buffer_log_at: Instant,
     last_non_dmabuf_log_at: Instant,
@@ -280,7 +377,7 @@ impl EyeCompositor {
         dmabuf_state: DmabufState,
         drm_syncobj_state: Option<DrmSyncobjState>,
         dmabuf_global: DmabufGlobal,
-        wl_drm_global_data: WlDrmGlobalData,
+        wl_drm_global_data: Option<WlDrmGlobalData>,
     ) -> Self {
         let compositor_state = CompositorState::new::<Self>(dh);
         let xwayland_shell_state = XWaylandShellState::new::<Self>(dh);
@@ -289,6 +386,16 @@ impl EyeCompositor {
         let mut seat = seat_state.new_wl_seat(dh, "seat-0");
         let _ = seat.add_pointer();
         let _ = seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 200, 25);
+        let force_focus = std::env::var("METABONK_EYE_FORCE_FOCUS")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+            .unwrap_or(false);
+        if force_focus {
+            info!("force focus enabled: keyboard focus will follow the primary capture surface");
+        }
         // wl_shm is required by many clients (including XWayland) even if we refuse
         // SHM buffers for the vision path. We expose it for compatibility and enforce
         // GPU-only capture by ignoring SHM commits in `commit()`.
@@ -297,7 +404,7 @@ impl EyeCompositor {
             wl_shm::Format::Xrgb8888,
         ]);
         let metabonk_control_global = dh.create_global::<Self, ZmetabonkOrchestratorV1, _>(1, ());
-        let wl_drm_global = dh.create_global::<Self, WlDrm, _>(2, wl_drm_global_data);
+        let wl_drm_global = wl_drm_global_data.map(|data| dh.create_global::<Self, WlDrm, _>(2, data));
         Self {
             compositor_state,
             xwayland_shell_state,
@@ -326,6 +433,14 @@ impl EyeCompositor {
             export_size,
             latest_dmabuf,
             primary_surface: None,
+            primary_surface_size: None,
+            primary_surface_score: 0,
+            forced_wl_surface: std::env::var("METABONK_EYE_FORCE_WL_SURFACE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            force_focus,
+            last_forced_focus_at: Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now),
+            wl_surface_to_x11: HashMap::new(),
             xwayland_ready_at: None,
             last_no_buffer_log_at: Instant::now(),
             last_non_dmabuf_log_at: Instant::now(),
@@ -345,6 +460,42 @@ impl EyeCompositor {
         self.agents
             .entry(pid)
             .or_insert_with(|| AgentState::new(pid, fallback))
+    }
+
+    fn x11_surface_score(&self, wl_surface: u32) -> (u64, Option<(u32, u32, u32, String, String)>) {
+        let Some(win) = self.wl_surface_to_x11.get(&wl_surface) else {
+            return (0, None);
+        };
+        if !win.alive() {
+            return (0, None);
+        }
+        if win.is_override_redirect() {
+            return (0, Some((win.window_id(), win.pid().unwrap_or(0), 0, win.title(), win.class())));
+        }
+        let type_score: u64 = match win.window_type() {
+            Some(smithay::xwayland::xwm::WmWindowType::Normal) => 100,
+            Some(smithay::xwayland::xwm::WmWindowType::Dialog) => 80,
+            Some(smithay::xwayland::xwm::WmWindowType::Splash) => 60,
+            Some(smithay::xwayland::xwm::WmWindowType::Utility) => 40,
+            Some(smithay::xwayland::xwm::WmWindowType::Toolbar) => 20,
+            Some(smithay::xwayland::xwm::WmWindowType::Menu) => 10,
+            Some(smithay::xwayland::xwm::WmWindowType::PopupMenu) => 10,
+            Some(smithay::xwayland::xwm::WmWindowType::DropdownMenu) => 10,
+            Some(smithay::xwayland::xwm::WmWindowType::Tooltip) => 1,
+            Some(smithay::xwayland::xwm::WmWindowType::Notification) => 1,
+            None => 50,
+        };
+        let has_pid = win.pid().is_some();
+        let title = win.title();
+        let class = win.class();
+        let has_title = !title.trim().is_empty();
+        let has_class = !class.trim().is_empty();
+        let bonus = (has_pid as u64) * 50 + (has_title as u64) * 10 + (has_class as u64) * 10;
+        let score = type_score.saturating_mul(1_000).saturating_add(bonus);
+        (
+            score,
+            Some((win.window_id(), win.pid().unwrap_or(0), type_score as u32, title, class)),
+        )
     }
 
     fn pid_for_client(client: &Client) -> u32 {
@@ -534,6 +685,27 @@ impl DmabufHandler for EyeCompositor {
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, _dmabuf: Dmabuf, notifier: ImportNotifier) {
+        let log_imports = std::env::var("METABONK_EYE_LOG_DMABUF_IMPORTS")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        if log_imports {
+            let fmt = _dmabuf.format().code;
+            let modifier: u64 = _dmabuf.format().modifier.into();
+            let stride0 = _dmabuf.strides().next().unwrap_or(0);
+            let offset0 = _dmabuf.offsets().next().unwrap_or(0);
+            let planes = _dmabuf.num_planes();
+            info!(
+                ?fmt,
+                modifier = format_args!("0x{modifier:016x}"),
+                planes,
+                stride0,
+                offset0,
+                w = _dmabuf.width(),
+                h = _dmabuf.height(),
+                "linux-dmabuf imported"
+            );
+        }
         // Accept all dmabufs from clients. We enforce "GPU-only" at the consumer by
         // ignoring SHM buffers and requiring a dmabuf-backed source to appear.
         let _ = notifier.successful::<Self>();
@@ -617,19 +789,22 @@ impl CompositorHandler for EyeCompositor {
                     info!("first DMA-BUF wl_buffer observed from a client surface");
                 }
 
+                let sz = dmabuf.size();
+                let pid = surface
+                    .client()
+                    .map(|c| Self::pid_for_client(&c))
+                    .unwrap_or(0);
+
                 if now.duration_since(self.last_commit_log_at) > Duration::from_secs(2) {
                     self.last_commit_log_at = now;
-                    let sz = dmabuf.size();
                     let stride0 = dmabuf.strides().next().unwrap_or(0);
                     let offset0 = dmabuf.offsets().next().unwrap_or(0);
                     let modifier_u64: u64 = dmabuf.format().modifier.into();
                     let fmt = dmabuf.format().code;
-                    let pid = surface
-                        .client()
-                        .map(|c| Self::pid_for_client(&c))
-                        .unwrap_or(0);
+                    let wl_surface = surface.id().protocol_id();
                     info!(
                         pid,
+                        wl_surface,
                         w = sz.w,
                         h = sz.h,
                         stride0,
@@ -649,21 +824,119 @@ impl CompositorHandler for EyeCompositor {
                     }
                 }
 
-                if self.primary_surface.is_none() && self.featured_pid.is_none() {
-                    self.primary_surface = Some(surface.id());
-                    info!("selected primary surface for capture (first DMA-BUF commit)");
+                // If a PID is explicitly featured, ignore DMA-BUF commits from other clients.
+                if let Some(featured) = self.featured_pid {
+                    if pid != featured {
+                        return;
+                    }
+                }
+
+                // Games (and XWayland) often create tiny helper surfaces before the real viewport.
+                // Ignore them so we don't latch onto a 1x1/tooltip/cursor buffer.
+                if sz.w < 64 || sz.h < 64 {
+                    return;
+                }
+
+                // Select capture surface heuristically:
+                // - Prefer the largest DMA-BUF surface (area).
+                // - If area ties, prefer the most recently created surface (higher protocol ID).
+                // This avoids latching onto early splash/launcher windows and prevents thrashing
+                // when multiple full-size surfaces commit alternately (e.g., overlays).
+                let candidate_id = surface.id();
+                let candidate_wl_surface = candidate_id.protocol_id();
+                if let Some(forced) = self.forced_wl_surface {
+                    if candidate_wl_surface != forced {
+                        return;
+                    }
+                }
+                let (cw, ch) = match (u32::try_from(sz.w), u32::try_from(sz.h)) {
+                    (Ok(w), Ok(h)) => (w, h),
+                    _ => return,
+                };
+                let candidate_area = u64::from(cw).saturating_mul(u64::from(ch));
+                let (x11_score, x11_meta) = self.x11_surface_score(candidate_wl_surface);
+                let candidate_score = candidate_area
+                    .saturating_mul(10_000)
+                    .saturating_add(x11_score.saturating_mul(100))
+                    .saturating_add(u64::from(candidate_wl_surface));
+                let should_select = self.primary_surface.is_none() || candidate_score > self.primary_surface_score;
+                if should_select {
+                    let changed = self.primary_surface.as_ref() != Some(&candidate_id);
+                    if changed {
+                        if let Some((x11_window, x11_pid, x11_type_score, title, class)) = x11_meta {
+                            info!(
+                                pid,
+                                surface_id = ?candidate_id,
+                                wl_surface = candidate_wl_surface,
+                                w = sz.w,
+                                h = sz.h,
+                                x11_window,
+                                x11_pid,
+                                x11_type_score,
+                                title = title.as_str(),
+                                class = class.as_str(),
+                                "switching primary surface capture"
+                            );
+                        } else {
+                            info!(
+                                pid,
+                                surface_id = ?candidate_id,
+                                wl_surface = candidate_wl_surface,
+                                w = sz.w,
+                                h = sz.h,
+                                "switching primary surface capture"
+                            );
+                        }
+                    }
+                    if self.force_focus {
+                        // Games can throttle/freeze rendering when unfocused. Continuously asserting focus
+                        // keeps the capture surface "active" even as new helper windows appear.
+                        let should_refocus = changed || now.duration_since(self.last_forced_focus_at) > Duration::from_secs(1);
+                        if should_refocus {
+                            if let Some(kbd) = self.seat.get_keyboard() {
+                                let focus = KeyboardFocusTarget::from_wl_surface(
+                                    surface,
+                                    self.wl_surface_to_x11.get(&candidate_wl_surface),
+                                );
+                                kbd.set_focus(
+                                    self,
+                                    Some(focus),
+                                    smithay::utils::SERIAL_COUNTER.next_serial(),
+                                );
+                                info!(
+                                    pid,
+                                    wl_surface = candidate_wl_surface,
+                                    "forcing keyboard focus to capture surface"
+                                );
+                                self.last_forced_focus_at = now;
+                            }
+                        }
+                    }
+                    self.primary_surface = Some(candidate_id);
+                    self.primary_surface_size = Some((cw, ch));
+                    self.primary_surface_score = candidate_score;
                 }
                 if let Some(primary) = self.primary_surface.as_ref() {
                     if &surface.id() != primary {
                         return;
                     }
                 }
-                if let Some(featured) = self.featured_pid {
-                    if let Some(client) = surface.client() {
-                        if let Some(cs) = client.get_data::<ClientState>() {
-                            if cs.pid != featured {
-                                return;
-                            }
+
+                // Keep asserting focus on the selected capture surface. This is important for
+                // many games that throttle/freeze rendering when unfocused, and can lose focus
+                // due to transient/helper windows inside XWayland.
+                if self.force_focus {
+                    let now = Instant::now();
+                    if now.duration_since(self.last_forced_focus_at) > Duration::from_secs(1) {
+                        if let Some(kbd) = self.seat.get_keyboard() {
+                            let wl_surface = surface.id().protocol_id();
+                            let focus = KeyboardFocusTarget::from_wl_surface(
+                                surface,
+                                self.wl_surface_to_x11.get(&wl_surface),
+                            );
+                            kbd.set_focus(self, Some(focus), smithay::utils::SERIAL_COUNTER.next_serial());
+                            info!(pid, wl_surface, "reasserting keyboard focus to capture surface");
+                            self.last_forced_focus_at = now;
                         }
                     }
                 }
@@ -673,10 +946,6 @@ impl CompositorHandler for EyeCompositor {
                     let sync_state = guard.current();
                     let has_acquire = sync_state.acquire_point.is_some();
                     let has_release = sync_state.release_point.is_some();
-                    let pid = surface
-                        .client()
-                        .map(|c| Self::pid_for_client(&c))
-                        .unwrap_or(0);
                     info!(
                         pid,
                         surface = ?surface.id(),
@@ -736,6 +1005,7 @@ impl CompositorHandler for EyeCompositor {
                 *g = Some(LatestDmabuf {
                     dmabuf: dmabuf.clone(),
                     acquire_fence: acquire_fd,
+                    buffer: buf.clone(),
                 });
             } else {
                 // Ignore SHM buffers to preserve the GPU-only contract. Do NOT clear latest_dmabuf here:
@@ -776,11 +1046,25 @@ impl XWaylandShellHandler for EyeCompositor {
         &mut self.xwayland_shell_state
     }
 
-    fn surface_associated(&mut self, _xwm_id: XwmId, surface: WlSurface, _window: X11Surface) {
-        // Do not pick a primary surface here. XWayland can associate multiple wl_surfaces, some of
-        // which may be SHM-only (cursor/overlays). We choose the primary only once a DMA-BUF commit
-        // is observed in `commit()`.
-        let _ = surface;
+    fn surface_associated(&mut self, _xwm_id: XwmId, surface: WlSurface, window: X11Surface) {
+        let wl_surface = surface.id().protocol_id();
+        let window_id = window.window_id();
+        let x11_pid = window.pid().unwrap_or(0);
+        let title = window.title();
+        let class = window.class();
+        let window_type = window.window_type();
+        let override_redirect = window.is_override_redirect();
+        info!(
+            wl_surface,
+            window_id,
+            x11_pid,
+            ?window_type,
+            override_redirect,
+            title = title.as_str(),
+            class = class.as_str(),
+            "xwayland window associated with wl_surface"
+        );
+        self.wl_surface_to_x11.insert(wl_surface, window);
     }
 }
 
@@ -846,7 +1130,7 @@ impl ShmHandler for EyeCompositor {
 }
 
 impl SeatHandler for EyeCompositor {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -961,6 +1245,10 @@ impl smithay::reexports::wayland_server::Dispatch<WlDrm, WlDrmData, EyeComposito
         _dh: &DisplayHandle,
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, EyeCompositor>,
     ) {
+        let disable_prime = std::env::var("METABONK_WL_DRM_DISABLE_PRIME")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
         match request {
             wl_drm::Request::Authenticate { .. } => {
                 resource.authenticated();
@@ -988,6 +1276,14 @@ impl smithay::reexports::wayland_server::Dispatch<WlDrm, WlDrmData, EyeComposito
                 use smithay::backend::allocator::{Fourcc, Modifier};
                 use smithay::backend::drm::DrmNode;
 
+                if disable_prime {
+                    resource.post_error(
+                        wl_drm::Error::InvalidName,
+                        "wl_drm PRIME buffers disabled (METABONK_WL_DRM_DISABLE_PRIME=1); use linux-dmabuf",
+                    );
+                    return;
+                }
+
                 if width <= 0 || height <= 0 {
                     resource.post_error(wl_drm::Error::InvalidName, "invalid buffer dimensions");
                     return;
@@ -1000,6 +1296,22 @@ impl smithay::reexports::wayland_server::Dispatch<WlDrm, WlDrmData, EyeComposito
                         return;
                     }
                 };
+
+                // Diagnostic: log PRIME buffer parameters so we can distinguish wl_drm PRIME vs linux-dmabuf flows.
+                if std::env::var("METABONK_EYE_LOG_DMABUF_IMPORTS").ok().map(|v| v.trim() == "1").unwrap_or(false) {
+                    info!(
+                        ?fourcc,
+                        w = width,
+                        h = height,
+                        stride0,
+                        offset0,
+                        stride1,
+                        offset1,
+                        stride2,
+                        offset2,
+                        "wl_drm CreatePrimeBuffer"
+                    );
+                }
 
                 let raw_fd = name.as_raw_fd();
                 let mut builder = Dmabuf::builder((width, height), fourcc, Modifier::Linear, DmabufFlags::empty());
@@ -1316,32 +1628,47 @@ pub fn spawn_wayland_xwayland_thread(
         let default_feedback = builder.build().context("build dmabuf feedback")?;
         let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<EyeCompositor>(&dh, &default_feedback);
 
-        // XWayland still expects a `wl_drm` global for device discovery and PRIME capability gating,
-        // even if it later submits buffers via `zwp_linux_dmabuf_v1`.
-        let wl_drm_global_data = {
-            use smithay::backend::drm::{DrmNode, NodeType};
-
-            let render_node = resolve_render_node_path(main_dev)
-                .with_context(|| format!("resolve wl_drm device path for main_dev=0x{:x}", main_dev as u64))?;
-            let device_node = if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
-                PathBuf::from(p)
-            } else {
-                DrmNode::from_dev_id(main_dev as _)
-                    .ok()
-                    .and_then(|n| n.dev_path_with_type(NodeType::Primary))
-                    .unwrap_or_else(|| render_node.clone())
+        let disable_wl_drm = std::env::var("METABONK_DISABLE_WL_DRM")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        let wl_drm_global_data = if disable_wl_drm {
+            warn!("wl_drm: disabled via METABONK_DISABLE_WL_DRM=1 (forcing XWayland to use linux-dmabuf + feedback)");
+            None
+        } else {
+            // XWayland still expects a `wl_drm` global for device discovery and PRIME capability gating,
+            // even if it later submits buffers via `zwp_linux_dmabuf_v1`. However, some stacks will use
+            // `wl_drm` PRIME buffers (no modifiers) which can lead to misinterpreting tiled layouts.
+            //
+            // METABONK_DISABLE_WL_DRM=1 is a diagnostic/escape hatch to force linux-dmabuf usage.
+            let data = {
+                let render_node = resolve_render_node_path(main_dev)
+                    .with_context(|| format!("resolve wl_drm device path for main_dev=0x{:x}", main_dev as u64))?;
+                // wl_drm "device" should generally be a render node so clients can open it without
+                // drm master / authentication. Exposing a primary node (card*) requires a real
+                // drmAuthMagic implementation, which we intentionally do not provide in this
+                // headless compositor.
+                //
+                // Allow overriding for experiments via METABONK_DRM_CARD_NODE, but default to the
+                // render node resolved from linux-dmabuf feedback.
+                let device_node = if let Ok(p) = std::env::var("METABONK_DRM_CARD_NODE") {
+                    PathBuf::from(p)
+                } else {
+                    render_node.clone()
+                };
+                WlDrmGlobalData {
+                    device_path: device_node.to_string_lossy().to_string(),
+                    main_dev: main_dev as u64,
+                    formats: vec![
+                        Fourcc::Argb8888 as u32,
+                        Fourcc::Xrgb8888 as u32,
+                        Fourcc::Abgr8888 as u32,
+                        Fourcc::Xbgr8888 as u32,
+                    ],
+                    capabilities: wl_drm::Capability::Prime as u32,
+                }
             };
-            WlDrmGlobalData {
-                device_path: device_node.to_string_lossy().to_string(),
-                main_dev: main_dev as u64,
-                formats: vec![
-                    Fourcc::Argb8888 as u32,
-                    Fourcc::Xrgb8888 as u32,
-                    Fourcc::Abgr8888 as u32,
-                    Fourcc::Xbgr8888 as u32,
-                ],
-                capabilities: wl_drm::Capability::Prime as u32,
-            }
+            Some(data)
         };
 
         // Advertise a headless wl_output. XWayland (and other clients) expect at least one output
@@ -1367,6 +1694,15 @@ pub fn spawn_wayland_xwayland_thread(
         }
 
         let drm_syncobj_state: Option<DrmSyncobjState> = (|| {
+            let disable = std::env::var("METABONK_DISABLE_DRM_SYNCOBJ")
+                .ok()
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false);
+            if disable {
+                warn!("linux-drm-syncobj-v1 disabled via METABONK_DISABLE_DRM_SYNCOBJ=1");
+                return None;
+            }
+
             use smithay::backend::drm::DrmDeviceFd;
             use smithay::utils::DeviceFd;
             use std::os::unix::fs::MetadataExt;

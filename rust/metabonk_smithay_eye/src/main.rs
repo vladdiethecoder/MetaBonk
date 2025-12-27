@@ -7,7 +7,7 @@ mod xwayland_watchdog;
 
 use std::{
     fs,
-    os::fd::IntoRawFd,
+    os::fd::{AsRawFd, IntoRawFd},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     args::Args,
-    compositor::{spawn_wayland_xwayland_thread, LatestDmabuf},
+    compositor::{export_dmabuf_read_sync_file, spawn_wayland_xwayland_thread, LatestDmabuf},
     frame_socket::FrameServer,
     vulkan_producer::{VkSelect, VulkanProducer},
 };
@@ -133,12 +133,16 @@ fn main() -> anyhow::Result<()> {
         }
         prev_connected = connected_now;
 
-        let (dmabuf, acquire_fd) = {
+        let (dmabuf, acquire_fd, buffer_hold) = {
             let mut guard = latest_dmabuf.lock().unwrap();
             if let Some(latest) = guard.as_mut() {
-                (Some(latest.dmabuf.clone()), latest.acquire_fence.take())
+                (
+                    Some(latest.dmabuf.clone()),
+                    latest.acquire_fence.take(),
+                    Some(latest.buffer.clone()),
+                )
             } else {
-                (None, None)
+                (None, None, None)
             }
         };
         if !saw_xwayland_dmabuf && dmabuf.is_some() {
@@ -178,19 +182,35 @@ fn main() -> anyhow::Result<()> {
         }
 
         let render_res = if let Some(d) = dmabuf.as_ref() {
+            let mut acquire_fd = acquire_fd;
+            if acquire_fd.is_none() {
+                match export_dmabuf_read_sync_file(d) {
+                    Ok(Some(fd)) => {
+                        debug!(fence_fd = fd.as_raw_fd(), "exported implicit dmabuf sync_file fence (late)");
+                        acquire_fd = Some(fd);
+                    }
+                    Ok(None) => {
+                        debug!("no implicit dmabuf sync_file fence exported (late)");
+                    }
+                    Err(e) => {
+                        warn!("failed to export implicit dmabuf sync_file fence (late): {e}");
+                    }
+                }
+            }
             let wait_fd = acquire_fd.map(|fd| fd.into_raw_fd());
+            let buffer_hold = buffer_hold.clone();
             if args.xwayland && passthrough {
                 let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
-                producer.render_passthrough_dmabuf(d, Some((w, h)), wait_fd)
+                producer.render_passthrough_dmabuf(d, Some((w, h)), wait_fd, buffer_hold)
             } else {
-                match producer.render_from_dmabuf(d, wait_fd) {
+                match producer.render_from_dmabuf(d, wait_fd, buffer_hold) {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         if args.xwayland && passthrough {
                             // Optional fallback within GPU-only constraints.
                             warn!("render_from_dmabuf failed; falling back to passthrough: {e}");
                             let (w, h) = export_size.lock().map(|s| *s).unwrap_or((args.width, args.height));
-                            producer.render_passthrough_dmabuf(d, Some((w, h)), None)
+                            producer.render_passthrough_dmabuf(d, Some((w, h)), None, None)
                         } else {
                             warn!("render_from_dmabuf failed with passthrough disabled: {e}");
                             Err(e)
