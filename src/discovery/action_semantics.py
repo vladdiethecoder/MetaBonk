@@ -152,15 +152,15 @@ class ActionSemanticLearner:
 
         if reward > 0.2:
             return "goal_progress_action"
-        if mean_pixel < 0.005 and perceptual < 1e-6:
+        if mean_pixel < 0.002 and perceptual < 1e-6:
             return "no_effect_or_disabled"
         if perceptual > 0.25:
             return "major_transition"
-        if edge > (mean_pixel * 1.5 + 1e-8) and mean_pixel > 0.01:
+        # Sparse toy envs produce small mean_pixel deltas; keep thresholds modest.
+        if edge > (mean_pixel * 1.5 + 1e-8) and mean_pixel > 0.003:
             return "camera_or_ui_action"
-        if center_dom > 0.6 and mean_pixel > 0.01:
+        if center_dom > 0.6 and mean_pixel > 0.003:
             return "movement_or_character_action"
         if mean_pixel > 0.02:
             return "interaction_action"
         return "minor_change_action"
-

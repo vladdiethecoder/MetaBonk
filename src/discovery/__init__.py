@@ -9,13 +9,15 @@ from .input_explorer import InputExplorer, InteractionEnv
 from .effect_detector import EffectDetector
 from .action_semantics import ActionSemanticLearner
 from .action_space_constructor import LearnedActionSpace
+from .pipeline import AutonomousDiscoveryPipeline, DiscoveryArtifacts
 
 __all__ = [
     "ActionSemanticLearner",
+    "AutonomousDiscoveryPipeline",
+    "DiscoveryArtifacts",
     "EffectDetector",
     "InputEnumerator",
     "InputExplorer",
     "InteractionEnv",
     "LearnedActionSpace",
 ]
-

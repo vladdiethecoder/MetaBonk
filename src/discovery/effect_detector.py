@@ -190,11 +190,11 @@ class EffectDetector:
             return "positive_reward"
         if reward_delta < -0.1:
             return "negative_reward"
-        if spatial.center_dominated and mean_change > 0.01:
+        # In toy environments, motion can be sparse; use a modest threshold.
+        if spatial.center_dominated and mean_change > 0.003:
             return "center_motion_or_action"
-        if spatial.edge_change > (spatial.center_change * 1.5 + 1e-8) and mean_change > 0.01:
+        if spatial.edge_change > (spatial.center_change * 1.5 + 1e-8) and mean_change > 0.003:
             return "camera_or_ui_edge_change"
         if perceptual_change > 0.25:
             return "major_transition"
         return "minor_change"
-
