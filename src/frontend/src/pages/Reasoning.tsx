@@ -7,6 +7,19 @@ import useActivationResizeKick from "../hooks/useActivationResizeKick";
 import { fetchInstances, fetchWorkerStatus, type InstanceView } from "../api";
 import { fmtPct01 } from "../lib/format";
 
+type ThoughtPacket = {
+  __meta_event?: string;
+  step?: number | null;
+  strategy?: string;
+  confidence?: number;
+  content?: string;
+  instance_id?: string;
+  worker_id?: number;
+  ts?: number;
+  ts_unix?: number;
+  payload?: any;
+};
+
 export default function Reasoning() {
   const loc = useLocation();
   const isActive = loc.pathname === "/reasoning";
@@ -40,6 +53,34 @@ export default function Reasoning() {
 
   const mb2 = (statusQ.data?.metabonk2 ?? null) as any;
   const plan = (mb2?.debug?.plan ?? []) as any[];
+
+  const [thoughts, setThoughts] = useState<ThoughtPacket[]>([]);
+  const tauriAvailable = typeof window !== "undefined" && Boolean((window as any).__TAURI__);
+
+  useEffect(() => {
+    if (!tauriAvailable) return;
+    let unlisten: null | (() => void) = null;
+    (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen<ThoughtPacket>("agent-thought", (event) => {
+          const pkt = (event.payload ?? {}) as ThoughtPacket;
+          setThoughts((prev) => [pkt, ...prev].slice(0, 200));
+        });
+      } catch {
+        // Ignore: not running under Tauri, or plugin unavailable.
+      }
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [tauriAvailable]);
+
+  const thoughtRows = useMemo(() => {
+    if (!selected) return thoughts;
+    const sel = String(selected);
+    return thoughts.filter((t) => String(t?.instance_id ?? "") === sel);
+  }, [selected, thoughts]);
 
   const rows = useMemo(() => {
     const ids = Object.keys(instances);
@@ -79,6 +120,43 @@ export default function Reasoning() {
       <QueryStateGate query={instQ} label="instances" />
 
       <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <div className="card" style={{ gridColumn: "1 / -1" }}>
+          <div className="row-between">
+            <div className="title">Thought Stream</div>
+            <div className="muted" style={{ marginLeft: "auto" }}>
+              {tauriAvailable ? "live (Tauri)" : "run under Tauri to enable live thought packets"}
+            </div>
+          </div>
+          {tauriAvailable && thoughtRows.length === 0 ? (
+            <div className="muted" style={{ marginTop: 8 }}>
+              waiting for agent-thought events…
+            </div>
+          ) : tauriAvailable ? (
+            <div style={{ marginTop: 8, maxHeight: 260, overflow: "auto" }}>
+              {thoughtRows.slice(0, 50).map((t, i) => (
+                <div key={i} className="card" style={{ marginBottom: 8 }}>
+                  <div className="row-between">
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      step {t.step ?? "—"} · {String(t.instance_id ?? "—")}
+                    </div>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      {fmtPct01(Number(t.confidence ?? 0))}
+                    </div>
+                  </div>
+                  <div style={{ fontWeight: 600, marginTop: 4 }}>{String(t.strategy ?? "—")}</div>
+                  <div className="muted" style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>
+                    {String(t.content ?? "")}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="muted" style={{ marginTop: 8 }}>
+              (non-Tauri mode) Thought packets are disabled.
+            </div>
+          )}
+        </div>
+
         <div className="card">
           <div className="title">MetaBonk2</div>
           {!controlUrl ? (

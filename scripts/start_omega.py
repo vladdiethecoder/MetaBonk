@@ -28,6 +28,7 @@ import sys
 import time
 import shutil
 import json
+import threading
 import ctypes.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -411,6 +412,75 @@ def _probe_gst_encoder(gst_inspect: str, enc: str) -> Optional[str]:
     if "plugin couldn't be loaded" in txt or "couldn't be loaded" in txt or "failed to load" in txt:
         return "plugin failed to load"
     return None
+
+
+def _forward_meta_events_enabled(env: Dict[str, str]) -> bool:
+    return _truthy(env.get("METABONK_FORWARD_META_EVENTS", "0"))
+
+
+def _tail_meta_events(
+    path: Path,
+    *,
+    worker_id: int,
+    instance_id: str,
+    stop_event: threading.Event,
+    start_at_end: bool = True,
+) -> None:
+    """Tail a worker log and re-emit structured meta-events to stdout (JSONL).
+
+    Worker stdout is usually redirected into `runs/<run_id>/logs/worker_<i>.log` (or an equivalent
+    logs directory). This preserves artifacts but makes it hard for a higher-level supervisor
+    (e.g. Tauri) to stream structured events to the UI. When enabled, we tail the log and forward
+    only JSON lines that contain a `__meta_event` envelope.
+    """
+
+    try:
+        f = path.open("r", encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        # Best-effort: wait briefly for the log file to be created.
+        deadline = time.time() + 5.0
+        f = None
+        while time.time() < deadline and not stop_event.is_set():
+            try:
+                f = path.open("r", encoding="utf-8", errors="replace")
+                break
+            except FileNotFoundError:
+                time.sleep(0.1)
+        if f is None:
+            return
+    except Exception:
+        return
+
+    with f:
+        try:
+            if start_at_end:
+                f.seek(0, os.SEEK_END)
+        except Exception:
+            pass
+
+        while not stop_event.is_set():
+            line = f.readline()
+            if not line:
+                time.sleep(0.05)
+                continue
+            if "__meta_event" not in line:
+                continue
+            s = line.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(obj, dict) or "__meta_event" not in obj:
+                continue
+            obj.setdefault("worker_id", int(worker_id))
+            obj.setdefault("instance_id", str(instance_id))
+            obj.setdefault("ts_unix", time.time())
+            try:
+                print(json.dumps(obj, separators=(",", ":")), flush=True)
+            except Exception:
+                pass
 
 
 def _read_nvidia_gpu_models() -> List[str]:
@@ -1199,6 +1269,8 @@ def main() -> int:
         )
 
     procs: List[Proc] = []
+    forward_meta = _forward_meta_events_enabled(env)
+    meta_stop = threading.Event()
     try:
         if not args.no_orchestrator:
             procs.append(
@@ -1298,6 +1370,46 @@ def main() -> int:
         logs_dir = Path(run_dir) / "logs" if run_dir else None
         if logs_dir:
             logs_dir.mkdir(parents=True, exist_ok=True)
+        autonomous_mode = _truthy(env.get("METABONK_AUTONOMOUS_MODE"))
+        auto_seed_buttons: Optional[str] = None
+        auto_input_space: Optional[dict] = None
+        if autonomous_mode and not (
+            env.get("METABONK_INPUT_BUTTONS") or env.get("METABONK_INPUT_KEYS") or env.get("METABONK_BUTTON_KEYS")
+        ):
+            try:
+                from src.discovery import InputEnumerator, select_seed_buttons  # type: ignore
+
+                auto_input_space = InputEnumerator().get_input_space_spec()
+                try:
+                    max_buttons = int(env.get("METABONK_AUTO_SEED_MAX_BUTTONS", "16"))
+                except Exception:
+                    max_buttons = 16
+                auto_seed_buttons = ",".join(select_seed_buttons(auto_input_space, max_buttons=max_buttons))
+            except Exception as e:
+                auto_seed_buttons = None
+                auto_input_space = None
+                print(f"[start_omega] WARN: autonomous input seed failed: {e}")
+
+        if autonomous_mode and run_dir and auto_input_space:
+            try:
+                disc_dir = Path(run_dir) / "discovery"
+                disc_dir.mkdir(parents=True, exist_ok=True)
+                (disc_dir / "input_space.json").write_text(json.dumps(auto_input_space, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                if auto_seed_buttons:
+                    (disc_dir / "seed_buttons.json").write_text(
+                        json.dumps(
+                            {
+                                "buttons": [s for s in auto_seed_buttons.split(",") if s],
+                                "created_at": time.time(),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                pass
         seen_worker_ports: set[str] = set()
         seen_sidecar_ports: set[str] = set()
         seen_bonklink_ports: set[str] = set()
@@ -1339,7 +1451,10 @@ def main() -> int:
                 or wenv.get("METABONK_INPUT_KEYS")
                 or wenv.get("METABONK_BUTTON_KEYS")
             ):
-                wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN"
+                if autonomous_mode and auto_seed_buttons:
+                    wenv["METABONK_INPUT_BUTTONS"] = auto_seed_buttons
+                else:
+                    wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN"
             if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                 wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
             worker_port = str(wenv.get("WORKER_PORT") or "")
@@ -1615,6 +1730,13 @@ def main() -> int:
                     stdout_path=str(worker_log) if worker_log else None,
                 )
             )
+            if forward_meta and worker_log:
+                threading.Thread(
+                    target=_tail_meta_events,
+                    args=(Path(worker_log),),
+                    kwargs={"worker_id": i, "instance_id": iid, "stop_event": meta_stop},
+                    daemon=True,
+                ).start()
 
         # UI (Vite)
         if bool(getattr(args, "ui", True)):
@@ -1643,6 +1765,7 @@ def main() -> int:
             if stop:
                 return
             stop = True
+            meta_stop.set()
             print(f"[start_omega] received {sig}, shutting down...")
             _terminate_all(procs)
 
@@ -1662,9 +1785,11 @@ def main() -> int:
             ret = _supervise(procs, supervise_workers=True, max_restarts=max_restarts, backoff_s=backoff_s)
         else:
             ret = _wait_until_exit(procs)
+        meta_stop.set()
         _terminate_all(procs)
         return ret
     finally:
+        meta_stop.set()
         _terminate_all(procs)
         # Last-resort cleanup for stragglers is handled by the top-level launcher
         # (`scripts/start.py` / `./start`). Avoid running stop.py from within omega

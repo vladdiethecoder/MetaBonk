@@ -54,6 +54,7 @@ node_modules/
 /gameplay_videos/
 /highlights/
 /skill_vectors/
+/cache/
 /temp/
 /tmp/
 /runs/

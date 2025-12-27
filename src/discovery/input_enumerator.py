@@ -23,13 +23,13 @@ from typing import Dict, Iterable, List, Optional, Set
 
 @dataclass(frozen=True)
 class KeyboardSpec:
-    available_keys: List[int]
+    available_keys: List[str]
 
 
 @dataclass(frozen=True)
 class MouseSpec:
-    axes: List[int]
-    buttons: List[int]
+    axes: List[str]
+    buttons: List[str]
 
 
 @dataclass(frozen=True)
@@ -59,8 +59,25 @@ class InputSpaceSpec:
 class InputEnumerator:
     """Enumerate input devices/capabilities (best-effort)."""
 
-    def __init__(self, *, event_glob: str = "/dev/input/event*") -> None:
+    def __init__(
+        self,
+        *,
+        event_glob: str = "/dev/input/event*",
+        key_name_blocklist: Optional[Set[str]] = None,
+    ) -> None:
         self.event_glob = str(event_glob)
+        self._key_name_blocklist = set(key_name_blocklist or set())
+        # Avoid keys that can affect the host OS/session.
+        self._key_name_blocklist.update(
+            {
+                "KEY_POWER",
+                "KEY_SLEEP",
+                "KEY_SUSPEND",
+                "KEY_WAKEUP",
+                "KEY_SYSRQ",
+                "KEY_MACRO",
+            }
+        )
 
     def get_input_space_spec(self) -> Dict[str, object]:
         return self.discover().to_dict()
@@ -125,16 +142,16 @@ class InputEnumerator:
         keyboard_nodes: Iterable[str],
         mouse_nodes: Iterable[str],
         warnings: List[str],
-    ) -> tuple[Set[int], Set[int], Set[int]]:
+    ) -> tuple[Set[str], Set[str], Set[str]]:
         try:
             import evdev  # type: ignore
         except Exception as e:
             warnings.append(f"evdev unavailable: {e}")
             return set(), set(), set()
 
-        keys: Set[int] = set()
-        axes: Set[int] = set()
-        buttons: Set[int] = set()
+        keys: Set[str] = set()
+        axes: Set[str] = set()
+        buttons: Set[str] = set()
 
         # Keyboards: EV_KEY codes.
         for path in keyboard_nodes:
@@ -145,7 +162,20 @@ class InputEnumerator:
                 caps = dev.capabilities()
                 ev_key = caps.get(evdev.ecodes.EV_KEY) or []
                 if ev_key:
-                    keys.update(int(x) for x in ev_key)
+                    for code in ev_key:
+                        try:
+                            name = evdev.ecodes.keys.get(int(code))
+                        except Exception:
+                            name = None
+                        if isinstance(name, (list, tuple)):
+                            name = name[0] if name else None
+                        if not isinstance(name, str) or not name:
+                            continue
+                        if not name.startswith("KEY_"):
+                            continue
+                        if name in self._key_name_blocklist:
+                            continue
+                        keys.add(name)
             except Exception as e:
                 warnings.append(f"evdev keyboard read failed for {path}: {e}")
 
@@ -158,17 +188,26 @@ class InputEnumerator:
                 caps = dev.capabilities()
                 ev_rel = caps.get(evdev.ecodes.EV_REL) or []
                 ev_key = caps.get(evdev.ecodes.EV_KEY) or []
-                axes.update(int(x) for x in ev_rel)
+                for code in ev_rel:
+                    try:
+                        rel = evdev.ecodes.REL.get(int(code))
+                    except Exception:
+                        rel = None
+                    if isinstance(rel, (list, tuple)):
+                        rel = rel[0] if rel else None
+                    if isinstance(rel, str) and rel:
+                        axes.add(rel)
                 # Keep only BTN_* in buttons; leave KEY_* to keyboard.
                 for code in ev_key:
                     try:
-                        name = evdev.ecodes.keys.get(int(code), "")
+                        name = evdev.ecodes.keys.get(int(code))
                     except Exception:
-                        name = ""
+                        name = None
+                    if isinstance(name, (list, tuple)):
+                        name = name[0] if name else None
                     if isinstance(name, str) and name.startswith("BTN_"):
-                        buttons.add(int(code))
+                        buttons.add(name)
             except Exception as e:
                 warnings.append(f"evdev mouse read failed for {path}: {e}")
 
         return keys, axes, buttons
-

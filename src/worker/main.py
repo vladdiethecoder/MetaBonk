@@ -4781,10 +4781,12 @@ class WorkerService:
 
                     img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
                     frame_arr = np.asarray(img)
+                    step_now = int(getattr(self.trainer, "step_count", 0) or 0)
                     mb2_cont, mb2_disc = self._metabonk2_controller.step(
                         frame_arr,
                         game_state,
                         time_budget_ms=self._metabonk2_time_budget_ms,
+                        step=step_now,
                     )
 
                     # Override discrete controls only when using OS-level input backend. In BonkLink

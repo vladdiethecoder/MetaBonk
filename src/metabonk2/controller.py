@@ -28,6 +28,7 @@ from src.agent.reasoning.metacognition import MetacognitiveController, Metacogni
 from src.agent.reasoning.system1 import ReflexivePolicy, ReflexivePolicyConfig
 from src.agent.reasoning.system2 import DeliberativePlanner, IntentSpace
 from src.agent.skills.library import SkillLibrary
+from src.common.observability import emit_thought
 
 
 @dataclass
@@ -111,6 +112,8 @@ class MetaBonk2Controller:
         self._skill_t_remaining: int = 0
         self._last_debug: Dict[str, Any] = {}
         self._episode_start_ts = time.time()
+        self._last_thought_ts: float = 0.0
+        self._last_thought_sig: str = ""
 
         # RNG for placeholder skills.
         seed = int(os.environ.get("METABONK2_SEED", "0") or "0")
@@ -126,6 +129,7 @@ class MetaBonk2Controller:
         game_state: Dict[str, Any],
         *,
         time_budget_ms: Optional[float] = None,
+        step: Optional[int] = None,
     ) -> Tuple[List[float], List[int]]:
         if torch is None:  # pragma: no cover
             raise ImportError("torch is required for MetaBonk2Controller")
@@ -166,6 +170,54 @@ class MetaBonk2Controller:
         }
         if self.cfg.log_reasoning and _env_flag("METABONK2_LOG", default=False):
             print(f"[MetaBonk2] mode={mode} intent={intent.name} skill={self._last_debug['skill']}", flush=True)
+
+        # UI-only: structured "thought packets" for the Reasoning Console (Tauri).
+        if _env_flag("METABONK2_EMIT_THOUGHTS", default=False) or _env_flag("METABONK_EMIT_THOUGHTS", default=False):
+            try:
+                now = time.time()
+                min_interval_s = float(os.environ.get("METABONK_THOUGHT_MIN_INTERVAL_S", "0.5") or "0.5")
+                if min_interval_s < 0:
+                    min_interval_s = 0.0
+
+                plan_items: List[dict] = []
+                if isinstance(dbg, dict) and isinstance(dbg.get("plan"), list):
+                    plan_items = [p for p in dbg.get("plan") if isinstance(p, dict)]
+
+                sig = f"{mode}:{getattr(intent, 'name', '')}:{getattr(self._current_skill, 'name', '')}:{len(plan_items)}"
+                if plan_items:
+                    sig += ":" + ",".join(str(p.get("name", "")) for p in plan_items[:4])
+
+                if sig != self._last_thought_sig or (now - self._last_thought_ts) >= min_interval_s:
+                    self._last_thought_sig = sig
+                    self._last_thought_ts = now
+
+                    if plan_items:
+                        plan_txt = ", ".join(
+                            f"{p.get('name', 'intent')}({int(p.get('estimated_steps', 0) or 0)})" for p in plan_items[:6]
+                        )
+                        content = f"{dbg.get('mode', 'System 2')} plan: {plan_txt}" if plan_txt else str(dbg.get("mode", "System 2"))
+                        strategy = str(dbg.get("mode", "System 2"))
+                    else:
+                        content = f"{dbg.get('mode', 'System 1')} skill={getattr(self._current_skill, 'name', 'noop')}"
+                        strategy = str(dbg.get("mode", "System 1"))
+
+                    emit_thought(
+                        step=step,
+                        strategy=strategy,
+                        confidence=float(dbg.get("confidence", 0.0) or 0.0) if isinstance(dbg, dict) else 0.0,
+                        content=content,
+                        payload={
+                            "mode": mode,
+                            "intent": getattr(intent, "name", "idle"),
+                            "skill": getattr(self._current_skill, "name", "noop") if self._current_skill else "noop",
+                            "skill_remaining": int(self._skill_t_remaining),
+                            "novelty": float(dbg.get("novelty", 0.0) or 0.0) if isinstance(dbg, dict) else 0.0,
+                            "uncertainty": float(dbg.get("uncertainty", 0.0) or 0.0) if isinstance(dbg, dict) else 0.0,
+                            "plan": plan_items[:12],
+                        },
+                    )
+            except Exception:
+                pass
 
         return a_cont, a_disc
 
@@ -225,4 +277,3 @@ __all__ = [
     "MetaBonk2Controller",
     "MetaBonk2ControllerConfig",
 ]
-

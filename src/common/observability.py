@@ -12,6 +12,8 @@ with a future Postgres/Prometheus/Otel backend.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -61,3 +63,47 @@ class Event(MBBaseModel):
     step: Optional[int] = None
     ts: float = time.time()
     payload: Dict[str, Any] = {}
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    v = str(os.environ.get(name, default) or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def emit_meta_event(payload: Dict[str, Any]) -> None:
+    """Emit a structured JSONL packet for UI interceptors (Tauri).
+
+    Disabled by default. Enable with `METABONK_EMIT_META_EVENTS=1`.
+    """
+    if not _env_truthy("METABONK_EMIT_META_EVENTS", default="0"):
+        return
+    out: Dict[str, Any] = dict(payload or {})
+    out.setdefault("ts", time.time())
+    out.setdefault("run_id", os.environ.get("METABONK_RUN_ID"))
+    out.setdefault("instance_id", os.environ.get("INSTANCE_ID") or os.environ.get("MEGABONK_INSTANCE_ID"))
+    try:
+        print(json.dumps(out, ensure_ascii=False, separators=(",", ":")), flush=True)
+    except Exception:
+        # Never let UI telemetry crash a worker.
+        return
+
+
+def emit_thought(
+    *,
+    step: Optional[int] = None,
+    strategy: str,
+    confidence: float,
+    content: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Emit a System 2 reasoning trace packet (UI-only)."""
+    base: Dict[str, Any] = {
+        "__meta_event": "reasoning_trace",
+        "step": int(step) if step is not None else None,
+        "strategy": str(strategy),
+        "confidence": float(confidence),
+        "content": str(content),
+    }
+    if payload:
+        base["payload"] = dict(payload)
+    emit_meta_event(base)

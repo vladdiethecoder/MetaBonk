@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -64,6 +65,23 @@ fn drain_stream(app: AppHandle, stream: impl std::io::Read + Send + 'static, eve
     for line in reader.lines() {
       match line {
         Ok(l) => {
+          let trimmed = l.trim_start();
+          if trimmed.starts_with('{') && l.contains("\"__meta_event\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+              if let Some(kind) = v.get("__meta_event").and_then(|x| x.as_str()) {
+                match kind {
+                  "reasoning_trace" => {
+                    let _ = app.emit("agent-thought", v);
+                    continue;
+                  }
+                  _ => {
+                    let _ = app.emit("omega-meta", v);
+                    continue;
+                  }
+                }
+              }
+            }
+          }
           let _ = app.emit(event, l);
         }
         Err(_) => break,
@@ -120,6 +138,14 @@ fn start_omega(app: AppHandle, state: State<'_, OmegaState>, mode: String, worke
   }
 
   let py = python_bin();
+  let now_s = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+  let run_id = format!("run-tauri-{now_s}");
+  let run_dir = repo_root.join("runs").join(&run_id);
+  let _ = std::fs::create_dir_all(run_dir.join("logs"));
+
   let mut cmd = Command::new(py);
   cmd.arg("-u")
     .arg("scripts/start_omega.py")
@@ -129,10 +155,17 @@ fn start_omega(app: AppHandle, state: State<'_, OmegaState>, mode: String, worke
     .arg(workers.to_string())
     .arg("--no-ui")
     .current_dir(&repo_root)
+    .env("METABONK_RUN_ID", &run_id)
+    .env("METABONK_RUN_DIR", run_dir.to_string_lossy().to_string())
+    .env("MEGABONK_LOG_DIR", run_dir.to_string_lossy().to_string())
     // Bake in the capture fixes: Synthetic Eye + focus enforcement.
     .env("METABONK_SYNTHETIC_EYE", "1")
     .env("METABONK_EYE_FORCE_FOCUS", "1")
     .env("METABONK_EYE_IMPORT_OPAQUE_OPTIMAL", "1")
+    // UI telemetry: structured meta events forwarded from worker logs.
+    .env("METABONK_EMIT_META_EVENTS", "1")
+    .env("METABONK_EMIT_THOUGHTS", "1")
+    .env("METABONK_FORWARD_META_EVENTS", "1")
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
