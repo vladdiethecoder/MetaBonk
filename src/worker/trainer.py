@@ -67,12 +67,37 @@ class Trainer:
         self.net = net_cls(self.obs_dim, self.cfg).to(self.device)
         self.net.eval()
         self.lstm_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._cortex = None
+        self._cortex_cfg = None
+        try:
+            from src.agent.optimization import SiliconCortexConfig
+
+            self._cortex_cfg = SiliconCortexConfig.from_env()
+        except Exception:
+            self._cortex_cfg = None
 
     def set_weights_b64(self, b64: str):
         raw = base64.b64decode(b64)
         state = torch.load(io.BytesIO(raw), map_location=self.device)
         self.net.load_state_dict(state)
         self.last_update_ts = time.time()
+
+    def _maybe_init_cortex(self, *, example_obs: torch.Tensor) -> None:
+        if self._cortex is not None:
+            return
+        if self._cortex_cfg is None or not bool(getattr(self._cortex_cfg, "enabled", False)):
+            return
+        # Keep the compiled path simple; LSTM graphs are shape/state sensitive.
+        if bool(getattr(self.cfg, "use_lstm", False)):
+            return
+        try:
+            from src.agent.optimization import SiliconCortex
+
+            self._cortex = SiliconCortex(self.net, cfg=self._cortex_cfg, device=torch.device(self.device))
+            self._cortex.optimize(example_obs=example_obs)
+        except Exception:
+            self._cortex = None
+            return
 
     @torch.no_grad()
     def act(
@@ -93,25 +118,65 @@ class Trainer:
         mask_t = None
         if action_mask is not None:
             mask_t = torch.tensor(action_mask, dtype=torch.long, device=self.device).unsqueeze(0)
+
+        # Best-effort compiled forward path (CUDA only).
+        self._maybe_init_cortex(example_obs=obs_t)
+        cortex = self._cortex
+
         if self.cfg.use_lstm:
             mu, std, logits, value, new_state = self.net.forward(obs_t, self.lstm_state)
             if new_state is not None:
                 self.lstm_state = (new_state[0].detach(), new_state[1].detach())
-            cont_dist = torch.distributions.Normal(mu, std)
-            disc_dists = []
-            for i, l in enumerate(logits):
-                if mask_t is not None and i == 0:
-                    l = self.net._mask_logits(l, mask_t)
-                disc_dists.append(torch.distributions.Categorical(logits=l))
+        elif cortex is not None and getattr(cortex, "compiled", False):
+            mu, std, logits, value, _ = cortex.forward(obs_t)
         else:
-            cont_dist, disc_dists, value = self.net.dist_and_value(obs_t, action_mask=mask_t)
-        a_cont = cont_dist.sample()
-        a_disc = torch.stack([d.sample() for d in disc_dists], dim=-1)
+            mu, std, logits, value, _ = self.net.forward(obs_t)
 
-        cont_lp = cont_dist.log_prob(a_cont).sum(-1)
+        # Apply mask to first discrete head if compatible.
+        logits_list = list(logits or [])
+        if mask_t is not None and logits_list:
+            try:
+                if tuple(mask_t.shape) == tuple(logits_list[0].shape) and float(mask_t.sum().item()) >= 1.0:
+                    logits_list[0] = self.net._mask_logits(logits_list[0], mask_t)
+            except Exception:
+                pass
+
+        # Sample on-device (avoid distribution object overhead).
+        deterministic = os.environ.get("METABONK_ACT_DETERMINISTIC", "0") in ("1", "true", "True")
+        if deterministic:
+            a_cont = mu
+        else:
+            a_cont = mu + std * torch.randn_like(mu)
+
+        # Continuous log-prob (Normal), in float32 for stability.
+        if deterministic:
+            cont_lp = torch.zeros((a_cont.shape[0],), device=a_cont.device, dtype=torch.float32)
+        else:
+            import math
+
+            mu_f = mu.float()
+            std_f = std.float().clamp(min=1e-6)
+            a_f = a_cont.float()
+            log_std = torch.log(std_f)
+            cont_lp = (-0.5 * (((a_f - mu_f) / std_f) ** 2 + 2.0 * log_std + math.log(2.0 * math.pi))).sum(-1)
+
         disc_lp = torch.zeros_like(cont_lp)
-        for i, d in enumerate(disc_dists):
-            disc_lp += d.log_prob(a_disc[:, i])
+        disc_actions: list[torch.Tensor] = []
+        for l in logits_list:
+            l_f = l.float()
+            if deterministic:
+                idx = l_f.argmax(dim=-1)
+            else:
+                probs = torch.softmax(l_f, dim=-1)
+                idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            disc_actions.append(idx)
+            try:
+                lp_i = torch.log_softmax(l_f, dim=-1).gather(1, idx.unsqueeze(-1)).squeeze(-1)
+                disc_lp = disc_lp + lp_i
+            except Exception:
+                pass
+        a_disc = torch.stack(disc_actions, dim=-1) if disc_actions else torch.zeros((a_cont.shape[0], 0), device=a_cont.device, dtype=torch.long)
+
         lp = (cont_lp + disc_lp).item()
         val = value.item()
 

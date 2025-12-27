@@ -238,6 +238,32 @@ class WorkerService:
         self.host = host
         self.port = port
         self.launcher = GameLauncher(instance_id=instance_id, display=display)
+
+        # Optional stream overlay text file (used by ffmpeg drawtext). We create it early so
+        # the encoder can reference it even before the first thought packet arrives.
+        try:
+            overlay_on = str(os.environ.get("METABONK_STREAM_OVERLAY", "0") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            overlay_path = str(os.environ.get("METABONK_STREAM_OVERLAY_FILE", "") or "").strip()
+            if overlay_on and not overlay_path:
+                run_dir = os.environ.get("METABONK_RUN_DIR") or os.environ.get("MEGABONK_LOG_DIR") or ""
+                if run_dir:
+                    try:
+                        worker_id = os.environ.get("METABONK_WORKER_ID", "0")
+                    except Exception:
+                        worker_id = "0"
+                    overlay_path = str(Path(run_dir) / "logs" / f"worker_{worker_id}_overlay.txt")
+                    os.environ["METABONK_STREAM_OVERLAY_FILE"] = overlay_path
+            if overlay_path:
+                from src.worker.stream_overlay import ensure_overlay_file  # type: ignore
+
+                ensure_overlay_file(overlay_path)
+        except Exception:
+            pass
         self._frame_source = str(os.environ.get("METABONK_FRAME_SOURCE", "pipewire") or "").strip().lower()
         if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
             if SyntheticEyeStream is None:

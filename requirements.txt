@@ -19,6 +19,7 @@ pyyaml>=6.0.0
 
 # Vision
 ultralytics>=8.0.0  # YOLO
+opencv-python>=4.8.0
 Pillow>=10.0.0
 
 # AV-RL / CLIP (optional, for real visual anomaly rewards)

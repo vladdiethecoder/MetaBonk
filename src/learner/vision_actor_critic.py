@@ -39,6 +39,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _env_str(name: str, default: str = "") -> str:
+    return str(os.environ.get(name, default) or "").strip()
+
+
 class VisionActorCritic(nn.Module):
     """ActorCritic that runs a vision encoder before policy heads."""
 
@@ -58,6 +62,12 @@ class VisionActorCritic(nn.Module):
         self.encoder = MetaBonkVisionEncoder(enc_cfg)
         self._aug_enabled = _env_bool("METABONK_VISION_AUG", True)
         self._aug_pad = _env_int("METABONK_VISION_AUG_SHIFT", 4)
+        self._infer_dtype = None
+        infer_dtype = _env_str("METABONK_VISION_INFER_DTYPE", "")
+        if infer_dtype.lower() in ("fp16", "float16", "half"):
+            self._infer_dtype = torch.float16
+        elif infer_dtype.lower() in ("bf16", "bfloat16"):
+            self._infer_dtype = torch.bfloat16
         self._try_load_encoder_ckpt()
 
         if cfg.use_lstm:
@@ -135,6 +145,12 @@ class VisionActorCritic(nn.Module):
         """Encode a batch of frames to (B, D)."""
         if obs.dtype == torch.uint8:
             obs = obs.to(dtype=torch.float32).div(255.0)
+        # Optional: cast encoder input on the worker fast-path (eval-only).
+        if not self.training and self._infer_dtype is not None and obs.device.type == "cuda":
+            try:
+                obs = obs.to(dtype=self._infer_dtype)
+            except Exception:
+                pass
         if obs.dim() != 4:
             raise ValueError(f"expected obs (B,3,H,W), got shape={tuple(obs.shape)}")
         if obs.shape[1] != 3:

@@ -166,6 +166,8 @@ fn start_omega(app: AppHandle, state: State<'_, OmegaState>, mode: String, worke
     .env("METABONK_EMIT_META_EVENTS", "1")
     .env("METABONK_EMIT_THOUGHTS", "1")
     .env("METABONK_FORWARD_META_EVENTS", "1")
+    // Stream HUD: bake mind text into the encoded stream when supported (ffmpeg drawtext).
+    .env("METABONK_STREAM_OVERLAY", "1")
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 

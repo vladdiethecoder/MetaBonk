@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union
 
 from .effect_detector import EffectDetector
+
+logger = logging.getLogger(__name__)
 
 
 class InteractionEnv(Protocol):
@@ -47,6 +52,47 @@ class InputExplorer:
         self.input_space = dict(input_space_spec or {})
         self.effect_detector = effect_detector
         self.input_effect_map: Dict[str, Any] = {}
+
+    def explore_all(
+        self,
+        env: InteractionEnv,
+        *,
+        exploration_budget: int = 5000,
+        hold_frames: int = 30,
+    ) -> Dict[str, Any]:
+        """Explore keyboard + mouse within a rough budget.
+
+        `exploration_budget` is interpreted as an approximate *probe count* budget
+        (not environment steps). This method caps how many keys are tested to keep
+        runtime bounded on large enumerated key sets.
+        """
+        exploration_budget = max(1, int(exploration_budget))
+        hold_frames = max(1, int(hold_frames))
+
+        # Heuristic allocation: keyboard dominates, but keep some budget for mouse.
+        keyboard_budget = max(1, int(exploration_budget * 0.9))
+        mouse_budget = max(1, exploration_budget - keyboard_budget)
+
+        kb = self.input_space.get("keyboard") or {}
+        keys = list(kb.get("available_keys") or [])
+        max_keys = max(1, keyboard_budget // 2)  # 2 probes per key: press + hold
+        keys_to_test = keys[:max_keys]
+
+        logger.info("Starting input exploration (budget=%s probes)", exploration_budget)
+        logger.info("Keyboard: testing %s keys (of %s total)", len(keys_to_test), len(keys))
+        self.explore_keyboard(env, budget_steps=keyboard_budget, hold_frames=hold_frames, keys=keys_to_test)
+
+        logger.info("Mouse: testing (budget=%s probes)", mouse_budget)
+        self.explore_mouse(env, budget_steps=mouse_budget)
+
+        return self.input_effect_map
+
+    def save_results(self, output_path: Path) -> None:
+        """Persist `input_effect_map` to JSON for inspection."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(self.input_effect_map, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        logger.info("Saved exploration results to %s", output_path)
 
     def explore_keyboard(
         self,
@@ -130,4 +176,3 @@ class InputExplorer:
             self.input_effect_map[f"mouse_btn_{b}"] = self.effect_detector.detect_effect(obs_before, obs_after)
 
         return self.input_effect_map
-

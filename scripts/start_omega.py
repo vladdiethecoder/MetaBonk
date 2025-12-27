@@ -1426,6 +1426,11 @@ def main() -> int:
             wenv["METABONK_BONKLINK_HOST"] = str(args.bonklink_host)
             wenv["METABONK_BONKLINK_PORT"] = str(args.bonklink_base_port + i)
             wenv["METABONK_WORKER_ID"] = str(i)
+            if logs_dir is not None:
+                try:
+                    wenv.setdefault("METABONK_STREAM_OVERLAY_FILE", str(logs_dir / f"worker_{i}_overlay.txt"))
+                except Exception:
+                    pass
             if force_gpu_env:
                 wenv.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
                 wenv.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")

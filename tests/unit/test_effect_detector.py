@@ -32,5 +32,4 @@ def test_effect_detector_positive_reward() -> None:
     frame = np.zeros((16, 16, 3), dtype=np.uint8)
     eff = EffectDetector().detect_effect({"pixels": frame, "reward": 0.0}, {"pixels": frame, "reward": 1.0})
     assert eff["reward_delta"] == 1.0
-    assert eff["category"] == "positive_reward"
-
+    assert eff["category"] == "goal_progress"

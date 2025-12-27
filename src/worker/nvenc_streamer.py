@@ -45,6 +45,8 @@ _FFMPEG_ENCODER_CACHE: dict[str, bool] = {}
 _FFMPEG_ENCODERS_TXT: Optional[str] = None
 _FFMPEG_BSFS_CACHE: dict[str, bool] = {}
 _FFMPEG_BSFS_TXT: Optional[str] = None
+_FFMPEG_FILTER_CACHE: dict[str, bool] = {}
+_FFMPEG_FILTERS_TXT: Optional[str] = None
 _FFMPEG_FPS_MODE_SUPPORTED: Optional[bool] = None
 _STREAM_LOG_LAST: dict[str, float] = {}
 
@@ -81,6 +83,42 @@ def _log_stream_event(event: str, **fields: object) -> None:
 
 def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ffmpeg_filter_available(ffmpeg: str, name: str) -> bool:
+    """Best-effort `ffmpeg -filters` probe with caching."""
+    global _FFMPEG_FILTERS_TXT
+    n = str(name or "").strip().lower()
+    if not n:
+        return False
+    cached = _FFMPEG_FILTER_CACHE.get(n)
+    if cached is not None:
+        return bool(cached)
+    if _FFMPEG_FILTERS_TXT is None:
+        try:
+            out = subprocess.check_output([ffmpeg, "-hide_banner", "-filters"], stderr=subprocess.STDOUT, timeout=2.0)
+            _FFMPEG_FILTERS_TXT = out.decode("utf-8", "replace").lower()
+        except Exception:
+            _FFMPEG_FILTERS_TXT = ""
+    ok = f" {n} " in _FFMPEG_FILTERS_TXT or f".{n} " in _FFMPEG_FILTERS_TXT
+    _FFMPEG_FILTER_CACHE[n] = bool(ok)
+    return bool(ok)
+
+
+def _ffmpeg_escape_drawtext_path(path: str) -> str:
+    # drawtext uses ':' as a key separator; escape it in file paths.
+    s = str(path or "")
+    return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _find_font_file(candidates: list[str]) -> Optional[str]:
+    for p in candidates:
+        try:
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
 
 def _pipewiresrc_selector(target: str) -> str:
     """Return the correct pipewiresrc selector assignment for a given target.
@@ -925,6 +963,61 @@ class NVENCStreamer:
             "pipe:0",
             "-an",
         ]
+
+        # Optional: mind HUD overlay (best-effort). Enabled by setting:
+        #   METABONK_STREAM_OVERLAY=1
+        #   METABONK_STREAM_OVERLAY_FILE=/path/to/text.txt
+        overlay_file = str(os.environ.get("METABONK_STREAM_OVERLAY_FILE", "") or "").strip()
+        overlay_on = _env_truthy("METABONK_STREAM_OVERLAY") and bool(overlay_file)
+        if overlay_on:
+            extra_out_l = extra_out.lower()
+            # Avoid clobbering user-provided filter graphs.
+            if ("-vf" in extra_out_l or "-filter:" in extra_out_l or "-filter_complex" in extra_out_l) and not _env_truthy(
+                "METABONK_STREAM_OVERLAY_FORCE"
+            ):
+                _log_stream_event("stream_overlay_skipped", reason="user_filter_present")
+            elif not _ffmpeg_filter_available(ffmpeg, "drawtext"):
+                _log_stream_event("stream_overlay_unavailable", reason="ffmpeg_drawtext_missing")
+            else:
+                font_override = str(os.environ.get("METABONK_STREAM_OVERLAY_FONTFILE", "") or "").strip()
+                fontfile = _find_font_file(
+                    [font_override]
+                    + [
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    ]
+                )
+                try:
+                    fontsize = int(os.environ.get("METABONK_STREAM_OVERLAY_FONTSIZE", "28"))
+                except Exception:
+                    fontsize = 28
+                try:
+                    x = int(os.environ.get("METABONK_STREAM_OVERLAY_X", "20"))
+                except Exception:
+                    x = 20
+                try:
+                    y = int(os.environ.get("METABONK_STREAM_OVERLAY_Y", "20"))
+                except Exception:
+                    y = 20
+                tf = _ffmpeg_escape_drawtext_path(overlay_file)
+                parts = [
+                    f"textfile='{tf}'",
+                    "reload=1",
+                    "fontcolor=0x00ff00",
+                    f"fontsize={max(8, fontsize)}",
+                    "box=1",
+                    "boxcolor=0x000000@0.38",
+                    "boxborderw=8",
+                    f"x={x}",
+                    f"y={y}",
+                ]
+                if fontfile:
+                    parts.append(f"fontfile='{_ffmpeg_escape_drawtext_path(fontfile)}'")
+                # Keep filtergraph simple: just drawtext on decoded frames.
+                cmd += ["-vf", "drawtext=" + ":".join(parts)]
+                _log_stream_event("stream_overlay_enabled", file=overlay_file, font=fontfile or "default")
 
         # Encoder options.
         if enc.endswith("_nvenc"):

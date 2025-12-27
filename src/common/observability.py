@@ -107,3 +107,20 @@ def emit_thought(
     if payload:
         base["payload"] = dict(payload)
     emit_meta_event(base)
+
+    # Optional: update a stream overlay text file for ffmpeg drawtext filters.
+    try:
+        overlay_path = str(os.environ.get("METABONK_STREAM_OVERLAY_FILE", "") or "").strip()
+        if overlay_path:
+            from src.worker.stream_overlay import write_thought_overlay  # type: ignore
+
+            write_thought_overlay(
+                step=int(step) if step is not None else None,
+                strategy=str(strategy),
+                confidence=float(confidence),
+                content=str(content),
+                path=overlay_path,
+            )
+    except Exception:
+        # Never let overlays break workers.
+        return
