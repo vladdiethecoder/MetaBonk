@@ -87,6 +87,7 @@ Documentation
 - **MetaBonk2 Controller**: `docs/metabonk2.md`
 - **Compositor Paradigms**: `docs/compositor_paradigms.md`
 - **Zero‑Copy Desktop RL (Smithay + PyTorch + Tauri)**: `docs/zero_copy_desktop_rl.md`
+- **Production AGI Platform Upgrade Plan**: `docs/production_agi_platform_plan.md`
 
 Design Philosophy
 -----------------
