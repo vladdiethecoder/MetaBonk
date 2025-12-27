@@ -94,10 +94,12 @@ class SemanticClusterer:
 
         clusters_dict: Dict[int, Dict[str, Any]] = {}
         outliers: List[str] = []
+        outlier_indices: List[int] = []
 
         for idx, label in enumerate(labels.tolist()):
             if int(label) == -1:
                 outliers.append(str(input_ids[idx]))
+                outlier_indices.append(int(idx))
                 continue
             cid = int(label)
             if cid not in clusters_dict:
@@ -121,6 +123,27 @@ class SemanticClusterer:
                     "avg_confidence": float(avg_conf),
                 }
             )
+
+        # Promote outliers to singleton clusters so downstream action space
+        # construction can still select rare-but-critical actions (e.g. JUMP,
+        # INTERACT, unique menu toggles).
+        next_cluster_id = (max(clusters_dict.keys()) + 1) if clusters_dict else 0
+        for idx in outlier_indices:
+            rep = features[idx].tolist()
+            in_id = str(input_ids[idx])
+            semantic_label = self._infer_semantic_label(rep, [in_id])
+            clusters.append(
+                {
+                    "cluster_id": int(next_cluster_id),
+                    "inputs": [in_id],
+                    "representative_effect": [float(x) for x in rep],
+                    "semantic_label": str(semantic_label),
+                    "size": 1,
+                    "avg_confidence": float(confidences[idx]),
+                    "is_outlier": True,
+                }
+            )
+            next_cluster_id += 1
 
         clusters.sort(key=lambda c: int(c.get("size") or 0), reverse=True)
         stats = {
@@ -224,20 +247,28 @@ class SemanticClusterer:
     def _infer_semantic_label(self, rep_effect: List[float], input_ids: List[str]) -> str:
         # rep_effect indices correspond to _extract_features() order.
         mean_px = float(rep_effect[0]) if len(rep_effect) > 0 else 0.0
+        max_px = float(rep_effect[1]) if len(rep_effect) > 1 else 0.0
         reward = float(rep_effect[4]) if len(rep_effect) > 4 else 0.0
         flow = float(rep_effect[5]) if len(rep_effect) > 5 else 0.0
         center_dom = float(rep_effect[8]) if len(rep_effect) > 8 else 0.0
         uniform = float(rep_effect[10]) if len(rep_effect) > 10 else 0.0
 
-        movement_keys = any(k in set(input_ids) for k in ("KEY_W", "KEY_A", "KEY_S", "KEY_D"))
-        mouse_keys = any("mouse" in str(k).lower() or str(k).startswith("BTN_") for k in input_ids)
+        norm_ids = {str(k).strip().upper() for k in input_ids}
+        movement_keys = any(k in norm_ids for k in ("KEY_W", "KEY_A", "KEY_S", "KEY_D", "MOVE_UP", "MOVE_LEFT", "MOVE_DOWN", "MOVE_RIGHT"))
+        mouse_keys = any(("MOUSE" in k) or k.startswith("BTN_") for k in norm_ids)
 
         if abs(reward) > 0.1:
             return "goal_progress" if reward > 0 else "penalty"
         if flow > 5.0 and uniform > 0.5:
             return "camera_control" if mouse_keys else "camera_action"
-        if center_dom > 0.5 and mean_px > 0.01:
-            return "movement" if movement_keys else "character_action"
+        # Low-area sprites (e.g., mock env dot) can yield tiny mean_px even when the
+        # action is clearly meaningful. Use max_px as a second signal. Also, don't
+        # require "center dominated" for movement keys; the subject may be near the
+        # edge of the frame during exploration.
+        if movement_keys and (mean_px > 0.001 or max_px > 0.3):
+            return "movement"
+        if center_dom > 0.5 and (mean_px > 0.001 or max_px > 0.3):
+            return "character_action"
         if mean_px < 1e-6:
             return "no_effect"
         if mean_px > 0.08:
@@ -266,4 +297,3 @@ class SemanticClusterer:
 
 
 __all__ = ["SemanticClusterer"]
-

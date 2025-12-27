@@ -157,9 +157,9 @@ class ActionSemanticLearner:
         if perceptual > 0.25:
             return "major_transition"
         # Sparse toy envs produce small mean_pixel deltas; keep thresholds modest.
-        if edge > (mean_pixel * 1.5 + 1e-8) and mean_pixel > 0.003:
+        if edge > (mean_pixel * 1.5 + 1e-8) and mean_pixel > 0.001:
             return "camera_or_ui_action"
-        if center_dom > 0.6 and mean_pixel > 0.003:
+        if center_dom > 0.6 and mean_pixel > 0.001:
             return "movement_or_character_action"
         if mean_pixel > 0.02:
             return "interaction_action"

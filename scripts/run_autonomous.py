@@ -18,8 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Optional, Sequence
 
 from src.discovery import EffectDetector, InputEnumerator, InputExplorer, select_seed_buttons
 
@@ -34,6 +35,99 @@ def _load_json(path: Path) -> Dict[str, Any]:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _run_stop_all(*, reason: str) -> None:
+    """Best-effort stop of prior MetaBonk jobs to free GPU/VRAM resources."""
+    repo_root = _repo_root()
+    logger.info("Preflight: stopping existing MetaBonk processes (%s)", reason)
+    try:
+        proc = subprocess.run(
+            ["python3", "scripts/stop.py", "--all"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.stdout.strip():
+            logger.info("stop.py stdout:\n%s", proc.stdout.strip())
+        if proc.stderr.strip():
+            logger.warning("stop.py stderr:\n%s", proc.stderr.strip())
+    except Exception as exc:
+        logger.warning("Preflight stop failed: %s", exc)
+
+
+def _parse_csv(value: Optional[str]) -> list[str]:
+    if not value:
+        return []
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def _apply_key_scope(
+    cache_dir: Path,
+    input_space: Dict[str, Any],
+    *,
+    key_scope: str,
+    custom_keys: Sequence[str],
+    custom_buttons: Sequence[str],
+) -> Dict[str, Any]:
+    """Return a possibly-filtered input_space dict based on key_scope."""
+    kb = dict((input_space.get("keyboard") or {}))
+    mouse = dict((input_space.get("mouse") or {}))
+    keys = [str(k) for k in (kb.get("available_keys") or []) if str(k)]
+    buttons = [str(b) for b in (mouse.get("buttons") or []) if str(b)]
+
+    # Always filter out host-desktop-dangerous keys unless explicitly provided via --custom.
+    dangerous_keys = {"KEY_LEFTMETA", "KEY_RIGHTMETA"}
+    keys = [k for k in keys if k not in dangerous_keys]
+
+    scope = str(key_scope or "auto").strip().lower()
+    seed_path = cache_dir / "seed_buttons.json"
+
+    def _use_seed() -> tuple[list[str], list[str]]:
+        if seed_path.exists():
+            try:
+                seeds = _load_json(seed_path)
+            except Exception:
+                seeds = []
+        else:
+            # If Phase 0 wasn't run, we can still derive a best-effort seed set.
+            seeds = select_seed_buttons(input_space, max_buttons=16)
+            _write_json(seed_path, seeds)
+        seed_keys = [s for s in seeds if isinstance(s, str) and s in keys]
+        seed_btns = [s for s in seeds if isinstance(s, str) and s in buttons]
+        # If we couldn't match seeds (e.g. a mock input space), fall back to all.
+        return (seed_keys or keys, seed_btns or buttons)
+
+    if scope == "seed":
+        keys, buttons = _use_seed()
+    elif scope == "auto":
+        if seed_path.exists():
+            keys, buttons = _use_seed()
+    elif scope == "custom":
+        if not custom_keys and not custom_buttons:
+            raise SystemExit("--key-scope custom requires --keys and/or --mouse-buttons")
+        if custom_keys:
+            keys = list(custom_keys)
+        if custom_buttons:
+            buttons = list(custom_buttons)
+    elif scope == "all":
+        pass
+    else:
+        raise SystemExit(f"unknown --key-scope {key_scope!r} (expected: auto|seed|all|custom)")
+
+    kb["available_keys"] = list(keys)
+    kb["total_keys"] = int(len(keys))
+    mouse["buttons"] = list(buttons)
+
+    out = dict(input_space)
+    out["keyboard"] = kb
+    out["mouse"] = mouse
+    return out
 
 
 def _print_exploration_summary(effect_map: Dict[str, Any]) -> None:
@@ -119,6 +213,9 @@ def run_phase_1_exploration(
     hold_frames: int,
     use_optical_flow: bool,
     env_adapter: str,
+    key_scope: str,
+    keys: Sequence[str],
+    mouse_buttons: Sequence[str],
 ) -> Dict[str, Any]:
     """Phase 1: explore inputs and write effect_map.json."""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +224,13 @@ def run_phase_1_exploration(
     if not input_space_path.exists():
         run_phase_0(cache_dir)
     input_space = _load_json(input_space_path)
+    input_space = _apply_key_scope(
+        cache_dir,
+        input_space,
+        key_scope=key_scope,
+        custom_keys=keys,
+        custom_buttons=mouse_buttons,
+    )
 
     logger.info("PHASE 1: INPUT EXPLORATION")
     env = _make_env(env_adapter)
@@ -203,6 +307,30 @@ def main() -> None:
     parser.add_argument("--hold-frames", type=int, default=30)
     parser.add_argument("--env-adapter", default="mock", help="mock|synthetic-eye")
     parser.add_argument("--optical-flow", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--preflight-stop",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop previous MetaBonk jobs before running (auto: enabled for non-mock adapters).",
+    )
+    parser.add_argument(
+        "--post-cleanup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run scripts/stop.py --all after completion (frees VRAM but will stop running jobs).",
+    )
+    parser.add_argument(
+        "--key-scope",
+        choices=["auto", "seed", "all", "custom"],
+        default="auto",
+        help="Which keys/buttons Phase 1 should probe (auto uses seed_buttons.json when available).",
+    )
+    parser.add_argument("--keys", default="", help="Comma-separated custom keys (used with --key-scope custom).")
+    parser.add_argument(
+        "--mouse-buttons",
+        default="",
+        help="Comma-separated custom mouse buttons (used with --key-scope custom).",
+    )
     parser.add_argument("--cluster-eps", type=float, default=0.3)
     parser.add_argument("--cluster-min-samples", type=int, default=2)
     parser.add_argument("--action-space-size", type=int, default=20)
@@ -210,9 +338,18 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
+    preflight_stop = args.preflight_stop
+    if preflight_stop is None:
+        preflight_stop = str(args.env_adapter or "").strip().lower() not in ("mock",)
+    if bool(preflight_stop):
+        _run_stop_all(reason=f"env-adapter={args.env_adapter}")
+
     cache_dir = Path(args.cache_dir)
     if not args.cache_dir or str(args.cache_dir) == "cache/discovery/megabonk":
         cache_dir = Path("cache") / "discovery" / str(args.env)
+
+    custom_keys = _parse_csv(args.keys)
+    custom_buttons = _parse_csv(args.mouse_buttons)
 
     if args.phase in ("0", "all"):
         run_phase_0(cache_dir)
@@ -223,13 +360,18 @@ def main() -> None:
             hold_frames=args.hold_frames,
             use_optical_flow=bool(args.optical_flow),
             env_adapter=args.env_adapter,
+            key_scope=str(args.key_scope),
+            keys=custom_keys,
+            mouse_buttons=custom_buttons,
         )
     if args.phase in ("2", "all"):
         run_phase_2_clustering(cache_dir, eps=float(args.cluster_eps), min_samples=int(args.cluster_min_samples))
     if args.phase in ("3", "all"):
         run_phase_3_action_space(cache_dir, target_size=int(args.action_space_size))
 
+    if bool(args.post_cleanup):
+        _run_stop_all(reason="post-cleanup")
+
 
 if __name__ == "__main__":
     main()
-

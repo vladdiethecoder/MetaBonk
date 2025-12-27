@@ -19,11 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .action_semantics import ActionSemanticLearner
-from .action_space_constructor import LearnedActionSpace
+from .action_space_constructor import ActionSpaceConstructor
 from .effect_detector import EffectDetector
 from .input_enumerator import InputEnumerator
 from .input_explorer import InputExplorer, InteractionEnv
+from .semantic_clusterer import SemanticClusterer
 
 
 def _default_cache_dir() -> Path:
@@ -40,8 +40,8 @@ def _stable_json(obj: Any) -> str:
 @dataclass(frozen=True)
 class DiscoveryArtifacts:
     input_space: Dict[str, Any]
-    input_effect_map: Dict[str, Any]
-    semantic_clusters: list[Dict[str, Any]]
+    effect_map: Dict[str, Any]
+    clusters_data: Dict[str, Any]
     learned_action_space: Dict[str, Any]
 
 
@@ -84,8 +84,8 @@ class AutonomousDiscoveryPipeline:
             self.last_used_cache = True
             self.last_artifacts = DiscoveryArtifacts(
                 input_space=dict(payload.get("input_space") or {}),
-                input_effect_map=dict(payload.get("input_effect_map") or {}),
-                semantic_clusters=list(payload.get("semantic_clusters") or []),
+                effect_map=dict(payload.get("effect_map") or {}),
+                clusters_data=dict(payload.get("clusters_data") or {}),
                 learned_action_space=action_space,
             )
             # Attach cache metadata.
@@ -94,20 +94,33 @@ class AutonomousDiscoveryPipeline:
 
         # Compute fresh.
         explorer = InputExplorer(input_space, EffectDetector())
-        explorer.explore_keyboard(self.env, budget_steps=self.budget_steps, hold_frames=self.hold_frames)
-        explorer.explore_mouse(self.env, budget_steps=max(100, self.budget_steps // 10))
+        explorer.explore_all(self.env, exploration_budget=self.budget_steps, hold_frames=self.hold_frames)
 
-        semantic = ActionSemanticLearner(eps=0.2, min_samples=1)
-        clusters = semantic.learn_from_exploration(explorer.input_effect_map)
+        # Build a Phase-1 style payload for downstream clustering/selection.
+        duration_s = 0.0
+        if explorer.start_time is not None:
+            duration_s = max(0.0, time.time() - float(explorer.start_time))
+        effect_map = {
+            "metadata": {
+                "total_inputs": int(len(explorer.results)),
+                "total_tests": int(explorer.explored_count),
+                "budget": int(self.budget_steps),
+                "duration_s": float(duration_s),
+            },
+            "results": {k: [r.to_dict() for r in v] for k, v in (explorer.results or {}).items()},
+        }
 
-        os.environ["METABONK_AUTO_ACTION_SPACE_SIZE"] = str(int(self.action_space_size))
-        action_space = LearnedActionSpace(clusters, self.optimization_objective).construct_optimal_action_space()
+        clusterer = SemanticClusterer(eps=0.3, min_samples=2)
+        clusters_data = clusterer.cluster(effect_map)
+
+        constructor = ActionSpaceConstructor(target_size=int(self.action_space_size))
+        action_space = constructor.construct(clusters_data, effect_map)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "input_space": input_space,
-            "input_effect_map": explorer.input_effect_map,
-            "semantic_clusters": clusters,
+            "effect_map": effect_map,
+            "clusters_data": clusters_data,
             "learned_action_space": action_space,
             "created_at": time.time(),
         }
@@ -115,8 +128,8 @@ class AutonomousDiscoveryPipeline:
         self.last_used_cache = False
         self.last_artifacts = DiscoveryArtifacts(
             input_space=input_space,
-            input_effect_map=explorer.input_effect_map,
-            semantic_clusters=clusters,
+            effect_map=effect_map,
+            clusters_data=clusters_data,
             learned_action_space=action_space,
         )
 
@@ -130,12 +143,8 @@ class AutonomousDiscoveryPipeline:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         out.joinpath("input_space.json").write_text(_stable_json(self.last_artifacts.input_space) + "\n", encoding="utf-8")
-        out.joinpath("input_effect_map.json").write_text(
-            _stable_json(self.last_artifacts.input_effect_map) + "\n", encoding="utf-8"
-        )
-        out.joinpath("semantic_clusters.json").write_text(
-            _stable_json(self.last_artifacts.semantic_clusters) + "\n", encoding="utf-8"
-        )
+        out.joinpath("effect_map.json").write_text(_stable_json(self.last_artifacts.effect_map) + "\n", encoding="utf-8")
+        out.joinpath("action_clusters.json").write_text(_stable_json(self.last_artifacts.clusters_data) + "\n", encoding="utf-8")
         out.joinpath("learned_action_space.json").write_text(
             _stable_json(self.last_artifacts.learned_action_space) + "\n", encoding="utf-8"
         )
@@ -164,4 +173,3 @@ __all__ = [
     "AutonomousDiscoveryPipeline",
     "DiscoveryArtifacts",
 ]
-

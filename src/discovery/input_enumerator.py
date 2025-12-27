@@ -76,6 +76,9 @@ class InputEnumerator:
                 "KEY_WAKEUP",
                 "KEY_SYSRQ",
                 "KEY_MACRO",
+                # Desktop/session keys that can steal focus or open system overlays.
+                "KEY_LEFTMETA",
+                "KEY_RIGHTMETA",
             }
         )
 
