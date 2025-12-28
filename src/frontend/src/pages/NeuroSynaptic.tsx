@@ -10,17 +10,6 @@ import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
 import { useWebglResetNonce } from "../hooks/useWebglReset";
 import { isTauri } from "../lib/tauri";
 
-const NAV = [
-  { to: "/", label: "Neuro" },
-  { to: "/supervisor", label: "Supervisor" },
-  { to: "/runs", label: "Runs" },
-  { to: "/instances", label: "Instances" },
-  { to: "/build", label: "Build Lab" },
-  { to: "/skills", label: "Skills" },
-  { to: "/spy", label: "Spy" },
-  { to: "/stream", label: "Stream" },
-];
-
 type Mode = "train" | "play" | "dream";
 
 function useCanvasLoop(draw: (ctx: CanvasRenderingContext2D, t: number, w: number, h: number) => void) {
@@ -456,7 +445,7 @@ function SpecStream({ lines }: { lines: string[] }) {
 
 export default function NeuroSynaptic() {
   const loc = useLocation();
-  const isActive = loc.pathname === "/";
+  const isActive = loc.pathname === "/brain";
   useActivationResizeKick(isActive);
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 3000 });
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 3000 });
@@ -470,6 +459,16 @@ export default function NeuroSynaptic() {
     queryFn: () => fetchOverviewIssues(600),
     refetchInterval: 6000,
   });
+  const queryList = [statusQ, workersQ, healthQ, issuesQ];
+  const isLoading = queryList.some((q) => q.isLoading || q.isFetching);
+  const hasError = queryList.some((q) => q.isError);
+  const errorQuery = queryList.find((q) => q.isError);
+  const errorMsg =
+    errorQuery && errorQuery.error
+      ? errorQuery.error instanceof Error
+        ? errorQuery.error.message
+        : String(errorQuery.error)
+      : null;
 
   const [tauriReady, setTauriReady] = useState(false);
   const [omegaRunning, setOmegaRunning] = useState(false);
@@ -600,8 +599,7 @@ export default function NeuroSynaptic() {
   }, [issues, divergenceLevel]);
 
   return (
-    <QueryStateGate label="NeuroSynaptic" queries={[statusQ, workersQ, healthQ, issuesQ]}>
-      <div className="syn-shell">
+    <div className="syn-shell">
         <div className="syn-noise" />
         {isActive ? <NeuroNebula /> : <div className="canvas-placeholder" />}
         <div className="syn-scroll">
@@ -611,17 +609,10 @@ export default function NeuroSynaptic() {
             <span className="syn-brand-title">MetaBonk</span>
             <span className="syn-brand-sub">Neuro-Synaptic Interface</span>
           </div>
-          <nav className="syn-nav">
-            {NAV.map((n) => (
-              <Link key={n.to} to={n.to} className={n.to === "/" ? "active" : ""}>
-                {n.label}
-              </Link>
-            ))}
-          </nav>
           <div className="syn-status">
             <div className="syn-kpi">
               <span>System sync</span>
-              <strong>{statusQ.isError ? "offline" : "live"}</strong>
+              <strong>{hasError ? "offline" : isLoading ? "loading" : "live"}</strong>
             </div>
             <div className="syn-kpi">
               <span>Active agents</span>
@@ -635,6 +626,12 @@ export default function NeuroSynaptic() {
               <span>Last pulse</span>
               <strong>{lastSeen ? timeAgo(lastSeen) : "--"}</strong>
             </div>
+            {errorMsg ? (
+              <div className="syn-kpi">
+                <span>API</span>
+                <strong>unreachable</strong>
+              </div>
+            ) : null}
           </div>
         </header>
 
@@ -1012,7 +1009,7 @@ export default function NeuroSynaptic() {
         <footer className="syn-footer">
           <div>
             <span className="label">Cluster status</span>
-            <strong>{statusQ.isError ? "degraded" : "stable"}</strong>
+            <strong>{hasError ? "degraded" : "stable"}</strong>
           </div>
           <div>
             <span className="label">Health laggards</span>
@@ -1030,6 +1027,5 @@ export default function NeuroSynaptic() {
           </div>
         </div>
       </div>
-    </QueryStateGate>
   );
 }

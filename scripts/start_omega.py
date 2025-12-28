@@ -137,6 +137,13 @@ def _apply_discovery_artifacts(repo_root: Path, env: Dict[str, str]) -> None:
 
     If the user explicitly set relevant vars in their shell, we do not override them.
     """
+    # Allow callers (e.g., Tauri supervisor) to disable discovery wiring without
+    # removing the cached artifacts.
+    use_discovered = str(env.get("METABONK_USE_DISCOVERED_ACTIONS") or "").strip().lower()
+    if use_discovered in ("0", "false", "no", "off"):
+        print("[start_omega] 🧬 Auto-Discovery: disabled (METABONK_USE_DISCOVERED_ACTIONS=0)", flush=True)
+        return
+
     discovery_dir = _resolve_discovery_dir(repo_root, env)
     action_json = discovery_dir / "learned_action_space.json"
     config_sh = discovery_dir / "ppo_config.sh"
@@ -1581,6 +1588,23 @@ def main() -> int:
                 wenv["METABONK_WORKER_GPU"] = str(gpu_choice)
 
             if bool(getattr(args, "synthetic_eye", False)):
+                # Lock-step export: ensure both producer and worker agree on the stepping model.
+                # - Worker checks METABONK_SYNTHETIC_EYE_LOCKSTEP or METABONK_EYE_LOCKSTEP.
+                # - Producer checks METABONK_EYE_LOCKSTEP or --lockstep.
+                lockstep = str(os.environ.get("METABONK_SYNTHETIC_EYE_LOCKSTEP", "0") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ) or str(os.environ.get("METABONK_EYE_LOCKSTEP", "0") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                if lockstep:
+                    wenv["METABONK_SYNTHETIC_EYE_LOCKSTEP"] = "1"
+                    wenv["METABONK_EYE_LOCKSTEP"] = "1"
                 # Default to Vulkan export path on NVIDIA (passthrough off).
                 wenv.setdefault("METABONK_SYNTHETIC_EYE_PASSTHROUGH", "0")
                 eye_bin = str(getattr(args, "synthetic_eye_bin", "") or "").strip()
@@ -1692,6 +1716,8 @@ def main() -> int:
                     "--fps",
                     str(int(args.gamescope_fps)),
                 ]
+                if lockstep:
+                    eye_cmd.append("--lockstep")
                 # Synthetic Eye uses per-frame external semaphore FDs. Under multi-worker load, too few
                 # in-flight slots can cause the producer to recycle/destroy semaphore objects before the
                 # CUDA consumer imports them, leading to sporadic cuImportExternalSemaphore failures.

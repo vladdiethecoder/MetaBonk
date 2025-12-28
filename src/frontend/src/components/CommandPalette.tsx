@@ -31,13 +31,18 @@ export default function CommandPalette() {
 
   const commands = useMemo(() => {
     const list: Array<{ id: string; label: string; action: () => void; meta?: string }> = [];
-    list.push({ id: "open-overview", label: "Open Overview", action: () => nav(`/${qs}`) });
-    list.push({ id: "open-instances", label: "Open Instances", action: () => nav(`/instances${qs}`) });
-    list.push({ id: "open-runs", label: "Open Runs", action: () => nav(`/runs${qs}`) });
-    list.push({ id: "open-build", label: "Open Build Lab", action: () => nav(`/build${qs}`) });
-    list.push({ id: "open-skills", label: "Open Skills", action: () => nav(`/skills${qs}`) });
-    list.push({ id: "open-spy", label: "Open Spy", action: () => nav(`/spy${qs}`) });
-    list.push({ id: "open-cctv", label: "Open CCTV Wall", action: () => nav(`/cctv${qs}`) });
+    list.push({ id: "open-home", label: "Open Home", action: () => nav(`/${qs}`) });
+    list.push({ id: "open-agents", label: "Open Agents", action: () => nav(`/agents${qs}`) });
+    list.push({ id: "open-discovery", label: "Open Discovery", action: () => nav(`/discovery${qs}`) });
+    list.push({ id: "open-analytics", label: "Open Analytics", action: () => nav(`/analytics${qs}`) });
+    list.push({ id: "open-settings", label: "Open Settings", action: () => nav(`/settings${qs}`) });
+
+    list.push({ id: "open-instances", label: "Open Instances (advanced)", action: () => nav(`/instances${qs}`) });
+    list.push({ id: "open-runs", label: "Open Runs (advanced)", action: () => nav(`/runs${qs}`) });
+    list.push({ id: "open-build", label: "Open Build Lab (advanced)", action: () => nav(`/build${qs}`) });
+    list.push({ id: "open-skills", label: "Open Skills (advanced)", action: () => nav(`/skills${qs}`) });
+    list.push({ id: "open-spy", label: "Open Spy (advanced)", action: () => nav(`/spy${qs}`) });
+    list.push({ id: "open-cctv", label: "Open CCTV Wall (advanced)", action: () => nav(`/cctv${qs}`) });
 
     const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
     Object.values(instances).slice(0, 40).forEach((v) => {

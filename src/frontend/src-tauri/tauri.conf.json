@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "MetaBonk Research Platform",
+        "title": "MetaBonk Platform v2.0",
         "width": 800,
         "height": 600,
         "resizable": true,
