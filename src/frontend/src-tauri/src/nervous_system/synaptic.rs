@@ -64,6 +64,8 @@ impl SynapticCommandGate {
     synapses.insert("stop_omega", Synapse::new(Duration::from_secs_f32(2.0)));
     synapses.insert("start_discovery", Synapse::new(Duration::from_secs_f32(1.0)));
     synapses.insert("stop_discovery", Synapse::new(Duration::from_secs_f32(1.0)));
+    synapses.insert("start_training", Synapse::new(Duration::from_secs_f32(2.0)));
+    synapses.insert("process_videos", Synapse::new(Duration::from_secs_f32(2.0)));
     synapses.insert(
       "run_synthetic_eye_bench",
       Synapse::new(Duration::from_secs_f32(1.0)),
@@ -88,4 +90,3 @@ impl SynapticCommandGate {
     Ok(())
   }
 }
-

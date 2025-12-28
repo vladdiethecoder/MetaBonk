@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,18 +5,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::synaptic::SynapticState;
-use super::util::{child_is_running, drain_stream, find_repo_root, python_bin, run_stop_all};
+use super::util::{child_is_running, drain_stream, find_repo_root, python_bin, resolve_metabonk_root, run_stop_all};
+
+pub struct OmegaJob {
+  pub run_id: String,
+  pub child: Child,
+}
 
 pub struct OmegaState {
-  pub child: Mutex<Option<Child>>,
+  pub child: Mutex<Option<OmegaJob>>,
 }
 
 fn stop_omega_inner(app: Option<&AppHandle>, state: &OmegaState) {
-  let repo_root = find_repo_root();
+  let repo_root = app.and_then(|a| resolve_metabonk_root(a).ok()).or_else(find_repo_root);
   let mut guard = state.child.lock().unwrap();
-  if let Some(mut child) = guard.take() {
-    let _ = child.kill();
-    let _ = child.wait();
+  if let Some(mut job) = guard.take() {
+    let _ = job.child.kill();
+    let _ = job.child.wait();
   }
   if let Some(root) = repo_root {
     // Ensure any stragglers (Proton/Wine helpers, ffmpeg, etc.) are killed to avoid VRAM leaks.
@@ -33,8 +37,8 @@ pub fn omega_running(state: State<'_, OmegaState>) -> bool {
   let mut guard = state.child.lock().unwrap();
   match guard.as_mut() {
     None => false,
-    Some(child) => {
-      if child_is_running(child) {
+    Some(job) => {
+      if child_is_running(&mut job.child) {
         true
       } else {
         *guard = None;
@@ -44,11 +48,9 @@ pub fn omega_running(state: State<'_, OmegaState>) -> bool {
   }
 }
 
-#[tauri::command]
-pub fn start_omega(
+pub(crate) fn start_omega_inner(
   app: AppHandle,
   state: State<'_, OmegaState>,
-  syn: State<'_, SynapticState>,
   mode: String,
   workers: u32,
   env_id: Option<String>,
@@ -57,18 +59,15 @@ pub fn start_omega(
   obs_backend: Option<String>,
   use_discovered_actions: Option<bool>,
   silicon_cortex: Option<bool>,
-) -> Result<(), String> {
-  syn.gate.lock().unwrap().fire("start_omega")?;
-
-  let repo_root =
-    find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/start_omega.py)".to_string())?;
+) -> Result<String, String> {
+  let repo_root = resolve_metabonk_root(&app)?;
 
   // Stop any previously-running job before starting a new one. This prevents VRAM leaks and stuck input backends.
   run_stop_all(&repo_root);
 
   let mut guard = state.child.lock().unwrap();
-  if let Some(child) = guard.as_mut() {
-    if child_is_running(child) {
+  if let Some(job) = guard.as_mut() {
+    if child_is_running(&mut job.child) {
       return Err("omega is already running".to_string());
     }
     *guard = None;
@@ -118,6 +117,12 @@ pub fn start_omega(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
+  // Local app default: upscale featured video tiles to 1080p without changing the agent's obs tensor.
+  // Override by setting METABONK_STREAM_NVENC_TARGET_SIZE in the environment.
+  if std::env::var("METABONK_STREAM_NVENC_TARGET_SIZE").is_err() {
+    cmd.env("METABONK_STREAM_NVENC_TARGET_SIZE", "1920x1080");
+  }
+
   if let Some(v) = obs_backend.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
     cmd.env("METABONK_OBS_BACKEND", v);
   }
@@ -137,8 +142,41 @@ pub fn start_omega(
     drain_stream(app.clone(), err, "omega-stderr");
   }
 
-  *guard = Some(child);
-  Ok(())
+  *guard = Some(OmegaJob {
+    run_id: run_id.clone(),
+    child,
+  });
+  Ok(run_id)
+}
+
+#[tauri::command]
+pub fn start_omega(
+  app: AppHandle,
+  state: State<'_, OmegaState>,
+  syn: State<'_, SynapticState>,
+  mode: String,
+  workers: u32,
+  env_id: Option<String>,
+  synthetic_eye: Option<bool>,
+  synthetic_eye_lockstep: Option<bool>,
+  obs_backend: Option<String>,
+  use_discovered_actions: Option<bool>,
+  silicon_cortex: Option<bool>,
+) -> Result<(), String> {
+  syn.gate.lock().unwrap().fire("start_omega")?;
+  start_omega_inner(
+    app,
+    state,
+    mode,
+    workers,
+    env_id,
+    synthetic_eye,
+    synthetic_eye_lockstep,
+    obs_backend,
+    use_discovered_actions,
+    silicon_cortex,
+  )
+  .map(|_| ())
 }
 
 #[tauri::command]

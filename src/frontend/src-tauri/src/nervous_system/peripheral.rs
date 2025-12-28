@@ -5,8 +5,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::synaptic::SynapticState;
 use super::util::{
-  child_is_running, discovery_dir, drain_stream, find_repo_root, parse_env_exports, parse_json_from_output,
-  python_bin, read_json_file,
+  child_is_running, discovery_dir, drain_stream, parse_env_exports, parse_json_from_output, python_bin, read_json_file,
+  resolve_metabonk_root,
 };
 
 pub struct DiscoveryState {
@@ -41,8 +41,8 @@ pub fn discovery_running(state: State<'_, DiscoveryState>) -> bool {
 }
 
 #[tauri::command]
-pub fn discovery_status(env_id: String) -> Result<serde_json::Value, String> {
-  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+pub fn discovery_status(app: AppHandle, env_id: String) -> Result<serde_json::Value, String> {
+  let repo_root = resolve_metabonk_root(&app)?;
   let env_name = env_id.trim();
   let cache_dir = discovery_dir(&repo_root, env_name);
   let phase0 = cache_dir.join("input_space.json").exists();
@@ -74,8 +74,8 @@ pub fn discovery_status(env_id: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn load_action_space(env_id: String) -> Result<serde_json::Value, String> {
-  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+pub fn load_action_space(app: AppHandle, env_id: String) -> Result<serde_json::Value, String> {
+  let repo_root = resolve_metabonk_root(&app)?;
   let env_name = env_id.trim();
   let action_path = discovery_dir(&repo_root, env_name).join("learned_action_space.json");
   if !action_path.exists() {
@@ -85,8 +85,8 @@ pub fn load_action_space(env_id: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub fn load_ppo_config(env_id: String) -> Result<serde_json::Value, String> {
-  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+pub fn load_ppo_config(app: AppHandle, env_id: String) -> Result<serde_json::Value, String> {
+  let repo_root = resolve_metabonk_root(&app)?;
   let env_name = env_id.trim();
   let cfg_path = discovery_dir(&repo_root, env_name).join("ppo_config.sh");
   if !cfg_path.exists() {
@@ -107,7 +107,7 @@ pub fn start_discovery(
 ) -> Result<(), String> {
   syn.gate.lock().unwrap().fire("start_discovery")?;
 
-  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+  let repo_root = resolve_metabonk_root(&app)?;
 
   let mut guard = state.child.lock().unwrap();
   if let Some(child) = guard.as_mut() {
@@ -161,6 +161,7 @@ pub fn stop_discovery(
 
 #[tauri::command]
 pub async fn run_synthetic_eye_bench(
+  app: AppHandle,
   syn: State<'_, SynapticState>,
   id: Option<String>,
   width: Option<u32>,
@@ -170,7 +171,7 @@ pub async fn run_synthetic_eye_bench(
   full_bridge: Option<bool>,
 ) -> Result<serde_json::Value, String> {
   syn.gate.lock().unwrap().fire("run_synthetic_eye_bench")?;
-  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+  let repo_root = resolve_metabonk_root(&app)?;
   let py = python_bin();
 
   let args_id = id.unwrap_or_else(|| "tauri-bench".to_string());

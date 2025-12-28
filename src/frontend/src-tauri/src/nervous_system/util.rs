@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub fn discovery_dir(repo_root: &Path, env_id: &str) -> PathBuf {
   repo_root.join("cache").join("discovery").join(env_id)
@@ -32,6 +32,22 @@ pub fn find_repo_root() -> Option<PathBuf> {
     }
   }
   None
+}
+
+pub fn resolve_metabonk_root(app: &AppHandle) -> Result<PathBuf, String> {
+  if let Some(root) = find_repo_root() {
+    return Ok(root);
+  }
+  let resource_dir = app
+    .path()
+    .resource_dir()
+    .map_err(|e| format!("failed to resolve resource_dir: {e}"))?;
+  for cand in [resource_dir.clone(), resource_dir.join("resources")] {
+    if cand.join("scripts").join("start_omega.py").exists() && cand.join("scripts").join("stop.py").exists() {
+      return Ok(cand);
+    }
+  }
+  Err("failed to locate MetaBonk root (missing scripts/)".to_string())
 }
 
 pub fn python_bin() -> String {
@@ -129,4 +145,3 @@ pub fn parse_env_exports(path: &Path) -> Result<serde_json::Value, String> {
   }
   Ok(serde_json::Value::Object(map))
 }
-
