@@ -4,8 +4,9 @@ This repo historically used Gamescope → PipeWire for agent-loop visual ingest.
 removes PipeWire from the **agent loop** by exporting **DMA-BUF + explicit sync fence FDs** directly
 to the worker for CUDA-side import.
 
-Status: the DMABuf+fence transport and CUDA-side import/sync are implemented. Full Smithay scene
-composition (including XWayland plumbing for games) is still evolving.
+Status: the DMABuf+fence transport, CUDA-side import/sync, and Smithay+XWayland hosting path are
+implemented. The compositor path is the default in the launcher; the capture loop should be
+**game-bound** (not I/O bound) when running lock-step.
 
 ## Build the compositor exporter
 
@@ -56,6 +57,20 @@ Key env vars:
 - `METABONK_SYNTHETIC_EYE_LOCKSTEP=1` (worker: request frames via `PING`)
 - `METABONK_EYE_FORCE_FOCUS=1` (force focus to avoid Proton/XWayland focus-throttling → black frames)
 - `METABONK_EYE_IMPORT_OPAQUE_OPTIMAL=1` (force modifier-safe import path for ambiguous DMA-BUF modifiers)
+
+## Benchmark / Validate throughput
+
+Use the bench runner to validate that the vision pipeline is not the bottleneck:
+
+```bash
+python3 scripts/synthetic_eye_bench.py --fps 500 --frames 2000
+```
+
+For strict deterministic stepping (producer `--lockstep`, consumer `PING`):
+
+```bash
+python3 scripts/synthetic_eye_bench.py --lockstep --frames 2000
+```
 
 ## ABI
 
