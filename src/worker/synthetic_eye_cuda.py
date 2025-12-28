@@ -276,18 +276,6 @@ class SyntheticEyeCudaIngestor:
             except Exception:
                 dmabuf_fd_dup = None
         try:
-            acquire = self._safe_import_semaphore(frame.acquire_fence_fd, "ACQUIRE")
-            release = self._safe_import_semaphore(frame.release_fence_fd, "RELEASE")
-            if acquire is not None:
-                # Wait until compositor finished producing the frame.
-                wait_external_semaphore(acquire, stream=self.stream, value=None)
-            elif self._strict_fence_sync and not self._warned_no_fence:
-                self._warned_no_fence = True
-                print(
-                    "[WARN] Synthetic Eye missing/invalid acquire fence; running unsynchronized",
-                    flush=True,
-                )
-
             # Map DMA-BUF into CUDA. Prefer mipmapped array for tiled modifiers.
             if int(frame.modifier) != 0:
                 # RGBA8 (8 bits per channel). Order depends on producer format; treat as 4x8-bit for now.
@@ -299,6 +287,22 @@ class SyntheticEyeCudaIngestor:
                 )
             else:
                 ext_frame = import_dmabuf_as_buffer(dmabuf_fd, int(frame.size_bytes))
+            # Import semaphores after the memory mapping succeeds.
+            #
+            # Some driver stacks treat external semaphore FDs as "consume-on-import"; if we import
+            # the release fence first and then fail during memory import, we can no longer signal
+            # release in a fallback path, deadlocking the producer's buffer pool.
+            acquire = self._safe_import_semaphore(frame.acquire_fence_fd, "ACQUIRE")
+            release = self._safe_import_semaphore(frame.release_fence_fd, "RELEASE")
+            if acquire is not None:
+                # Wait until compositor finished producing the frame.
+                wait_external_semaphore(acquire, stream=self.stream, value=None)
+            elif self._strict_fence_sync and not self._warned_no_fence:
+                self._warned_no_fence = True
+                print(
+                    "[WARN] Synthetic Eye missing/invalid acquire fence; running unsynchronized",
+                    flush=True,
+                )
         except Exception:
             self.import_fail_count += 1
             self._maybe_audit()

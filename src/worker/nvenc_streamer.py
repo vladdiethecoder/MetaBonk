@@ -17,8 +17,8 @@ import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Iterator, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Iterator, Optional
 import shutil
 import re
 import select
@@ -49,6 +49,8 @@ _FFMPEG_FILTER_CACHE: dict[str, bool] = {}
 _FFMPEG_FILTERS_TXT: Optional[str] = None
 _FFMPEG_FPS_MODE_SUPPORTED: Optional[bool] = None
 _STREAM_LOG_LAST: dict[str, float] = {}
+_NVML_OK: Optional[bool] = None
+_NVML_LAST_ERR: Optional[str] = None
 
 
 def _log_stream_event(event: str, **fields: object) -> None:
@@ -83,6 +85,79 @@ def _log_stream_event(event: str, **fields: object) -> None:
 
 def _env_truthy(name: str) -> bool:
     return str(os.environ.get(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _nvml_init() -> bool:
+    """Best-effort NVML init for NVENC session accounting (optional)."""
+    global _NVML_OK, _NVML_LAST_ERR
+    if _NVML_OK is not None:
+        return bool(_NVML_OK)
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        _NVML_OK = True
+        return True
+    except Exception as e:
+        _NVML_OK = False
+        _NVML_LAST_ERR = str(e)
+        return False
+
+
+def _nvenc_sessions_used(*, gpu_index: int) -> Optional[int]:
+    """Return active encoder session count (best-effort) or None."""
+    if not _nvml_init():
+        return None
+    try:
+        import pynvml  # type: ignore
+
+        handle = pynvml.nvmlDeviceGetHandleByIndex(int(gpu_index))
+        stats = pynvml.nvmlDeviceGetEncoderStats(handle)
+        # pynvml typically returns (sessionCount, averageFps, averageLatency)
+        if isinstance(stats, tuple) and stats:
+            return int(stats[0])
+        if hasattr(stats, "sessionCount"):
+            return int(getattr(stats, "sessionCount"))
+        return None
+    except Exception:
+        return None
+
+
+def _nvenc_max_sessions() -> int:
+    try:
+        v = int(os.environ.get("METABONK_NVENC_MAX_SESSIONS", "0"))
+    except Exception:
+        v = 0
+    return max(0, int(v))
+
+
+def _nvml_gpu_index() -> Optional[int]:
+    """Best-effort mapping to an NVML device index.
+
+    - If METABONK_NVML_GPU_INDEX is set, it wins.
+    - Else if CUDA_VISIBLE_DEVICES is a numeric list, use the first index.
+    - Else fall back to 0 (common single-GPU hosts).
+
+    If CUDA_VISIBLE_DEVICES is set to a UUID (common on some systems), prefer
+    setting METABONK_NVML_GPU_INDEX explicitly.
+    """
+    raw = str(os.environ.get("METABONK_NVML_GPU_INDEX", "") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    cvd = str(os.environ.get("CUDA_VISIBLE_DEVICES", "") or "").strip()
+    if not cvd:
+        return 0
+    first = cvd.split(",")[0].strip()
+    if not first:
+        return 0
+    try:
+        return int(first)
+    except Exception:
+        return None
 
 
 def _ffmpeg_filter_available(ffmpeg: str, name: str) -> bool:
@@ -395,6 +470,18 @@ def _gst_kv_opts(elem: str, opts: dict[str, str]) -> str:
     return " ".join(out).strip()
 
 
+@dataclass
+class PixelFrame:
+    """Raw frame payload for ffmpeg rawvideo stdin."""
+
+    data: bytes
+    width: int
+    height: int
+    pix_fmt: str = "rgb24"
+    frame_id: Optional[int] = None
+    timestamp: float = 0.0
+
+
 
 @dataclass
 class NVENCConfig:
@@ -406,6 +493,9 @@ class NVENCConfig:
     preset: str = "p1"  # p1 fastest / low latency
     tune: str = "ll"    # low-latency
     container: str = "mp4"  # mp4|mpegts
+    # Optional: bypass PipeWire/X11 capture by encoding frames provided by the caller
+    # (e.g., Synthetic Eye pixel observations).
+    pixel_frame_provider: Optional[Callable[[], Optional[PixelFrame]]] = field(default=None, repr=False)
 
 
 class NVENCStreamer:
@@ -414,6 +504,7 @@ class NVENCStreamer:
         self.cfg.pipewire_node = self.cfg.pipewire_node or os.environ.get("PIPEWIRE_NODE")
         self._lock = threading.Lock()
         self._active_clients: int = 0
+        self.nvenc_sessions_used_last: Optional[int] = None
         self.last_chunk_ts: float = 0.0
         self.last_keyframe_ts: float = 0.0
         self.keyframe_count: int = 0
@@ -435,6 +526,12 @@ class NVENCStreamer:
         codec = str(self.cfg.codec or "h264").strip().lower()
         if codec in ("avc",):
             codec = "h264"
+        if requested in ("pixel_obs", "pixels"):
+            try:
+                enc = _select_ffmpeg_encoder(codec)
+            except Exception:
+                return "ffmpeg:pixel_obs"
+            return f"ffmpeg:pixel_obs:{enc}"
         if requested == "x11grab":
             try:
                 enc = _select_ffmpeg_encoder(codec)
@@ -450,6 +547,31 @@ class NVENCStreamer:
         if requested in ("gst", "gstreamer", "gst-launch"):
             return "gst"
         if requested in ("auto", ""):
+            # Synthetic Eye stacks can provide a pixel frame provider even when PIPEWIRE_NODE
+            # exists (stale / wrong node). Prefer pixel_obs when available so `/stream.mp4`
+            # stays usable without depending on PipeWire.
+            if self.cfg.pixel_frame_provider is not None:
+                try:
+                    enc = _select_ffmpeg_encoder(codec)
+                except Exception:
+                    return "ffmpeg:pixel_obs"
+                return f"ffmpeg:pixel_obs:{enc}"
+            # If there's no PipeWire capture target, prefer explicit fallbacks.
+            target = str(os.environ.get("PIPEWIRE_NODE") or self.cfg.pipewire_node or "").strip()
+            if not target:
+                if self.cfg.pixel_frame_provider is not None:
+                    try:
+                        enc = _select_ffmpeg_encoder(codec)
+                    except Exception:
+                        return "ffmpeg:pixel_obs"
+                    return f"ffmpeg:pixel_obs:{enc}"
+                disp = str(os.environ.get("DISPLAY") or "").strip()
+                if disp:
+                    try:
+                        enc = _select_ffmpeg_encoder(codec)
+                    except Exception:
+                        return "ffmpeg:x11grab"
+                    return f"ffmpeg:x11grab:{enc}"
             # Prefer GStreamer GPU encoders when available; otherwise fall back to ffmpeg.
             try:
                 _select_gst_encoder(codec)
@@ -693,6 +815,14 @@ class NVENCStreamer:
         gop = max(1, int(self.cfg.gop))
 
         encoder = _select_gst_encoder(codec)
+        max_nvenc = _nvenc_max_sessions()
+        if max_nvenc > 0 and encoder.startswith("nv"):
+            gpu_idx = _nvml_gpu_index()
+            if gpu_idx is not None:
+                used = _nvenc_sessions_used(gpu_index=gpu_idx)
+                self.nvenc_sessions_used_last = used
+                if used is not None and int(used) >= int(max_nvenc):
+                    raise RuntimeError(f"NVENC session limit reached (used={used} max={max_nvenc})")
         enc_opts: list[str] = []
         enc_props = _gst_element_properties(encoder)
         if encoder.startswith("nv"):
@@ -771,6 +901,11 @@ class NVENCStreamer:
             # Default to fastpath for NVENC (avoid CPU-bound videoconvert at 60fps).
             prefer_fastpath = "1" if encoder.startswith("nv") else "0"
         use_videoconvert = bool(force_videoconvert) or (prefer_fastpath not in ("1", "true", "yes", "on"))
+        if _env_truthy("METABONK_STREAM_REQUIRE_ZERO_COPY") and use_videoconvert:
+            raise RuntimeError(
+                "zero-copy streaming requires fastpath (disable videoconvert); "
+                "set METABONK_STREAM_PIPEWIRE_FASTPATH=1 and keep gst-nvcodec available"
+            )
         try:
             pw_min = int(os.environ.get("METABONK_PIPEWIRE_MIN_BUFFERS", "8"))
         except Exception:
@@ -931,6 +1066,14 @@ class NVENCStreamer:
         bitrate = str(self.cfg.bitrate or "6M").strip() or "6M"
 
         enc = _select_ffmpeg_encoder(codec)
+        max_nvenc = _nvenc_max_sessions()
+        if max_nvenc > 0 and "nvenc" in str(enc):
+            gpu_idx = _nvml_gpu_index()
+            if gpu_idx is not None:
+                used = _nvenc_sessions_used(gpu_index=gpu_idx)
+                self.nvenc_sessions_used_last = used
+                if used is not None and int(used) >= int(max_nvenc):
+                    raise RuntimeError(f"NVENC session limit reached (used={used} max={max_nvenc})")
 
         # OBS-like defaults: low-latency, no audio, fragment-friendly containers.
         # Keep options conservative across encoders; users can override via env.
@@ -1031,6 +1174,15 @@ class NVENCStreamer:
         else:
             cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop), "-force_key_frames", "0"]
 
+        # Browser-friendly default: force H.264/MP4 output to 4:2:0 so MSE decoders don't reject
+        # 4:4:4 / 10-bit formats (users can override via METABONK_FFMPEG_OUT_OPTS).
+        try:
+            has_out_pix_fmt = "-pix_fmt" in (extra_out.split() if extra_out else [])
+        except Exception:
+            has_out_pix_fmt = False
+        if not has_out_pix_fmt:
+            cmd += ["-pix_fmt", "yuv420p"]
+
         if extra_out:
             cmd += extra_out.split()
 
@@ -1070,6 +1222,8 @@ class NVENCStreamer:
             gop=gop,
             width=width,
             height=height,
+            in_pix_fmt=str(pix_fmt or ""),
+            out_pix_fmt="user" if has_out_pix_fmt else "yuv420p",
         )
         self.backend = f"ffmpeg:{enc}"
         return p
@@ -1117,6 +1271,7 @@ class NVENCStreamer:
         container_name = str(container or self.cfg.container or "mp4").strip().lower()
         if container_name not in ("mp4", "mpegts", "h264"):
             container_name = "mp4"
+        require_zero_copy = _env_truthy("METABONK_STREAM_REQUIRE_ZERO_COPY")
         if container_name == "h264":
             # Only valid for H.264. Avoid producing an undecodable elementary stream.
             codec = str(self.cfg.codec or "h264").strip().lower()
@@ -1128,15 +1283,39 @@ class NVENCStreamer:
                     self._active_clients = max(0, int(self._active_clients) - 1)
                 return
 
-        backend = self._normalize_backend(os.environ.get("METABONK_STREAM_BACKEND", "auto"))
+        requested_backend = self._normalize_backend(os.environ.get("METABONK_STREAM_BACKEND", "auto"))
+        backend = requested_backend
         # Browser-friendly note:
         # - MSE requires an init segment (ftyp+moov) before media fragments.
         # - GStreamer's mp4mux frequently finalizes moov at EOS (even when fragmented),
         #   which makes a live HTTP MP4 stream unusable for MSE in practice.
         # Prefer FFmpeg for MP4 (unless explicitly overridden).
-        allow_gst_mp4 = _env_truthy("METABONK_STREAM_ALLOW_GST_MP4")
-        if container_name == "mp4" and not allow_gst_mp4 and backend not in ("ffmpeg", "x11grab"):
+        allow_gst_mp4 = _env_truthy("METABONK_STREAM_ALLOW_GST_MP4") or bool(require_zero_copy)
+        if container_name == "mp4" and not allow_gst_mp4 and backend not in ("ffmpeg", "x11grab", "pixel_obs", "pixels"):
             backend = "ffmpeg"
+
+        # Synthetic Eye: if the worker can supply pixel frames directly, prefer that path in
+        # auto mode even when PIPEWIRE_NODE is set (PIPEWIRE_NODE can be stale/wrong, leading
+        # to empty MP4 streams and blank UI tiles).
+        if not require_zero_copy and requested_backend in ("", "auto") and self.cfg.pixel_frame_provider is not None:
+            backend = "pixel_obs"
+
+        # Auto mode fallback: if PipeWire capture isn't available (common in fully headless stacks),
+        # fall back to X11 capture (still NVENC/VAAPI encode) rather than returning an empty MP4.
+        #
+        # This keeps `/stream.mp4` usable for smoke tests and the dev UI even when gamescope
+        # doesn't expose a PipeWire node in the current environment.
+        if not require_zero_copy and requested_backend in ("", "auto") and backend != "x11grab":
+            target = str(os.environ.get("PIPEWIRE_NODE") or self.cfg.pipewire_node or "").strip()
+            if not target:
+                if self.cfg.pixel_frame_provider is not None:
+                    backend = "pixel_obs"
+                    _log_stream_event("pixel_obs_fallback", reason="PIPEWIRE_NODE missing")
+                else:
+                    disp = str(os.environ.get("DISPLAY") or "").strip()
+                    if disp:
+                        backend = "x11grab"
+                        _log_stream_event("x11grab_fallback", reason="PIPEWIRE_NODE missing")
         try:
             with self._lock:
                 active = int(self._active_clients)
@@ -1149,6 +1328,14 @@ class NVENCStreamer:
             container=container_name,
             backend=backend,
         )
+        if require_zero_copy and backend in ("pixel_obs", "pixels", "x11grab", "ffmpeg"):
+            self._record_error(f"zero-copy required; backend '{backend}' is not allowed")
+            with self._lock:
+                self._active_clients = max(0, int(self._active_clients) - 1)
+            return
+        if backend in ("pixel_obs", "pixels"):
+            yield from self._iter_chunks_pixel_obs(chunk_size=chunk_size, container=container_name, stop_event=stop_event)
+            return
         if backend == "x11grab":
             yield from self._iter_chunks_x11grab(chunk_size=chunk_size, container=container_name, stop_event=stop_event)
             return
@@ -1197,7 +1384,7 @@ class NVENCStreamer:
 
         def _spawn_with_fallback():
             last_exc: Optional[Exception] = None
-            for force_vc in (False, True):
+            for force_vc in ((False,) if require_zero_copy else (False, True)):
                 try:
                     pipeline, appsink = self._build_pipeline(force_videoconvert=force_vc, container=container_name)
                 except Exception as e:
@@ -1246,7 +1433,7 @@ class NVENCStreamer:
             pipeline, appsink, sample_hid = _spawn_with_fallback()
         except Exception as e:
             # Auto fallback: if gst-nvcodec isn't installed but ffmpeg can encode, use it.
-            if backend in ("", "auto"):
+            if not require_zero_copy and backend in ("", "auto"):
                 yield from self._iter_chunks_ffmpeg(chunk_size=chunk_size, container=container_name)
                 return
             self._record_error(str(e))
@@ -1372,6 +1559,236 @@ class NVENCStreamer:
                 self._active_clients = max(0, int(self._active_clients) - 1)
                 active = int(self._active_clients)
             _log_stream_event("client_disconnected", active_clients=active, container=container_name)
+
+    def _iter_chunks_pixel_obs(
+        self,
+        *,
+        chunk_size: int,
+        container: str,
+        stop_event: Optional[threading.Event],
+    ) -> Iterator[bytes]:
+        if False:  # ensure this is always a generator function
+            yield b""
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self._record_error("ffmpeg not found (required for pixel_obs stream backend)")
+            with self._lock:
+                self._active_clients = max(0, int(self._active_clients) - 1)
+            return
+
+        provider = getattr(self.cfg, "pixel_frame_provider", None)
+        if provider is None:
+            self._record_error("pixel_obs backend requested but no pixel_frame_provider configured")
+            with self._lock:
+                self._active_clients = max(0, int(self._active_clients) - 1)
+            return
+
+        stop_ev = threading.Event()
+        ffmpeg_proc: Optional[subprocess.Popen[bytes]] = None
+        ffmpeg_started = threading.Event()
+        err_lines: list[str] = []
+        err_lock = threading.Lock()
+
+        def _read_stderr(p: subprocess.Popen[bytes]) -> None:
+            try:
+                if not p.stderr:
+                    return
+                while not stop_ev.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        stop_ev.set()
+                        break
+                    line = p.stderr.readline()
+                    if not line:
+                        break
+                    s = line.decode("utf-8", "replace").strip()
+                    if not s:
+                        continue
+                    with err_lock:
+                        err_lines.append(s)
+                        if len(err_lines) > 50:
+                            del err_lines[:10]
+            except Exception:
+                return
+
+        startup_timeout_s = 12.0
+        try:
+            startup_timeout_s = float(os.environ.get("METABONK_STREAM_STARTUP_TIMEOUT_S", "12.0"))
+        except Exception:
+            startup_timeout_s = 12.0
+        if startup_timeout_s < 0.5:
+            startup_timeout_s = 0.5
+
+        fps = max(1, int(self.cfg.fps))
+        dt = 1.0 / float(fps)
+
+        def _writer() -> None:
+            nonlocal ffmpeg_proc
+            start_ts = time.time()
+            next_ts = time.time()
+            last_frame: Optional[PixelFrame] = None
+
+            while not stop_ev.is_set():
+                if stop_event is not None and stop_event.is_set():
+                    stop_ev.set()
+                    break
+
+                try:
+                    fr = provider()
+                except Exception:
+                    fr = None
+                if fr is not None and fr.data and int(fr.width) > 0 and int(fr.height) > 0:
+                    last_frame = fr
+
+                if last_frame is None:
+                    if (time.time() - start_ts) > startup_timeout_s:
+                        self._record_error("pixel_obs startup timeout (no frames available)")
+                        stop_ev.set()
+                        break
+                    time.sleep(0.01)
+                    continue
+
+                if ffmpeg_proc is None:
+                    try:
+                        ffmpeg_proc = self._spawn_ffmpeg(
+                            width=int(last_frame.width),
+                            height=int(last_frame.height),
+                            pix_fmt=str(last_frame.pix_fmt or "rgb24"),
+                            container=container,
+                        )
+                        # Annotate backend for /status observability (per-connection).
+                        try:
+                            b = str(self.backend or "")
+                            if b.startswith("ffmpeg:") and "pixel_obs" not in b:
+                                parts = b.split(":")
+                                if len(parts) == 2:
+                                    self.backend = f"ffmpeg:pixel_obs:{parts[1]}"
+                                elif len(parts) >= 3:
+                                    self.backend = f"ffmpeg:pixel_obs:{parts[-1]}"
+                                else:
+                                    self.backend = "ffmpeg:pixel_obs"
+                        except Exception:
+                            self.backend = "ffmpeg:pixel_obs"
+                        threading.Thread(target=_read_stderr, args=(ffmpeg_proc,), daemon=True).start()
+                        ffmpeg_started.set()
+                    except Exception as e:
+                        self._record_error(str(e))
+                        stop_ev.set()
+                        break
+
+                if ffmpeg_proc.poll() is not None:
+                    with err_lock:
+                        extra = "\n".join(err_lines[-10:])
+                    if extra:
+                        self._record_error(f"ffmpeg exited: {extra}")
+                    else:
+                        self._record_error(f"ffmpeg exited with code {ffmpeg_proc.returncode}")
+                    stop_ev.set()
+                    break
+
+                now = time.time()
+                if now < next_ts:
+                    time.sleep(min(0.01, next_ts - now))
+                    continue
+                next_ts += dt
+
+                try:
+                    if ffmpeg_proc.stdin:
+                        ffmpeg_proc.stdin.write(last_frame.data)
+                except BrokenPipeError:
+                    stop_ev.set()
+                    break
+                except Exception:
+                    stop_ev.set()
+                    break
+                self._record_frame_ts(time.time())
+
+        threading.Thread(target=_writer, daemon=True).start()
+
+        stall_timeout_s = 25.0
+        try:
+            stall_timeout_s = float(os.environ.get("METABONK_STREAM_STALL_TIMEOUT_S", "25.0"))
+        except Exception:
+            stall_timeout_s = 25.0
+        if stall_timeout_s < 0.5:
+            stall_timeout_s = 0.5
+
+        start_ts = time.time()
+        try:
+            if not ffmpeg_started.wait(timeout=startup_timeout_s):
+                with err_lock:
+                    extra = "\n".join(err_lines[-8:])
+                if extra:
+                    self._record_error(f"ffmpeg startup timeout:\n{extra}")
+                else:
+                    self._record_error("ffmpeg startup timeout (pixel_obs)")
+                return
+
+            assert ffmpeg_proc is not None
+            if not ffmpeg_proc.stdout:
+                self._record_error("ffmpeg stdout unavailable (pixel_obs)")
+                return
+
+            last_out_ts = 0.0
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if stop_ev.is_set():
+                    break
+                if ffmpeg_proc.poll() is not None:
+                    with err_lock:
+                        extra = "\n".join(err_lines[-10:])
+                    if extra:
+                        self._record_error(f"ffmpeg exited: {extra}")
+                    else:
+                        self._record_error(f"ffmpeg exited with code {ffmpeg_proc.returncode}")
+                    break
+                try:
+                    r, _, _ = select.select([ffmpeg_proc.stdout], [], [], 0.5)
+                except Exception:
+                    r = []
+                if not r:
+                    now = time.time()
+                    if last_out_ts <= 0.0 and (now - start_ts) >= startup_timeout_s:
+                        self._record_error("stream startup timeout (no output from ffmpeg pixel_obs)")
+                        break
+                    if last_out_ts > 0.0 and (now - last_out_ts) >= stall_timeout_s:
+                        self._record_error("stream stalled (no output from ffmpeg pixel_obs)")
+                        break
+                    continue
+                try:
+                    data = ffmpeg_proc.stdout.read(chunk_size)
+                except Exception:
+                    data = b""
+                if not data:
+                    continue
+                self._record_output_chunk(data, container)
+                last_out_ts = time.time()
+                yield data
+        finally:
+            stop_ev.set()
+            try:
+                if ffmpeg_proc is not None:
+                    try:
+                        if ffmpeg_proc.stdin:
+                            ffmpeg_proc.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        ffmpeg_proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        ffmpeg_proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            ffmpeg_proc.kill()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            with self._lock:
+                self._active_clients = max(0, int(self._active_clients) - 1)
 
     def _iter_chunks_ffmpeg(self, *, chunk_size: int, container: str, stop_event: Optional[threading.Event]) -> Iterator[bytes]:
         if False:  # ensure this is always a generator function

@@ -1,0 +1,54 @@
+profiles:
+  # Shared defaults (may be overridden per profile).
+  base:
+    streaming:
+      codec: h264
+      bitrate: 6M
+      fps: 60
+      gop: 60
+      max_clients: 3
+      nvenc_max_sessions: 0
+      pipewire_fastpath: true
+      gst_use_cuda_upload: false
+    fifo:
+      enabled: false
+      container: mpegts
+      dir: temp/streams
+    go2rtc:
+      enabled: false
+      url: http://127.0.0.1:1984
+      mode: fifo
+
+  # Developer-friendly defaults:
+  # - allow auto backend selection
+  # - keep /stream.mp4 usable for the Vite dashboard (MSE)
+  dev:
+    streaming:
+      backend: auto
+      container: mp4
+      allow_gst_mp4: false
+      require_zero_copy: false
+
+  # Production/training defaults:
+  # - deterministic backend (GStreamer)
+  # - enforce GPU-only streaming (no CPU raw-frame fallback)
+  # - prefer go2rtc + FIFO distribution for viewers
+  prod:
+    streaming:
+      backend: gst
+      container: mpegts
+      allow_gst_mp4: true
+      require_zero_copy: true
+      pipewire_fastpath: true
+      gst_use_cuda_upload: true
+      max_clients: 2
+      nvenc_max_sessions: 2
+      gop: 60
+    fifo:
+      enabled: true
+      container: mpegts
+      dir: temp/streams
+    go2rtc:
+      enabled: true
+      url: http://127.0.0.1:1984
+      mode: fifo

@@ -35,6 +35,9 @@ __pypackages__/
 node_modules/
 **/dist/
 **/build/
+src/frontend/test-results/
+src/frontend/playwright-report/
+test_report.json
 
 # === Rust ===
 /rust/target/

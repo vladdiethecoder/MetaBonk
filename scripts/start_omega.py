@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.common.gpu_contract import enforce_gpu_contract
+from src.config import apply_streaming_profile
 
 
 @dataclass
@@ -326,6 +327,33 @@ def _wait_for_compositor_env(
                 return last
         time.sleep(0.1)
     return last
+
+
+def _wait_for_xtest(*, display: str, timeout_s: float) -> Tuple[bool, str]:
+    """Wait for the XTEST extension to be available on a given DISPLAY."""
+    if shutil.which("xdpyinfo") is None:
+        return False, "xdpyinfo not found (install xorg-x11-utils)"
+    deadline = time.time() + max(0.1, float(timeout_s))
+    last_out = ""
+    while time.time() < deadline:
+        try:
+            proc = subprocess.run(
+                ["xdpyinfo", "-display", str(display), "-ext", "XTEST"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            time.sleep(0.2)
+            continue
+        out = (proc.stdout or "") + (proc.stderr or "")
+        last_out = out
+        out_l = out.lower()
+        if proc.returncode == 0 and "not supported" not in out_l and "unable to open display" not in out_l:
+            return True, out
+        time.sleep(0.2)
+    return False, last_out
 
 
 def _parse_gpu_list(raw: str) -> List[str]:
@@ -788,9 +816,14 @@ def main() -> int:
         help="Path to metabonk_eye_orchestrator binary (defaults to rust/target/*/metabonk_eye_orchestrator).",
     )
     parser.add_argument(
+        "--stream-profile",
+        default=os.environ.get("METABONK_STREAM_PROFILE", ""),
+        help="Streaming profile (from configs/streaming.yaml): dev|prod (default: based on mode).",
+    )
+    parser.add_argument(
         "--stream-backend",
-        default=os.environ.get("METABONK_STREAM_BACKEND", "auto"),
-        help="Stream backend: auto|gst|ffmpeg (default: env or auto).",
+        default=os.environ.get("METABONK_STREAM_BACKEND", ""),
+        help="Stream backend override: auto|gst|ffmpeg (default: from stream profile / env).",
     )
     parser.add_argument(
         "--dashboard-stream",
@@ -918,6 +951,13 @@ def main() -> int:
     env.setdefault("METABONK_BONKLINK_USE_PIPE", "0")
     env.setdefault("METABONK_USE_LEARNED_REWARD", "1")
     env.setdefault("METABONK_VIDEO_REWARD_CKPT", str(repo_root / "checkpoints" / "video_reward_model.pt"))
+
+    # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
+    try:
+        apply_streaming_profile(env, mode=str(args.mode), profile=str(getattr(args, "stream_profile", "") or "") or None)
+    except Exception as e:
+        print(f"[start_omega] ERROR: failed to apply streaming profile: {e}", file=sys.stderr)
+        return 1
     # Default to GPU-first streaming if PipeWire is available.
     env.setdefault("METABONK_STREAM", "1")
     env.setdefault("METABONK_STREAM_CONTAINER", "mp4")
@@ -928,6 +968,11 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_GOP", "60")
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
+    # Production/zero-copy guardrail: don't allow auto selection to drift into CPU paths.
+    if str(env.get("METABONK_STREAM_REQUIRE_ZERO_COPY") or "0").strip().lower() in ("1", "true", "yes", "on"):
+        sb = str(env.get("METABONK_STREAM_BACKEND") or "").strip().lower()
+        if sb in ("", "auto"):
+            env["METABONK_STREAM_BACKEND"] = "gst"
     # Give the UI some slack for reconnects (MSE) without permanently locking out a worker
     # due to a slow/half-closed client. The UI still enforces a per-worker lock to avoid
     # intentional multi-client contention.
@@ -965,8 +1010,17 @@ def main() -> int:
     if bool(getattr(args, "force_pipewire", False)) and bool(getattr(args, "synthetic_eye", False)):
         print("[start_omega] forcing PipeWire: disabling Synthetic Eye", flush=True)
         args.synthetic_eye = False
+    argv = set(sys.argv[1:])
+
+    def _arg_specified(*flags: str) -> bool:
+        return any(f in argv for f in flags)
+
     use_synthetic_eye = bool(getattr(args, "synthetic_eye", False))
-    public_stream = bool(getattr(args, "enable_public_stream", False)) and args.mode in ("train", "play")
+    if _arg_specified("--enable-public-stream", "--no-enable-public-stream"):
+        public_stream_requested = bool(getattr(args, "enable_public_stream", False))
+    else:
+        public_stream_requested = _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0"))
+    public_stream = bool(public_stream_requested) and args.mode in ("train", "play")
     dash_stream = str(getattr(args, "dashboard_stream", "auto") or "auto").strip().lower()
     if dash_stream == "auto":
         dash_stream = "synthetic-eye" if use_synthetic_eye else "pipewire"
@@ -979,8 +1033,24 @@ def main() -> int:
     else:
         env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
     if public_stream:
+        if _arg_specified("--public-stream-url"):
+            env["METABONK_GO2RTC_URL"] = str(args.public_stream_url)
+        env.setdefault("METABONK_GO2RTC_URL", str(args.public_stream_url))
+        if _arg_specified("--public-stream-mode"):
+            env["METABONK_GO2RTC_MODE"] = str(args.public_stream_mode)
+        env.setdefault("METABONK_GO2RTC_MODE", str(args.public_stream_mode or "fifo"))
+        if _arg_specified("--public-stream-exec-cmd"):
+            env["METABONK_GO2RTC_EXEC_CMD"] = str(args.public_stream_exec_cmd or "")
+        if _arg_specified("--public-stream-exec-profile"):
+            env["METABONK_GO2RTC_EXEC_PROFILE"] = str(args.public_stream_exec_profile or "")
+        if _arg_specified("--public-stream-exec-wrap"):
+            env["METABONK_GO2RTC_EXEC_WRAP"] = str(args.public_stream_exec_wrap or "raw")
+        if _arg_specified("--public-stream-exec-wrapper"):
+            env["METABONK_GO2RTC_EXEC_WRAPPER"] = str(args.public_stream_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh")
         env["METABONK_PUBLIC_STREAM"] = "1"
-        env["METABONK_GO2RTC_URL"] = str(args.public_stream_url)
+        env["METABONK_ENABLE_PUBLIC_STREAM"] = "1"
+    else:
+        env.setdefault("METABONK_ENABLE_PUBLIC_STREAM", "0")
     # Synthetic Eye is the default run state: when enabled, default to the compositor/XWayland hosting
     # path unless the user explicitly opts out (METABONK_SYNTHETIC_EYE_COMPOSITOR=0).
     if bool(getattr(args, "synthetic_eye", False)):
@@ -1447,7 +1517,7 @@ def main() -> int:
         base = [compose]
         if compose == "docker":
             base += ["compose"]
-        mode = str(args.public_stream_mode or "fifo").strip().lower()
+        mode = str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower()
         compose_file = "docker-compose.go2rtc.exec.yml" if mode == "exec" else "docker-compose.go2rtc.yml"
         base += ["-f", str(repo_root / "docker" / compose_file)]
         base += list(extra)
@@ -1458,7 +1528,7 @@ def main() -> int:
     try:
         if public_stream:
             try:
-                go2rtc_mode = str(args.public_stream_mode or "fifo").strip().lower()
+                go2rtc_mode = str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower()
                 if go2rtc_mode == "fifo":
                     fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
                     env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
@@ -1466,7 +1536,7 @@ def main() -> int:
                     env["METABONK_FIFO_STREAM"] = "1"
                 else:
                     env["METABONK_FIFO_STREAM"] = "0"
-                env["METABONK_GO2RTC_URL"] = str(args.public_stream_url)
+                env.setdefault("METABONK_GO2RTC_URL", "http://127.0.0.1:1984")
                 try:
                     cur_max = int(str(env.get("METABONK_STREAM_MAX_CLIENTS", "") or "1"))
                 except Exception:
@@ -1486,13 +1556,13 @@ def main() -> int:
                         "--mode",
                         go2rtc_mode,
                         "--exec-cmd-template",
-                        str(args.public_stream_exec_cmd or ""),
+                        str(env.get("METABONK_GO2RTC_EXEC_CMD") or ""),
                         "--exec-profile",
-                        str(args.public_stream_exec_profile or ""),
+                        str(env.get("METABONK_GO2RTC_EXEC_PROFILE") or ""),
                         "--exec-wrap",
-                        str(args.public_stream_exec_wrap or "raw"),
+                        str(env.get("METABONK_GO2RTC_EXEC_WRAP") or "raw"),
                         "--exec-wrapper",
-                        str(args.public_stream_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh"),
+                        str(env.get("METABONK_GO2RTC_EXEC_WRAPPER") or "scripts/go2rtc_exec_mpegts.sh"),
                         "--fifo-dir",
                         str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams")),
                         "--out",
@@ -1686,6 +1756,15 @@ def main() -> int:
             if not wenv.get("METABONK_INPUT_BACKEND"):
                 wenv["METABONK_INPUT_BACKEND"] = "libxdo" if libxdo_ok else "xdotool"
             wenv.setdefault("METABONK_INPUT_DISPLAY_WAIT_S", "20")
+            # XTEST gate: libxdo/xdotool require XTEST to inject into XWayland (gamescope or Smithay Eye).
+            # Xwayland generally exports XTEST by default, but some builds/flags disable it.
+            wenv.setdefault("METABONK_INPUT_XTEST_WAIT_S", "20")
+            if str(wenv.get("METABONK_INPUT_BACKEND") or "").strip().lower() in ("libxdo", "xdotool"):
+                # Xorg/Xwayland use `+extension` to enable and `-extension` to disable.
+                want = "+extension XTEST"
+                existing = _strip_shell_quotes(str(wenv.get("GAMESCOPE_XWAYLAND_ARGS") or "").strip())
+                if "XTEST" not in existing.upper():
+                    wenv["GAMESCOPE_XWAYLAND_ARGS"] = (existing + " " + want).strip() if existing else want
             wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "1")
             if not (
                 wenv.get("METABONK_INPUT_BUTTONS")
@@ -1876,6 +1955,11 @@ def main() -> int:
                     except Exception:
                         min_mtime_ns = None
                 eye_env = wenv.copy()
+                # Synthetic Eye -> CUDA interop: exporting a linear staging buffer can trigger
+                # sporadic cuImportExternalMemory failures on some driver stacks. The worker
+                # supports detiling modifiers via CUDA mipmapped-array import, so default to
+                # exporting the native modifier-backed image memory instead (GPU-only).
+                eye_env.setdefault("METABONK_FORCE_LINEAR_EXPORT", "0")
                 procs.append(
                     _spawn(
                         f"{iid}-eye",
@@ -1905,6 +1989,28 @@ def main() -> int:
                     wenv["METABONK_INPUT_DISPLAY"] = disp
                     wenv["WAYLAND_DISPLAY"] = wl
                     wenv["XDG_RUNTIME_DIR"] = xdg
+                    # Verify XTEST early so we fail-fast with a clear error instead of restarting the worker.
+                    if str(wenv.get("METABONK_INPUT_BACKEND") or "").strip().lower() in ("libxdo", "xdotool"):
+                        try:
+                            xtest_wait_s = float(
+                                os.environ.get(
+                                    "METABONK_XTEST_WAIT_S",
+                                    os.environ.get("METABONK_INPUT_XTEST_WAIT_S", "20"),
+                                )
+                            )
+                        except Exception:
+                            xtest_wait_s = 20.0
+                        ok, diag = _wait_for_xtest(display=disp, timeout_s=float(xtest_wait_s))
+                        if not ok:
+                            tail = (diag or "").strip()
+                            if len(tail) > 800:
+                                tail = tail[-800:]
+                            raise SystemExit(
+                                f"[start_omega] ERROR: XTEST not available on DISPLAY={disp} "
+                                f"(required for METABONK_INPUT_BACKEND={wenv.get('METABONK_INPUT_BACKEND')}). "
+                                "Install xorg-x11-utils for xdpyinfo and ensure XWayland exports XTEST.\n"
+                                f"xdpyinfo:\n{tail}"
+                            )
                     # Force X11 for the game even when the compositor exposes WAYLAND_DISPLAY.
                     wenv.pop("WAYLAND_DISPLAY", None)
                     wenv["SDL_VIDEODRIVER"] = "x11"

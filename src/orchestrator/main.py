@@ -30,7 +30,7 @@ from typing import Any, Tuple
 try:
     from fastapi import FastAPI, HTTPException
     import uvicorn
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import Response, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 except Exception as e:  # pragma: no cover
     FastAPI = None  # type: ignore
@@ -712,6 +712,28 @@ def _build_db() -> Optional[sqlite3.Connection]:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS build_runs_hash_idx ON build_runs(build_hash);")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clips (
+                    clip_url TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    worker_id TEXT,
+                    timestamp REAL DEFAULT (strftime('%s','now')),
+                    tag TEXT,
+                    agent_name TEXT,
+                    seed TEXT,
+                    policy_name TEXT,
+                    policy_version INTEGER,
+                    episode_idx INTEGER,
+                    match_duration_sec INTEGER,
+                    final_score REAL
+                );
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS clips_ts_idx ON clips(timestamp);")
+            conn.execute("CREATE INDEX IF NOT EXISTS clips_tag_ts_idx ON clips(tag, timestamp);")
+            conn.execute("CREATE INDEX IF NOT EXISTS clips_run_idx ON clips(run_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS clips_worker_idx ON clips(worker_id);")
             conn.commit()
             _build_db_conn = conn
             return conn
@@ -775,6 +797,46 @@ def _store_build_run(payload: dict[str, Any]) -> Optional[str]:
                     float(final_score) if final_score is not None else None,
                 ),
             )
+            if clip_url:
+                tag = str(payload.get("tag") or payload.get("clip_tag") or "")
+                agent_name = str(payload.get("agent_name") or payload.get("agentName") or "")
+                seed = str(payload.get("seed") or payload.get("map_seed") or payload.get("mapSeed") or "")
+                policy_name = str(payload.get("policy_name") or payload.get("policyName") or "")
+                policy_version = payload.get("policy_version") or payload.get("policyVersion")
+                episode_idx = payload.get("episode_idx") or payload.get("episodeIdx")
+                conn.execute(
+                    """
+                    INSERT INTO clips
+                    (clip_url, run_id, worker_id, timestamp, tag, agent_name, seed, policy_name, policy_version, episode_idx, match_duration_sec, final_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(clip_url) DO UPDATE SET
+                        run_id=excluded.run_id,
+                        worker_id=excluded.worker_id,
+                        timestamp=excluded.timestamp,
+                        tag=excluded.tag,
+                        agent_name=excluded.agent_name,
+                        seed=excluded.seed,
+                        policy_name=excluded.policy_name,
+                        policy_version=excluded.policy_version,
+                        episode_idx=excluded.episode_idx,
+                        match_duration_sec=excluded.match_duration_sec,
+                        final_score=excluded.final_score;
+                    """,
+                    (
+                        str(clip_url),
+                        run_id,
+                        worker_id or None,
+                        float(payload.get("timestamp") or time.time()),
+                        tag or None,
+                        agent_name or None,
+                        seed or None,
+                        policy_name or None,
+                        int(policy_version) if policy_version is not None else None,
+                        int(episode_idx) if episode_idx is not None else None,
+                        int(match_duration_sec) if match_duration_sec is not None else None,
+                        float(final_score) if final_score is not None else None,
+                    ),
+                )
             conn.commit()
         return build_hash
     except Exception:
@@ -2766,6 +2828,96 @@ if app:
         window = max(60.0, window)
         return _collect_issues(window_s=window)
 
+    @app.get("/metrics")
+    def prometheus_metrics():
+        """Prometheus exposition (best-effort, no hard dependency on prometheus_client)."""
+        if str(os.environ.get("METABONK_PROMETHEUS", "1")).strip().lower() in ("0", "false", "no", "off"):
+            raise HTTPException(status_code=404, detail="metrics disabled")
+
+        def _esc(v: str) -> str:
+            return str(v).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+        now = time.time()
+        lines: list[str] = []
+        lines.append("# HELP metabonk_workers_total Number of workers in registry.")
+        lines.append("# TYPE metabonk_workers_total gauge")
+        lines.append(f"metabonk_workers_total {len(workers)}")
+
+        lines.append("# HELP metabonk_worker_heartbeat_age_seconds Seconds since last heartbeat.")
+        lines.append("# TYPE metabonk_worker_heartbeat_age_seconds gauge")
+        lines.append("# HELP metabonk_worker_stream_ok Stream health (1 ok, 0 not ok).")
+        lines.append("# TYPE metabonk_worker_stream_ok gauge")
+        lines.append("# HELP metabonk_worker_stream_fps Observed stream FPS (best-effort).")
+        lines.append("# TYPE metabonk_worker_stream_fps gauge")
+        lines.append("# HELP metabonk_worker_stream_frame_age_seconds Seconds since last observed stream frame.")
+        lines.append("# TYPE metabonk_worker_stream_frame_age_seconds gauge")
+        lines.append("# HELP metabonk_worker_stream_keyframe_age_seconds Seconds since last observed stream keyframe.")
+        lines.append("# TYPE metabonk_worker_stream_keyframe_age_seconds gauge")
+        lines.append("# HELP metabonk_worker_stream_active_clients Active stream clients (best-effort).")
+        lines.append("# TYPE metabonk_worker_stream_active_clients gauge")
+        lines.append("# HELP metabonk_worker_stream_max_clients Max stream clients configured (best-effort).")
+        lines.append("# TYPE metabonk_worker_stream_max_clients gauge")
+        lines.append("# HELP metabonk_worker_pipewire_ok PipeWire availability (1 ok, 0 not ok).")
+        lines.append("# TYPE metabonk_worker_pipewire_ok gauge")
+        lines.append("# HELP metabonk_worker_nvenc_sessions_used NVENC sessions used (best-effort, per worker).")
+        lines.append("# TYPE metabonk_worker_nvenc_sessions_used gauge")
+
+        for iid, hb in workers.items():
+            inst = _esc(str(iid))
+            last = float(worker_last_seen.get(str(iid), 0.0) or 0.0)
+            age = max(0.0, now - last) if last > 0 else float("nan")
+            lines.append(f'metabonk_worker_heartbeat_age_seconds{{instance_id="{inst}"}} {age}')
+
+            ok = 1.0 if bool(getattr(hb, "stream_ok", False)) else 0.0
+            lines.append(f'metabonk_worker_stream_ok{{instance_id="{inst}"}} {ok}')
+
+            fps = getattr(hb, "stream_fps", None)
+            if fps is not None:
+                try:
+                    lines.append(f'metabonk_worker_stream_fps{{instance_id="{inst}"}} {float(fps)}')
+                except Exception:
+                    pass
+
+            ts = getattr(hb, "stream_last_frame_ts", None)
+            if ts is not None:
+                try:
+                    lines.append(f'metabonk_worker_stream_frame_age_seconds{{instance_id="{inst}"}} {max(0.0, now - float(ts))}')
+                except Exception:
+                    pass
+
+            kts = getattr(hb, "stream_keyframe_ts", None)
+            if kts is not None:
+                try:
+                    lines.append(f'metabonk_worker_stream_keyframe_age_seconds{{instance_id="{inst}"}} {max(0.0, now - float(kts))}')
+                except Exception:
+                    pass
+
+            ac = getattr(hb, "stream_active_clients", None)
+            if ac is not None:
+                try:
+                    lines.append(f'metabonk_worker_stream_active_clients{{instance_id="{inst}"}} {int(ac)}')
+                except Exception:
+                    pass
+
+            mc = getattr(hb, "stream_max_clients", None)
+            if mc is not None:
+                try:
+                    lines.append(f'metabonk_worker_stream_max_clients{{instance_id="{inst}"}} {int(mc)}')
+                except Exception:
+                    pass
+
+            pw_ok = 1.0 if bool(getattr(hb, "pipewire_ok", False)) else 0.0
+            lines.append(f'metabonk_worker_pipewire_ok{{instance_id="{inst}"}} {pw_ok}')
+
+            nv = getattr(hb, "nvenc_sessions_used", None)
+            if nv is not None:
+                try:
+                    lines.append(f'metabonk_worker_nvenc_sessions_used{{instance_id="{inst}"}} {int(nv)}')
+                except Exception:
+                    pass
+
+        return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
     @app.post("/issues/ack")
     def issues_ack(req: dict):
         issue_id = str(req.get("id") or req.get("fingerprint") or "")
@@ -3870,6 +4022,112 @@ if app:
                 }
             )
         return {"combo_hash": combo_hash, "total_runs_indexed": total, "examples": examples}
+
+    @app.get("/clips")
+    def list_clips(
+        limit: int = 50,
+        before: float = 0.0,
+        tag: str = "",
+        worker_id: str = "",
+        run_id: str = "",
+        seed: str = "",
+        policy_name: str = "",
+        policy_version: int = -1,
+    ):
+        """List archived clips (highlights, PBs, clutch clips) from the clip manifest DB."""
+        conn = _build_db()
+        if conn is None:
+            return {"items": [], "next_before": None, "timestamp": time.time()}
+
+        lim = max(1, min(200, int(limit)))
+        wh: list[str] = []
+        args: list[object] = []
+
+        if before and float(before) > 0:
+            wh.append("timestamp < ?")
+            args.append(float(before))
+
+        tag_raw = [t.strip() for t in str(tag or "").split(",") if t.strip()]
+        if tag_raw:
+            if len(tag_raw) == 1:
+                wh.append("tag = ?")
+                args.append(tag_raw[0])
+            else:
+                wh.append("tag IN (%s)" % (", ".join(["?"] * len(tag_raw))))
+                args.extend(tag_raw)
+
+        if str(worker_id or "").strip():
+            wh.append("worker_id = ?")
+            args.append(str(worker_id).strip())
+
+        if str(run_id or "").strip():
+            wh.append("run_id = ?")
+            args.append(str(run_id).strip())
+
+        if str(seed or "").strip():
+            wh.append("seed = ?")
+            args.append(str(seed).strip())
+
+        if str(policy_name or "").strip():
+            wh.append("policy_name = ?")
+            args.append(str(policy_name).strip())
+
+        if policy_version is not None and int(policy_version) >= 0:
+            wh.append("policy_version = ?")
+            args.append(int(policy_version))
+
+        q = (
+            "SELECT clip_url, run_id, worker_id, timestamp, tag, agent_name, seed, policy_name, policy_version, episode_idx, match_duration_sec, final_score "
+            "FROM clips"
+        )
+        if wh:
+            q += " WHERE " + " AND ".join(wh)
+        q += " ORDER BY timestamp DESC LIMIT ?"
+        args.append(int(lim))
+
+        try:
+            with _build_db_lock:
+                cur = conn.cursor()
+                cur.execute(q, args)
+                rows = cur.fetchall()
+        except Exception:
+            return {"items": [], "next_before": None, "timestamp": time.time()}
+
+        items = []
+        for row in rows:
+            (
+                clip_url,
+                rid,
+                wid,
+                ts,
+                tag_v,
+                agent_name_v,
+                seed_v,
+                policy_name_v,
+                policy_version_v,
+                episode_idx_v,
+                match_duration_v,
+                final_score_v,
+            ) = row
+            items.append(
+                {
+                    "clip_url": clip_url,
+                    "run_id": rid,
+                    "worker_id": wid,
+                    "timestamp": ts,
+                    "tag": tag_v,
+                    "agent_name": agent_name_v,
+                    "seed": seed_v,
+                    "policy_name": policy_name_v,
+                    "policy_version": policy_version_v,
+                    "episode_idx": episode_idx_v,
+                    "match_duration_sec": match_duration_v,
+                    "final_score": final_score_v,
+                }
+            )
+
+        next_before = float(items[-1]["timestamp"]) if items else None
+        return {"items": items, "next_before": next_before, "timestamp": time.time()}
 
     @app.get("/instances/{instance_id}/timeline")
     def instance_timeline(instance_id: str, window: float = 600.0, limit: int = 120):

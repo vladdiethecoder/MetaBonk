@@ -13,6 +13,8 @@ References:
 
 from __future__ import annotations
 
+import io
+import os
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,7 +36,8 @@ class GhostRun:
     
     # Position data (sampled at fixed intervals)
     # positions[i] = position at timestamp i * sample_rate
-    positions: np.ndarray  # Shape: [T, 3]
+    positions: Optional[np.ndarray]  # Shape: [T, 3] (may be packed)
+    positions_blob: Optional[bytes] = field(default=None, repr=False)
     sample_rate: float = 0.1  # 10 Hz
     
     # Classification
@@ -53,10 +56,48 @@ class GhostRun:
     
     def get_position_at(self, timestamp: float) -> Optional[np.ndarray]:
         """Get position at a specific timestamp."""
+        pos = self._load_positions()
+        if pos is None:
+            return None
         idx = int(timestamp / self.sample_rate)
-        if 0 <= idx < len(self.positions):
-            return self.positions[idx]
+        if 0 <= idx < len(pos):
+            return pos[idx]
         return None
+
+    def pack_positions(self) -> None:
+        """Best-effort: compress positions to reduce RAM/VRAM footprint.
+
+        This is intended for historic ghosts that are not actively displayed.
+        """
+        if self.positions is None or self.positions_blob is not None:
+            return
+        try:
+            arr = self.positions
+            if arr is None:
+                return
+            if getattr(arr, "dtype", None) != np.float16:
+                arr = arr.astype(np.float16, copy=False)
+            buf = io.BytesIO()
+            np.savez_compressed(buf, positions=arr)
+            self.positions_blob = buf.getvalue()
+            self.positions = None
+        except Exception:
+            return
+
+    def _load_positions(self) -> Optional[np.ndarray]:
+        if self.positions is not None:
+            return self.positions
+        if self.positions_blob is None:
+            return None
+        try:
+            buf = io.BytesIO(self.positions_blob)
+            with np.load(buf) as z:
+                if "positions" not in z:
+                    return None
+                arr = z["positions"]
+                return arr if isinstance(arr, np.ndarray) else None
+        except Exception:
+            return None
 
 
 @dataclass
@@ -101,9 +142,19 @@ class GhostEcosystem:
     one seed would clip through walls/floors on a different seed.
     """
     
-    def __init__(self, max_ghosts: int = 1000, max_ghosts_per_seed: int = 100):
-        self.max_ghosts = max_ghosts
-        self.max_ghosts_per_seed = max_ghosts_per_seed
+    def __init__(self, max_ghosts: int = 200, max_ghosts_per_seed: int = 50, hot_keep_per_seed: int = 24):
+        try:
+            self.max_ghosts = int(os.environ.get("METABONK_GHOST_MAX", str(max_ghosts)))
+        except Exception:
+            self.max_ghosts = int(max_ghosts)
+        try:
+            self.max_ghosts_per_seed = int(os.environ.get("METABONK_GHOST_MAX_PER_SEED", str(max_ghosts_per_seed)))
+        except Exception:
+            self.max_ghosts_per_seed = int(max_ghosts_per_seed)
+        try:
+            self._hot_keep_per_seed = int(os.environ.get("METABONK_GHOST_HOT_KEEP_PER_SEED", str(hot_keep_per_seed)))
+        except Exception:
+            self._hot_keep_per_seed = int(hot_keep_per_seed)
         
         # Ghost storage - keyed by map seed
         self.ghosts_by_seed: Dict[str, List[GhostRun]] = {}
@@ -157,6 +208,11 @@ class GhostEcosystem:
             map_seed: The procedural map seed. Ghosts are only shown
                      on runs with matching seeds to prevent clipping.
         """
+        try:
+            if getattr(positions, "dtype", None) != np.float16:
+                positions = positions.astype(np.float16, copy=False)
+        except Exception:
+            pass
         ghost = GhostRun(
             run_id=run_id,
             agent_name=agent_name,
@@ -195,6 +251,17 @@ class GhostEcosystem:
         seed_list = self.ghosts_by_seed[map_seed]
         if len(seed_list) > self.max_ghosts_per_seed:
             seed_list.pop(0)
+
+        # Pack cold ghosts to keep memory bounded. Keep the most recent N uncompressed.
+        try:
+            keep = max(0, int(self._hot_keep_per_seed))
+        except Exception:
+            keep = 0
+        if keep >= 0:
+            cold = seed_list[:-keep] if keep > 0 else list(seed_list)
+            for g in cold:
+                if g.positions is not None and g.positions_blob is None:
+                    g.pack_positions()
         
         # Update top 10
         self._update_top_10()
@@ -286,6 +353,7 @@ class GhostEcosystem:
         self,
         timestamp: float,
         include_herd: bool = True,
+        herd_limit: int = 200,
     ) -> Dict[str, Any]:
         """Get ghost positions at a timestamp for the current map seed only.
         
@@ -332,6 +400,8 @@ class GhostEcosystem:
         # Herd (remaining ghosts for this seed only)
         if include_herd:
             seed_ghosts = self.ghosts_by_seed.get(self.active_seed, [])
+            lim = max(0, int(herd_limit))
+            count = 0
             for ghost in seed_ghosts:
                 if ghost.is_top_10:
                     continue
@@ -339,6 +409,9 @@ class GhostEcosystem:
                 if pos is not None:
                     result["herd"].append(pos.tolist())
                     result["alive_count"] += 1
+                    count += 1
+                    if lim > 0 and count >= lim:
+                        break
                 else:
                     result["dead_count"] += 1
         

@@ -12,10 +12,10 @@ Watch mode:
     dynamics from your gameplay visuals without recording your inputs.
 
 Spectator cam:
-  - Orchestrator continuously selects 4 featured feeds:
+  - Orchestrator continuously selects 5 featured feeds:
       - top 3 most hyped
-      - 1 most shamed
-  - The Stream page shows these 4 and swaps as ranks change.
+      - 2 most shamed
+  - The Stream page shows these and swaps as ranks change.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.common.gpu_contract import enforce_gpu_contract
+from src.config import apply_streaming_profile
 
 
 def _spawn(
@@ -244,9 +245,14 @@ def main() -> int:
     parser.add_argument("--steam-root", default=os.environ.get("MEGABONK_STEAM_ROOT", str(Path('~/.local/share/Steam').expanduser())))
     parser.add_argument("--proton", default=os.environ.get("MEGABONK_PROTON", "proton"))
     parser.add_argument(
+        "--stream-profile",
+        default=os.environ.get("METABONK_STREAM_PROFILE", ""),
+        help="Streaming profile (from configs/streaming.yaml): dev|prod (default: based on mode).",
+    )
+    parser.add_argument(
         "--stream-backend",
-        default=os.environ.get("METABONK_STREAM_BACKEND", "auto"),
-        help="Stream backend: auto|gst|ffmpeg (default: env or auto).",
+        default=os.environ.get("METABONK_STREAM_BACKEND", ""),
+        help="Stream backend override: auto|gst|ffmpeg (default: from stream profile / env).",
     )
     parser.add_argument(
         "--synthetic-eye",
@@ -415,6 +421,13 @@ def main() -> int:
     env["METABONK_BONKLINK_USE_PIPE"] = "0"
     env["METABONK_USE_LEARNED_REWARD"] = "1"
     env["METABONK_VIDEO_REWARD_CKPT"] = args.reward_ckpt
+
+    # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
+    try:
+        apply_streaming_profile(env, mode=str(args.mode), profile=str(getattr(args, "stream_profile", "") or "") or None)
+    except Exception as e:
+        raise SystemExit(f"[start] ERROR: failed to apply streaming profile: {e}") from e
+
     # Default to GPU-first streaming for the Stream HUD when PipeWire is available.
     env.setdefault("METABONK_STREAM", "1")
     env.setdefault("METABONK_STREAM_CONTAINER", "mp4")
@@ -440,6 +453,11 @@ def main() -> int:
         env["METABONK_STREAM_HEIGHT"] = str(env.get("MEGABONK_HEIGHT"))
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
+    # Production/zero-copy guardrail: don't allow auto selection to drift into CPU paths.
+    if str(env.get("METABONK_STREAM_REQUIRE_ZERO_COPY") or "0").strip().lower() in ("1", "true", "yes", "on"):
+        sb = str(env.get("METABONK_STREAM_BACKEND") or "").strip().lower()
+        if sb in ("", "auto"):
+            env["METABONK_STREAM_BACKEND"] = "gst"
     stream_backend = str(env.get("METABONK_STREAM_BACKEND") or "auto").strip().lower()
     if stream_backend == "x11grab":
         raise SystemExit("[start] ERROR: MetaBonk is GPU-only; x11grab is not supported (PipeWire DMA-BUF required).")
@@ -490,21 +508,7 @@ def main() -> int:
     omega: Optional[subprocess.Popen] = None
     ui: Optional[subprocess.Popen] = None
     watch: Optional[subprocess.Popen] = None
-    go2rtc_started = False
-
-    def _go2rtc_compose(*extra: str) -> int:
-        compose = os.environ.get("METABONK_DOCKER_COMPOSE") or "docker"
-        base = [compose]
-        if compose == "docker":
-            base += ["compose"]
-        go2rtc_mode = str(args.go2rtc_mode or "fifo").strip().lower()
-        compose_file = "docker-compose.go2rtc.exec.yml" if go2rtc_mode == "exec" else "docker-compose.go2rtc.yml"
-        base += ["-f", str(repo_root / "docker" / compose_file)]
-        base += list(extra)
-        try:
-            return int(subprocess.call(base, cwd=str(repo_root), env=env))
-        except Exception:
-            return 1
+    go2rtc_enabled = False
 
     try:
         if args.doctor_only:
@@ -529,56 +533,47 @@ def main() -> int:
             if args.doctor_only:
                 return 0
 
-        if args.go2rtc and args.mode in ("train", "play"):
-            go2rtc_mode = str(args.go2rtc_mode or "fifo").strip().lower()
-            if go2rtc_mode == "fifo":
+        # go2rtc is started/stopped by start_omega.py. Here we only control the env defaults.
+        argv = set(sys.argv[1:])
+        go2rtc_cli_specified = ("--go2rtc" in argv) or ("--no-go2rtc" in argv)
+        if go2rtc_cli_specified:
+            go2rtc_enabled = bool(args.go2rtc)
+        else:
+            go2rtc_enabled = str(env.get("METABONK_GO2RTC") or env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        if args.mode not in ("train", "play"):
+            go2rtc_enabled = False
+
+        env["METABONK_GO2RTC"] = "1" if go2rtc_enabled else "0"
+        env["METABONK_ENABLE_PUBLIC_STREAM"] = "1" if go2rtc_enabled else "0"
+
+        if go2rtc_cli_specified and not go2rtc_enabled:
+            env["METABONK_FIFO_STREAM"] = "0"
+
+        if go2rtc_enabled:
+            if "--go2rtc-url" in argv:
+                env["METABONK_GO2RTC_URL"] = str(args.go2rtc_url)
+            env.setdefault("METABONK_GO2RTC_URL", str(args.go2rtc_url))
+            if "--go2rtc-mode" in argv:
+                env["METABONK_GO2RTC_MODE"] = str(args.go2rtc_mode)
+            env.setdefault("METABONK_GO2RTC_MODE", str(args.go2rtc_mode or "fifo"))
+            if "--go2rtc-exec-cmd" in argv:
+                env["METABONK_GO2RTC_EXEC_CMD"] = str(args.go2rtc_exec_cmd or "")
+            if "--go2rtc-exec-profile" in argv:
+                env["METABONK_GO2RTC_EXEC_PROFILE"] = str(args.go2rtc_exec_profile or "")
+            if "--go2rtc-exec-wrap" in argv:
+                env["METABONK_GO2RTC_EXEC_WRAP"] = str(args.go2rtc_exec_wrap or "raw")
+            if "--go2rtc-exec-wrapper" in argv:
+                env["METABONK_GO2RTC_EXEC_WRAPPER"] = str(args.go2rtc_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh")
+            if str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower() == "fifo":
                 fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
                 env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
                 env.setdefault("METABONK_FIFO_CONTAINER", "mpegts")
-                env["METABONK_FIFO_STREAM"] = "1"
-            else:
-                env["METABONK_FIFO_STREAM"] = "0"
-            env["METABONK_GO2RTC_URL"] = args.go2rtc_url
-            # Allow MP4 stream probes/UI and FIFO/go2rtc to coexist without fighting over
-            # the per-worker stream client limit.
-            try:
-                cur_max = int(str(env.get("METABONK_STREAM_MAX_CLIENTS", "") or "1"))
-            except Exception:
-                cur_max = 1
-            # 3 is a pragmatic default: UI MP4 + optional FIFO/go2rtc + occasional probes/debug.
-            if cur_max < 3:
-                env["METABONK_STREAM_MAX_CLIENTS"] = "3"
-            out_cfg = str(repo_root / "temp" / "go2rtc.yaml")
-            env["METABONK_GO2RTC_CONFIG"] = out_cfg
-            subprocess.check_call(
-                [
-                    py,
-                    str(repo_root / "scripts" / "go2rtc_generate_config.py"),
-                    "--workers",
-                    str(int(args.workers) if args.mode == "train" else 1),
-                    "--instance-prefix",
-                    str(args.instance_prefix),
-                    "--mode",
-                    go2rtc_mode,
-                    "--exec-cmd-template",
-                    str(args.go2rtc_exec_cmd or ""),
-                    "--exec-profile",
-                    str(args.go2rtc_exec_profile or ""),
-                    "--exec-wrap",
-                    str(args.go2rtc_exec_wrap or "raw"),
-                    "--exec-wrapper",
-                    str(args.go2rtc_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh"),
-                    "--fifo-dir",
-                    str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams")),
-                    "--out",
-                    out_cfg,
-                ],
-                cwd=str(repo_root),
-                env=env,
-            )
-            _go2rtc_compose("up", "-d", "--remove-orphans")
-            go2rtc_started = True
-            print(f"[start] go2rtc -> {args.go2rtc_url}/")
+                env.setdefault("METABONK_FIFO_STREAM", "1")
 
         # Omega stack
         omega_mode = args.mode
@@ -606,9 +601,11 @@ def main() -> int:
             str(args.bonklink_port),
             "--instance-prefix",
             str(args.instance_prefix),
-            "--stream-backend",
-            str(args.stream_backend),
         ]
+        if str(args.stream_profile or "").strip():
+            omega_cmd += ["--stream-profile", str(args.stream_profile)]
+        if str(args.stream_backend or "").strip():
+            omega_cmd += ["--stream-backend", str(args.stream_backend)]
         # Prevent duplicate UI when running `./start`: start.py owns UI lifecycle.
         omega_cmd.append("--no-ui")
         if bool(getattr(args, "synthetic_eye", True)):
@@ -708,9 +705,10 @@ def main() -> int:
                     instance_id = f"{args.instance_prefix}-{int(args.video_proof_worker)}"
                     port = int(args.worker_base_port) + int(args.video_proof_worker)
                     urls = [f"http://127.0.0.1:{port}/stream.mp4"]
-                    if args.go2rtc and go2rtc_started:
+                    if go2rtc_enabled:
+                        go2rtc_url = str(env.get("METABONK_GO2RTC_URL") or args.go2rtc_url).rstrip("/")
                         urls.append(
-                            f"{args.go2rtc_url.rstrip('/')}/api/stream.mp4?"
+                            f"{go2rtc_url}/api/stream.mp4?"
                             f"src={instance_id}&duration={int(args.video_proof_duration)}"
                         )
                     out_path = videos_dir / "gameplay_proof.mp4"
@@ -778,11 +776,6 @@ def main() -> int:
         _kill(omega, "omega")
         _kill(ui, "ui")
         _kill(watch, "watch")
-        if go2rtc_started:
-            try:
-                _go2rtc_compose("down", "--remove-orphans")
-            except Exception:
-                pass
         # Last-resort sweep for stragglers (ffmpeg/gamescope/Xvfb) that might have escaped.
         try:
             subprocess.call([py, str(repo_root / "scripts" / "stop.py"), "--all"], env=env)

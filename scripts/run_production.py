@@ -61,6 +61,9 @@ def _ensure_run_dir(repo: Path, env: dict[str, str]) -> None:
 
 
 def _apply_production_defaults(env: dict[str, str]) -> None:
+    # Use deterministic, GPU-only streaming defaults from configs/streaming.yaml.
+    env.setdefault("METABONK_STREAM_PROFILE", "prod")
+
     # Vision path defaults: Synthetic Eye + focus enforcement.
     env.setdefault("METABONK_SYNTHETIC_EYE", "1")
     env.setdefault("METABONK_EYE_FORCE_FOCUS", "1")

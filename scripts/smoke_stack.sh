@@ -172,6 +172,48 @@ if codec != "h264":
 if int(st.get("width") or 0) <= 0 or int(st.get("height") or 0) <= 0:
     raise SystemExit("[smoke] invalid stream dimensions")
 print(f"[smoke] stream OK: {codec} {st.get('width')}x{st.get('height')} at {stream_url}")
+
+# Confirm the MP4 stream contains non-black pixels (avoid silent X11/headless capture regressions).
+cmd = [
+    "ffmpeg",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-rw_timeout",
+    "5000000",
+    "-i",
+    stream_url,
+    "-frames:v",
+    "1",
+    "-f",
+    "image2pipe",
+    "-vcodec",
+    "png",
+    "pipe:1",
+]
+try:
+    png = subprocess.check_output(cmd, timeout=12.0)
+except Exception as e:
+    raise SystemExit(f"[smoke] failed to extract frame from {stream_url}: {e}") from e
+try:
+    img2 = Image.open(BytesIO(png)).convert("L")
+    arr2 = np.array(img2, dtype=np.float32)
+    var2 = float(arr2.var())
+except Exception as e:
+    raise SystemExit(f"[smoke] failed to decode extracted stream frame: {e}") from e
+if var2 < 5.0:
+    raise SystemExit(f"[smoke] stream frame variance too low ({var2:.2f}) at {stream_url}")
+print(f"[smoke] stream frame variance OK: {var2:.2f}")
+
+# Confirm worker reports a hardware encoder (GPU path, not libx264).
+status = _get_json(f"{target}/status", timeout=2.0)
+backend = str(status.get("stream_backend") or "").strip().lower()
+if not backend:
+    raise SystemExit("[smoke] worker status missing stream_backend")
+hw_tokens = ("nvenc", "vaapi", "amf", "qsv", "videotoolbox", "nvv4l2", "nvh264enc", "nvh265enc", "v4l2")
+if not any(tok in backend for tok in hw_tokens):
+    raise SystemExit(f"[smoke] stream backend is not hardware encoded: {backend}")
+print(f"[smoke] stream encoder OK: {backend}")
 PY
 fi
 
@@ -182,13 +224,20 @@ from pathlib import Path
 import urllib.request
 import urllib.error
 
-cfg = os.environ.get("METABONK_GO2RTC_CONFIG") or str(Path(__file__).resolve().parent.parent / "temp" / "go2rtc.yaml")
+repo_root = Path(os.environ.get("METABONK_REPO_ROOT") or os.getcwd()).resolve()
+cfg = os.environ.get("METABONK_GO2RTC_CONFIG") or str(repo_root / "temp" / "go2rtc.yaml")
 mode = str(os.environ.get("METABONK_GO2RTC_MODE", "fifo") or "fifo").strip().lower()
 if not os.path.exists(cfg):
     raise SystemExit(f"[smoke] go2rtc config missing: {cfg}")
 text = Path(cfg).read_text(errors="replace")
-if mode == "fifo" and "#raw" not in text:
-    raise SystemExit("[smoke] go2rtc fifo config missing #raw passthrough tag")
+if mode == "fifo":
+    # Accept either raw H.264 (includes #raw) or MPEG-TS (no #raw) configs, but
+    # require FIFO passthrough via `exec:cat /streams/...` in both cases.
+    if "exec:cat /streams/" not in text:
+        raise SystemExit("[smoke] go2rtc fifo config missing exec:cat /streams passthrough")
+    fifo_container = str(os.environ.get("METABONK_FIFO_CONTAINER", "mpegts") or "mpegts").strip().lower()
+    if fifo_container in ("h264", "raw", "annexb") and "#raw" not in text:
+        raise SystemExit("[smoke] go2rtc fifo raw-H264 config missing #raw passthrough tag")
 url = os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984").rstrip("/") + "/"
 try:
     with urllib.request.urlopen(url, timeout=2.0) as resp:

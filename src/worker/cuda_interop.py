@@ -12,6 +12,7 @@ the CUDA Driver API does. Use the Driver API for all external interop here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 from cuda.bindings import driver  # type: ignore
@@ -102,15 +103,29 @@ def _import_external_memory(fd: int, size_bytes: int) -> driver.CUexternalMemory
     last_flags = None
     for handle_type in handle_types:
         for flags in flag_candidates:
+            try:
+                fd_dup = os.dup(int(fd))
+            except Exception:
+                # If we can't dup the fd, importing can't succeed.
+                last_err = int(getattr(driver.CUresult, "CUDA_ERROR_INVALID_VALUE", 1))
+                last_type = handle_type
+                last_flags = flags
+                continue
             desc = driver.CUDA_EXTERNAL_MEMORY_HANDLE_DESC()
             desc.type = handle_type
-            desc.handle.fd = int(fd)
+            # CUDA takes ownership of the imported fd on success; never pass the original.
+            desc.handle.fd = int(fd_dup)
             desc.size = int(size_bytes)
             desc.flags = int(flags)
             err, ext_mem = driver.cuImportExternalMemory(desc)
             err_i = _err_int(err)
             if err_i == 0:
+                # Success: ownership of fd_dup transferred to CUDA driver.
                 return ext_mem
+            try:
+                os.close(int(fd_dup))
+            except Exception:
+                pass
             last_err = err_i
             last_type = handle_type
             last_flags = flags
@@ -168,15 +183,24 @@ def import_dmabuf_as_mipmapped_array(
 def import_external_semaphore_fd(fd: int, *, timeline: bool = False) -> CudaExternalSemaphore:
     """Import a Vulkan-exported external semaphore FD into CUDA (Driver API)."""
     _ensure_ctx()
+    # CUDA takes ownership of the imported fd on success; never pass the original.
+    fd_dup = os.dup(int(fd))
     desc = driver.CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC()
     if timeline:
         desc.type = driver.CUexternalSemaphoreHandleType.CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD
     else:
         desc.type = driver.CUexternalSemaphoreHandleType.CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD
-    desc.handle.fd = int(fd)
+    desc.handle.fd = int(fd_dup)
     desc.flags = 0
-    err, ext_sem = driver.cuImportExternalSemaphore(desc)
-    _check(err, "cuImportExternalSemaphore")
+    try:
+        err, ext_sem = driver.cuImportExternalSemaphore(desc)
+        _check(err, "cuImportExternalSemaphore")
+    except Exception:
+        try:
+            os.close(int(fd_dup))
+        except Exception:
+            pass
+        raise
     if not isinstance(ext_sem, driver.CUexternalSemaphore):
         raise RuntimeError(f"cuImportExternalSemaphore returned unexpected type: {type(ext_sem)}")
     return CudaExternalSemaphore(ext_sem=ext_sem)

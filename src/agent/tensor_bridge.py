@@ -13,6 +13,7 @@ from typing import Any, Optional
 from cuda.bindings import driver  # type: ignore
 
 _DEBUG_TENSOR_BRIDGE = os.environ.get("METABONK_TENSOR_BRIDGE_DEBUG", "0") == "1"
+_PACK_PITCHED = os.environ.get("METABONK_TENSOR_BRIDGE_PACK_PITCHED", "1") == "1"
 
 from ..worker.cuda_interop import CudaExternalFrame, _ensure_ctx
 
@@ -207,6 +208,7 @@ def tensor_from_external_frame(
     stream: Optional[Any] = None,
     format_hint: Optional[str] = None,
     sync: bool = True,
+    pack: bool = False,
 ) -> "Any":
     """Return a torch.Tensor for a CUDA external frame.
 
@@ -233,6 +235,61 @@ def tensor_from_external_frame(
                 f"channels={int(channels)} stride_bytes={stride_bytes} offset_bytes={int(offset_bytes)}",
                 flush=True,
             )
+        tight_stride = int(width) * bytes_per_pixel
+        stride_b = int(stride_bytes) if stride_bytes is not None else int(tight_stride)
+        should_pack = bool(pack)
+        if not should_pack and _PACK_PITCHED and (int(stride_b) != int(tight_stride)):
+            should_pack = True
+        if not should_pack and int(offset_bytes or 0) != 0:
+            # Offsets are common for DRM-format-modifier images. Packing makes downstream consumers
+            # robust (no custom strides/offset metadata).
+            should_pack = True
+
+        if should_pack:
+            _ensure_ctx()
+            dest = torch.empty(
+                (int(height), int(width), int(channels)),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            dest_ptr = int(dest.data_ptr())
+            width_bytes = int(width) * bytes_per_pixel
+            try:
+                dest_stride_elems = int(dest.stride()[0])
+            except Exception:
+                dest_stride_elems = int(width) * int(channels)
+            dest_pitch = int(dest_stride_elems) * int(itemsize)
+            if dest_pitch < width_bytes:
+                raise RuntimeError(
+                    f"Destination pitch {dest_pitch} is smaller than row width {width_bytes}"
+                )
+            if stride_b < width_bytes:
+                raise RuntimeError(
+                    f"Source pitch {stride_b} is smaller than row width {width_bytes}"
+                )
+            src_ptr = int(frame.mapped_ptr) + int(offset_bytes)
+
+            params = driver.CUDA_MEMCPY2D()
+            params.srcMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+            params.srcDevice = int(src_ptr)
+            params.srcPitch = int(stride_b)
+            params.srcXInBytes = 0
+            params.srcY = 0
+            params.dstMemoryType = driver.CUmemorytype.CU_MEMORYTYPE_DEVICE
+            params.dstDevice = int(dest_ptr)
+            params.dstPitch = int(dest_pitch)
+            params.dstXInBytes = 0
+            params.dstY = 0
+            params.WidthInBytes = int(width_bytes)
+            params.Height = int(height)
+
+            cu_stream = _as_cu_stream(stream)
+            _check(driver.cuMemcpy2DAsync(params, cu_stream), "cuMemcpy2DAsync")
+            if sync:
+                if not _maybe_wait_for_stream(stream):
+                    _check(driver.cuStreamSynchronize(cu_stream), "cuStreamSynchronize")
+            return dest
+
         img = image_from_external_frame(
             frame,
             width=width,

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -70,13 +73,41 @@ def test_megabonk_gym_env_steps():
     env.close()
 
 
-def test_megabonk_yolo_env_steps_without_capture():
+def test_megabonk_yolo_env_steps_without_capture(tmp_path, monkeypatch: pytest.MonkeyPatch):
     # Integration test: MegaBonkEnv requires a reward-from-video checkpoint and
     # an actual capture backend. Skip unless explicitly enabled.
     if os.environ.get("METABONK_ENABLE_INTEGRATION_TESTS", "0") not in ("1", "true", "True"):
         pytest.skip("set METABONK_ENABLE_INTEGRATION_TESTS=1 to run environment integration tests")
     if not os.path.exists(os.environ.get("METABONK_VIDEO_REWARD_CKPT", "checkpoints/video_reward_model.pt")):
         pytest.skip("reward model checkpoint missing; run scripts/video_pretrain.py --phase reward_train")
+
+    # MegaBonkEnv requires a capture source. Prefer an explicit replay source to make this
+    # test runnable on headless/CI hosts (no desktop capture).
+    if not os.environ.get("METABONK_CAPTURE_VIDEO") and not os.environ.get("METABONK_CAPTURE_IMAGES_DIR"):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            pytest.skip("no capture source and ffmpeg not available; set METABONK_CAPTURE_VIDEO or install ffmpeg")
+
+        video_path = tmp_path / "capture.mp4"
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=15",
+                "-t",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+                str(video_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        monkeypatch.setenv("METABONK_CAPTURE_VIDEO", str(video_path))
 
     from src.env.megabonk_env import MegaBonkEnv
 

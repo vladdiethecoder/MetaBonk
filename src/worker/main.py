@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 from .trainer import Trainer
 from .perception import construct_observation
 from .rollout import LearnerClient, RolloutBuffer, PixelRolloutBuffer
-from .nvenc_streamer import NVENCConfig, NVENCStreamer
+from .nvenc_streamer import NVENCConfig, NVENCStreamer, PixelFrame
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
 from .stream_health import jpeg_luma_variance
@@ -275,11 +275,20 @@ class WorkerService:
 
                 poll_s = float(os.environ.get("METABONK_WORLD_OVERLAY_POLL_S", "0.5"))
                 max_kb = int(os.environ.get("METABONK_WORLD_OVERLAY_MAX_KB", "2048"))
+                max_hz = float(os.environ.get("METABONK_WORLD_OVERLAY_MAX_HZ", "2.0"))
+                dedupe = str(os.environ.get("METABONK_WORLD_OVERLAY_DEDUPE", "1") or "").strip().lower() not in (
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                )
                 start_world_overlay_watcher(
                     path=wm_overlay,
                     instance_id=self.instance_id,
                     poll_s=poll_s,
                     max_kb=max_kb,
+                    max_hz=max_hz,
+                    dedupe=dedupe,
                 )
         except Exception:
             pass
@@ -376,6 +385,10 @@ class WorkerService:
         self._latest_pixel_frame_id: Optional[int] = None
         self._latest_pixel_ts: float = 0.0
         self._latest_pixel_src_size: Optional[tuple[int, int]] = None
+        self._pixel_stream_cache_frame_id: Optional[int] = None
+        self._pixel_stream_cache_bytes: Optional[bytes] = None
+        self._pixel_stream_cache_size: Optional[tuple[int, int]] = None
+        self._pixel_stream_cache_ts: float = 0.0
         if self._pixel_obs_enabled:
             if self._frame_source not in ("synthetic_eye", "smithay", "smithay_dmabuf"):
                 raise RuntimeError(
@@ -464,6 +477,12 @@ class WorkerService:
         # Synthetic Eye resilience: restart worker on compositor resets/stalls to avoid training on frozen frames.
         self._synthetic_eye_reset_restart = str(
             os.environ.get("METABONK_SYNTHETIC_EYE_RESET_RESTART", "1")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        # Synthetic Eye orientation: some capture stacks produce bottom-up buffers.
+        self._synthetic_eye_vflip = str(
+            os.environ.get("METABONK_SYNTHETIC_EYE_VFLIP", "")
+            or os.environ.get("METABONK_EYE_VFLIP", "")
+            or "0"
         ).strip().lower() in ("1", "true", "yes", "on")
         try:
             self._synthetic_eye_stall_restart_s = float(
@@ -1009,11 +1028,20 @@ class WorkerService:
         self.highlight: Optional[HighlightRecorder] = None
         if os.environ.get("METABONK_HIGHLIGHTS", "0") in ("1", "true", "True"):
             try:
+                ds_raw = str(os.environ.get("METABONK_HIGHLIGHT_DOWNSCALE", "480x270") or "").strip().lower()
+                downscale = (480, 270)
+                if ds_raw and ("x" in ds_raw or "," in ds_raw):
+                    sep = "x" if "x" in ds_raw else ","
+                    parts = [p.strip() for p in ds_raw.split(sep) if p.strip()]
+                    if len(parts) >= 2:
+                        downscale = (max(64, int(parts[0])), max(64, int(parts[1])))
                 hcfg = HighlightConfig(
                     fps=int(os.environ.get("METABONK_HIGHLIGHT_FPS", "30")),
                     max_seconds=int(os.environ.get("METABONK_HIGHLIGHT_SECONDS", "180")),
-                    downscale=(480, 270),
+                    downscale=downscale,
                     speed=float(os.environ.get("METABONK_HIGHLIGHT_SPEED", "3.0")),
+                    codec=str(os.environ.get("METABONK_HIGHLIGHT_CODEC", "h264_nvenc") or "h264_nvenc"),
+                    bitrate=str(os.environ.get("METABONK_HIGHLIGHT_BITRATE", "4M") or "4M"),
                 )
                 out_root = os.environ.get("METABONK_HIGHLIGHTS_DIR", "highlights")
                 self.highlight = HighlightRecorder(out_root=out_root, cfg=hcfg)
@@ -1236,8 +1264,10 @@ class WorkerService:
         # Back-compat: "obs" means "use OBS-like ffmpeg encoder selection" (no OBS required).
         if backend == "obs":
             backend = "ffmpeg"
-        if backend and backend not in ("gst", "gstreamer", "gst-launch", "ffmpeg", "x11grab", "auto"):
-            self._stream_error = f"unsupported stream backend '{backend}' (expected auto|gst|ffmpeg|x11grab|obs)"
+        if backend and backend not in ("gst", "gstreamer", "gst-launch", "ffmpeg", "x11grab", "auto", "pixel_obs", "pixels"):
+            self._stream_error = (
+                f"unsupported stream backend '{backend}' (expected auto|gst|ffmpeg|x11grab|pixel_obs|obs)"
+            )
             return
         node = None
         if backend != "x11grab":
@@ -1254,6 +1284,12 @@ class WorkerService:
                     # refresh PIPEWIRE_NODE per-connection.
                     pass
         try:
+            pixel_provider = None
+            if (
+                self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
+                and bool(getattr(self, "_pixel_obs_enabled", False))
+            ):
+                pixel_provider = self._get_latest_pixel_stream_frame
             scfg = NVENCConfig(
                 pipewire_node=node,
                 codec=os.environ.get("METABONK_STREAM_CODEC", "h264"),
@@ -1261,6 +1297,7 @@ class WorkerService:
                 fps=int(os.environ.get("METABONK_STREAM_FPS", "60")),
                 gop=int(os.environ.get("METABONK_STREAM_GOP", "60")),
                 container=os.environ.get("METABONK_STREAM_CONTAINER", "mp4"),
+                pixel_frame_provider=pixel_provider,
             )
             self.streamer = NVENCStreamer(scfg)
             if self._fifo_stream_enabled and self._fifo_stream_path:
@@ -1428,9 +1465,19 @@ class WorkerService:
             disp = str(self.display)
             os.environ["DISPLAY"] = disp
             os.environ["METABONK_INPUT_DISPLAY"] = disp
-            xtest_ok = self._check_xtest(display=disp)
+            xtest_ok, xtest_diag = self._check_xtest(display=disp)
             if not xtest_ok:
-                raise RuntimeError(f"[worker:{self.instance_id}] XTEST extension not available on {disp}")
+                diag = (xtest_diag or "").strip()
+                if len(diag) > 800:
+                    diag = diag[-800:]
+                hint = (
+                    "Ensure the nested Xwayland is running and exports XTEST. "
+                    "For gamescope, try setting GAMESCOPE_XWAYLAND_ARGS='+extension XTEST'."
+                )
+                raise RuntimeError(
+                    f"[worker:{self.instance_id}] XTEST extension not available on {disp}. "
+                    f"{hint}\nxdpyinfo:\n{diag}"
+                )
             self._upsert_isolation_log(
                 {
                     "DISPLAY": disp,
@@ -1492,9 +1539,16 @@ class WorkerService:
                 self.display = disp
                 os.environ["DISPLAY"] = disp
                 os.environ["METABONK_INPUT_DISPLAY"] = disp
-                xtest_ok = self._check_xtest(display=disp)
+                xtest_ok, xtest_diag = self._check_xtest(display=disp)
                 if not xtest_ok:
-                    raise RuntimeError(f"XTEST extension not available on {disp}")
+                    diag = (xtest_diag or "").strip()
+                    if len(diag) > 800:
+                        diag = diag[-800:]
+                    hint = (
+                        "Ensure the nested Xwayland is running and exports XTEST. "
+                        "For gamescope, try setting GAMESCOPE_XWAYLAND_ARGS='+extension XTEST'."
+                    )
+                    raise RuntimeError(f"XTEST extension not available on {disp}. {hint}\nxdpyinfo:\n{diag}")
                 self._upsert_isolation_log(
                     {
                         "DISPLAY": disp,
@@ -1621,16 +1675,47 @@ class WorkerService:
                                             from src.agent.tensor_bridge import tensor_from_external_frame
 
                                             offset_bytes = int(frame.offset) if int(frame.modifier) == 0 else 0
-                                            raw_tensor = tensor_from_external_frame(
-                                                h.ext_frame,
-                                                width=frame.width,
-                                                height=frame.height,
-                                                stride_bytes=frame.stride,
-                                                offset_bytes=offset_bytes,
-                                                stream=h.stream,
-                                            )
-                                            raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
-                                            obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
+                                            try:
+                                                import torch  # type: ignore
+
+                                                ext_stream = torch.cuda.ExternalStream(int(h.stream))
+                                            except Exception:
+                                                ext_stream = None
+
+                                            if ext_stream is not None:
+                                                with torch.cuda.stream(ext_stream):
+                                                    raw_tensor = tensor_from_external_frame(
+                                                        h.ext_frame,
+                                                        width=frame.width,
+                                                        height=frame.height,
+                                                        stride_bytes=frame.stride,
+                                                        offset_bytes=offset_bytes,
+                                                        stream=h.stream,
+                                                        sync=False,
+                                                    )
+                                                    raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
+                                                    if bool(getattr(self, "_synthetic_eye_vflip", False)):
+                                                        try:
+                                                            raw_tensor = raw_tensor.flip(0)
+                                                        except Exception:
+                                                            pass
+                                                    obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
+                                            else:
+                                                raw_tensor = tensor_from_external_frame(
+                                                    h.ext_frame,
+                                                    width=frame.width,
+                                                    height=frame.height,
+                                                    stride_bytes=frame.stride,
+                                                    offset_bytes=offset_bytes,
+                                                    stream=h.stream,
+                                                )
+                                                raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
+                                                if bool(getattr(self, "_synthetic_eye_vflip", False)):
+                                                    try:
+                                                        raw_tensor = raw_tensor.flip(0)
+                                                    except Exception:
+                                                        pass
+                                                obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
 
                                             if want_pixels:
                                                 obs_small = None
@@ -1640,19 +1725,35 @@ class WorkerService:
 
                                                     for dt in (torch.float16, torch.float32):
                                                         try:
-                                                            obs_f = obs_u8.unsqueeze(0).to(dtype=dt).div(255.0)
-                                                            obs_f = F.interpolate(
-                                                                obs_f,
-                                                                size=(int(self._pixel_obs_h), int(self._pixel_obs_w)),
-                                                                mode="bilinear",
-                                                                align_corners=False,
-                                                            )
-                                                            obs_small = (
-                                                                (obs_f.clamp(0.0, 1.0) * 255.0)
-                                                                .to(dtype=torch.uint8)
-                                                                .squeeze(0)
-                                                                .contiguous()
-                                                            )
+                                                            if ext_stream is not None:
+                                                                with torch.cuda.stream(ext_stream):
+                                                                    obs_f = obs_u8.unsqueeze(0).to(dtype=dt).div(255.0)
+                                                                    obs_f = F.interpolate(
+                                                                        obs_f,
+                                                                        size=(int(self._pixel_obs_h), int(self._pixel_obs_w)),
+                                                                        mode="bilinear",
+                                                                        align_corners=False,
+                                                                    )
+                                                                    obs_small = (
+                                                                        (obs_f.clamp(0.0, 1.0) * 255.0)
+                                                                        .to(dtype=torch.uint8)
+                                                                        .squeeze(0)
+                                                                        .contiguous()
+                                                                    )
+                                                            else:
+                                                                obs_f = obs_u8.unsqueeze(0).to(dtype=dt).div(255.0)
+                                                                obs_f = F.interpolate(
+                                                                    obs_f,
+                                                                    size=(int(self._pixel_obs_h), int(self._pixel_obs_w)),
+                                                                    mode="bilinear",
+                                                                    align_corners=False,
+                                                                )
+                                                                obs_small = (
+                                                                    (obs_f.clamp(0.0, 1.0) * 255.0)
+                                                                    .to(dtype=torch.uint8)
+                                                                    .squeeze(0)
+                                                                    .contiguous()
+                                                                )
                                                             break
                                                         except Exception:
                                                             obs_small = None
@@ -1681,16 +1782,35 @@ class WorkerService:
 
                                             if want_audit:
                                                 try:
-                                                    obs_f32 = obs_u8.float().div(255.0)
-                                                    mean_val = float(obs_f32.mean().item())
-                                                    std_val = float(obs_f32.std().item())
-                                                    self._dump_frame_to_png(obs_f32, int(frame.frame_id), mean_val, std_val)
-                                                    print(
-                                                        f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
-                                                        f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
-                                                        f"device={obs_f32.device}",
-                                                        flush=True,
-                                                    )
+                                                    if ext_stream is not None:
+                                                        import torch  # type: ignore
+
+                                                        with torch.cuda.stream(ext_stream):
+                                                            obs_f32 = obs_u8.float().div(255.0)
+                                                            mean_val = float(obs_f32.mean().item())
+                                                            std_val = float(obs_f32.std().item())
+                                                            self._dump_frame_to_png(
+                                                                obs_f32, int(frame.frame_id), mean_val, std_val
+                                                            )
+                                                            print(
+                                                                f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                                f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                                f"device={obs_f32.device}",
+                                                                flush=True,
+                                                            )
+                                                    else:
+                                                        obs_f32 = obs_u8.float().div(255.0)
+                                                        mean_val = float(obs_f32.mean().item())
+                                                        std_val = float(obs_f32.std().item())
+                                                        self._dump_frame_to_png(
+                                                            obs_f32, int(frame.frame_id), mean_val, std_val
+                                                        )
+                                                        print(
+                                                            f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                            f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                            f"device={obs_f32.device}",
+                                                            flush=True,
+                                                        )
                                                 except Exception:
                                                     pass
                                         except Exception as e:
@@ -1783,7 +1903,7 @@ class WorkerService:
         print(f"[worker:{self.instance_id}] gamescope Xwayland display: {disp}", flush=True)
         return disp
 
-    def _check_xtest(self, *, display: str) -> bool:
+    def _check_xtest(self, *, display: str) -> tuple[bool, str]:
         """Require XTEST extension for X11 input injection."""
         if not shutil.which("xdpyinfo"):
             raise RuntimeError("xdpyinfo is required to validate XTEST (install xorg-x11-utils)")
@@ -1807,10 +1927,11 @@ class WorkerService:
                 continue
             out = (result.stdout or "") + (result.stderr or "")
             last_out = out
-            if result.returncode == 0 and "not supported" not in out.lower():
-                return True
+            out_l = out.lower()
+            if result.returncode == 0 and "not supported" not in out_l and "unable to open display" not in out_l:
+                return True, out
             time.sleep(0.2)
-        return False
+        return False, last_out
 
     def _upsert_isolation_log(self, kv: dict[str, str]) -> None:
         try:
@@ -2046,6 +2167,192 @@ class WorkerService:
             ts = float(getattr(self, "_latest_pixel_ts", 0.0) or 0.0)
             src_size = getattr(self, "_latest_pixel_src_size", None)
         return obs, frame_id, ts, src_size
+
+    def _get_latest_pixel_stream_frame(self) -> Optional[PixelFrame]:
+        """Return the latest pixel observation as raw RGB24 bytes (best-effort)."""
+        obs, frame_id, ts, _src = self._get_latest_pixel_obs()
+        if obs is None:
+            return None
+
+        # Streaming-only upscale target. This does not affect the agent's observation tensor.
+        # Intended for local app viewing quality (e.g., featured tiles at 1080p).
+        target_raw = str(os.environ.get("METABONK_STREAM_NVENC_TARGET_SIZE", "") or "").strip().lower()
+        target_w: Optional[int] = None
+        target_h: Optional[int] = None
+        if target_raw:
+            try:
+                m = re.match(r"^(\d+)\s*x\s*(\d+)$", target_raw)
+                if m:
+                    tw = int(m.group(1))
+                    th = int(m.group(2))
+                    if tw > 0 and th > 0:
+                        if tw % 2:
+                            tw += 1
+                        if th % 2:
+                            th += 1
+                        target_w, target_h = int(tw), int(th)
+            except Exception:
+                target_w, target_h = None, None
+        try:
+            fid = int(frame_id) if frame_id is not None else None
+        except Exception:
+            fid = None
+        try:
+            cached_id = getattr(self, "_pixel_stream_cache_frame_id", None)
+            cached_bytes = getattr(self, "_pixel_stream_cache_bytes", None)
+            cached_size = getattr(self, "_pixel_stream_cache_size", None)
+            if fid is not None and cached_id is not None and int(fid) == int(cached_id) and cached_bytes and cached_size:
+                w, h = int(cached_size[0]), int(cached_size[1])
+                if target_w is not None and target_h is not None and (w != int(target_w) or h != int(target_h)):
+                    raise RuntimeError("pixel stream cache size mismatch")
+                return PixelFrame(
+                    data=cached_bytes,
+                    width=w,
+                    height=h,
+                    pix_fmt="rgb24",
+                    frame_id=fid,
+                    timestamp=float(ts or time.time()),
+                )
+        except Exception:
+            pass
+
+        # Convert to HWC uint8 on CPU for ffmpeg rawvideo.
+        try:
+            t = obs
+            try:
+                if hasattr(t, "detach"):
+                    t = t.detach()
+            except Exception:
+                pass
+
+            # If we have a CUDA tensor and a large target size, prefer GPU upscaling
+            # (avoids CPU-bound PIL resizing).
+            if target_w is not None and target_h is not None:
+                try:
+                    import torch  # type: ignore
+                    import torch.nn.functional as F  # type: ignore
+
+                    if isinstance(t, torch.Tensor) and str(getattr(t, "device", "")).startswith("cuda"):
+                        src = t
+                        if src.ndim == 3:
+                            src = src[:3].unsqueeze(0)
+                        elif src.ndim == 4:
+                            src = src[:, :3]
+                        else:
+                            src = None
+                        if src is not None:
+                            up = src.to(dtype=torch.float16)
+                            up = F.interpolate(
+                                up,
+                                size=(int(target_h), int(target_w)),
+                                mode="nearest",
+                            )
+                            up_u8 = up.clamp(0.0, 255.0).to(dtype=torch.uint8).squeeze(0)
+                            hwc = up_u8.permute(1, 2, 0).contiguous()
+                            cpu = hwc.to(device="cpu", non_blocking=True)
+                            arr = cpu.numpy()
+                            h, w, c = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+                            if w > 0 and h > 0 and c >= 3:
+                                if c != 3:
+                                    arr = arr[:, :, :3]
+                                data = arr.tobytes()
+                                self._pixel_stream_cache_frame_id = fid
+                                self._pixel_stream_cache_bytes = data
+                                self._pixel_stream_cache_size = (int(w), int(h))
+                                self._pixel_stream_cache_ts = float(ts or time.time())
+                                return PixelFrame(
+                                    data=data,
+                                    width=int(w),
+                                    height=int(h),
+                                    pix_fmt="rgb24",
+                                    frame_id=fid,
+                                    timestamp=float(ts or time.time()),
+                                )
+                except Exception:
+                    pass
+            try:
+                if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
+                    t = t.to(device="cpu", non_blocking=True)
+                elif hasattr(t, "cpu"):
+                    t = t.cpu()
+            except Exception:
+                if hasattr(t, "cpu"):
+                    t = t.cpu()
+            # Expect CHW uint8 (3xHxW).
+            if hasattr(t, "ndim") and int(getattr(t, "ndim", 0) or 0) == 3:
+                try:
+                    t = t[:3].permute(1, 2, 0).contiguous()
+                except Exception:
+                    pass
+            arr = t.numpy() if hasattr(t, "numpy") else None
+            if arr is None:
+                return None
+            if getattr(arr, "ndim", 0) != 3:
+                return None
+            h, w, c = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+            if w <= 0 or h <= 0 or c < 3:
+                return None
+            if c != 3:
+                arr = arr[:, :, :3]
+
+            # Optional explicit stream target size (e.g., 1920x1080).
+            if target_w is not None and target_h is not None and (w != int(target_w) or h != int(target_h)):
+                try:
+                    from PIL import Image
+
+                    img = Image.fromarray(arr)
+                    img = img.resize((int(target_w), int(target_h)), resample=getattr(Image, "NEAREST", 0))
+                    data = img.tobytes()
+                    w, h = int(target_w), int(target_h)
+                    arr = data  # type: ignore[assignment]
+                except Exception:
+                    pass
+
+            # NVENC encoders often reject very small frames. Upscale for streaming only
+            # (keeps training/inference resolution unchanged).
+            try:
+                min_dim = int(os.environ.get("METABONK_STREAM_NVENC_MIN_DIM", "256"))
+            except Exception:
+                min_dim = 256
+            if (target_w is None or target_h is None) and min_dim > 0 and (w < min_dim or h < min_dim):
+                scale = max(float(min_dim) / float(w), float(min_dim) / float(h))
+                out_w = max(min_dim, int(round(float(w) * scale)))
+                out_h = max(min_dim, int(round(float(h) * scale)))
+                # NVENC typically requires even dimensions.
+                if out_w % 2:
+                    out_w += 1
+                if out_h % 2:
+                    out_h += 1
+                try:
+                    from PIL import Image
+
+                    img = Image.fromarray(arr)
+                    img = img.resize((int(out_w), int(out_h)), resample=getattr(Image, "NEAREST", 0))
+                    arr = img.tobytes()  # type: ignore[assignment]
+                    w, h = int(out_w), int(out_h)
+                except Exception:
+                    # If PIL resize fails, fall back to encoding the original size (may fail on some NVENC stacks).
+                    pass
+            data = arr if isinstance(arr, (bytes, bytearray, memoryview)) else arr.tobytes()
+        except Exception:
+            return None
+
+        try:
+            self._pixel_stream_cache_frame_id = fid
+            self._pixel_stream_cache_bytes = data
+            self._pixel_stream_cache_size = (int(w), int(h))
+            self._pixel_stream_cache_ts = float(ts or time.time())
+        except Exception:
+            pass
+
+        return PixelFrame(
+            data=data,
+            width=int(w),
+            height=int(h),
+            pix_fmt="rgb24",
+            frame_id=fid,
+            timestamp=float(ts or time.time()),
+        )
 
     def _lockstep_request_next_frame(self, baseline_frame_id: Optional[int]) -> None:
         if not bool(getattr(self, "_synthetic_eye_lockstep", False)):
@@ -3888,6 +4195,7 @@ class WorkerService:
                 stream_error=self._stream_error,
                 streamer_last_error=getattr(self.streamer, "last_error", None) if self.streamer else None,
                 stream_backend=getattr(self.streamer, "backend", None) if self.streamer else None,
+                nvenc_sessions_used=getattr(self.streamer, "nvenc_sessions_used_last", None) if self.streamer else None,
                 stream_active_clients=active_clients,
                 stream_max_clients=max_clients,
                 stream_fps=stream_fps,
@@ -4342,20 +4650,91 @@ class WorkerService:
                                         from src.agent.tensor_bridge import tensor_from_external_frame
 
                                         offset_bytes = int(frame.offset) if int(frame.modifier) == 0 else 0
-                                        raw_tensor = tensor_from_external_frame(
-                                            h.ext_frame,
-                                            width=frame.width,
-                                            height=frame.height,
-                                            stride_bytes=frame.stride,
-                                            offset_bytes=offset_bytes,
-                                            stream=h.stream,
-                                        )
-                                        raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
-                                        obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
+                                        try:
+                                            import torch  # type: ignore
+
+                                            ext_stream = torch.cuda.ExternalStream(int(h.stream))
+                                        except Exception:
+                                            ext_stream = None
+
+                                        if ext_stream is not None:
+                                            with torch.cuda.stream(ext_stream):
+                                                raw_tensor = tensor_from_external_frame(
+                                                    h.ext_frame,
+                                                    width=frame.width,
+                                                    height=frame.height,
+                                                    stride_bytes=frame.stride,
+                                                    offset_bytes=offset_bytes,
+                                                    stream=h.stream,
+                                                    sync=False,
+                                                )
+                                                raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
+                                                if bool(getattr(self, "_synthetic_eye_vflip", False)):
+                                                    try:
+                                                        raw_tensor = raw_tensor.flip(0)
+                                                    except Exception:
+                                                        pass
+                                                obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
+
+                                                if (
+                                                    self._dashboard_stream == "synthetic_eye"
+                                                    and self._dashboard_fps > 0
+                                                    and (now - float(self._dashboard_last_ts or 0.0))
+                                                    >= (1.0 / float(self._dashboard_fps))
+                                                ):
+                                                    try:
+                                                        import io
+                                                        from PIL import Image
+                                                        import torch.nn.functional as F
+
+                                                        img_t = raw_tensor[..., :3].permute(2, 0, 1).unsqueeze(0).float()
+                                                        if 0 < self._dashboard_scale < 1:
+                                                            h_out = max(2, int(img_t.shape[2] * self._dashboard_scale))
+                                                            w_out = max(2, int(img_t.shape[3] * self._dashboard_scale))
+                                                            img_t = F.interpolate(
+                                                                img_t, size=(h_out, w_out), mode="bilinear", align_corners=False
+                                                            )
+                                                        img_t = img_t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().to("cpu")
+                                                        img = Image.fromarray(img_t.numpy())
+                                                        buf = io.BytesIO()
+                                                        img.save(buf, format="JPEG", quality=80)
+                                                        latest_image_bytes = buf.getvalue()
+                                                        latest_image_source = "synthetic_eye"
+                                                        self._set_latest_jpeg(latest_image_bytes)
+                                                        self._dashboard_last_ts = now
+                                                    except Exception:
+                                                        pass
+                                                if os.environ.get("METABONK_VISION_AUDIT", "0") == "1":
+                                                    if int(frame.frame_id) % 60 == 0:
+                                                        mean_val = float(obs.mean().item())
+                                                        std_val = float(obs.std().item())
+                                                        print(
+                                                            f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                            f"shape={tuple(obs.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                            f"device={obs.device}",
+                                                            flush=True,
+                                                        )
+                                        else:
+                                            raw_tensor = tensor_from_external_frame(
+                                                h.ext_frame,
+                                                width=frame.width,
+                                                height=frame.height,
+                                                stride_bytes=frame.stride,
+                                                offset_bytes=offset_bytes,
+                                                stream=h.stream,
+                                            )
+                                            raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
+                                            if bool(getattr(self, "_synthetic_eye_vflip", False)):
+                                                try:
+                                                    raw_tensor = raw_tensor.flip(0)
+                                                except Exception:
+                                                    pass
+                                            obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
                                         if (
                                             self._dashboard_stream == "synthetic_eye"
                                             and self._dashboard_fps > 0
-                                            and (now - float(self._dashboard_last_ts or 0.0)) >= (1.0 / float(self._dashboard_fps))
+                                            and (now - float(self._dashboard_last_ts or 0.0))
+                                            >= (1.0 / float(self._dashboard_fps))
                                         ):
                                             try:
                                                 import io
@@ -4366,9 +4745,11 @@ class WorkerService:
                                                 if 0 < self._dashboard_scale < 1:
                                                     h_out = max(2, int(img_t.shape[2] * self._dashboard_scale))
                                                     w_out = max(2, int(img_t.shape[3] * self._dashboard_scale))
-                                                    img_t = F.interpolate(img_t, size=(h_out, w_out), mode="bilinear", align_corners=False)
+                                                    img_t = F.interpolate(
+                                                        img_t, size=(h_out, w_out), mode="bilinear", align_corners=False
+                                                    )
                                                 img_t = img_t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().to("cpu")
-                                                img = Image.fromarray(img_t.numpy(), mode="RGB")
+                                                img = Image.fromarray(img_t.numpy())
                                                 buf = io.BytesIO()
                                                 img.save(buf, format="JPEG", quality=80)
                                                 latest_image_bytes = buf.getvalue()
@@ -6621,6 +7002,11 @@ class WorkerService:
             "clip_url": clip_url,
             "final_score": float(score),
             "match_duration_sec": int(max(0.0, time.time() - float(self._episode_start_ts))),
+            "episode_idx": int(getattr(self, "_episode_idx", 0) or 0),
+            "policy_name": str(getattr(self, "policy_name", "") or ""),
+            "policy_version": int(self._policy_version) if self._policy_version is not None else None,
+            "agent_name": str(os.environ.get("MEGABONK_AGENT_NAME") or self.instance_id),
+            "seed": str(os.environ.get("MEGABONK_SEED") or ""),
         }
         if self._last_inventory_items:
             payload["inventory_snapshot"] = list(self._last_inventory_items)
@@ -6772,6 +7158,7 @@ class WorkerService:
         out.setdefault("stream_active_clients", None)
         out.setdefault("stream_max_clients", None)
         out.setdefault("stream_busy", None)
+        out.setdefault("nvenc_sessions_used", None)
         if self.streamer is not None:
             try:
                 out["stream_backend"] = getattr(self.streamer, "backend", None)
@@ -6791,6 +7178,10 @@ class WorkerService:
                 out["stream_max_clients"] = (
                     self.streamer.max_clients() if hasattr(self.streamer, "max_clients") else None
                 )
+            except Exception:
+                pass
+            try:
+                out["nvenc_sessions_used"] = getattr(self.streamer, "nvenc_sessions_used_last", None)
             except Exception:
                 pass
             try:
@@ -6839,7 +7230,20 @@ class WorkerService:
         self.rollout.policy_name = cfg.policy_name
         self.rollout.hparams = cfg.hparams
         self._policy_version = None
-        self.learner.register(self.instance_id, cfg.policy_name, obs_dim=self.trainer.obs_dim)
+        caps: dict = {}
+        reg_obs_dim: Optional[int] = self.trainer.obs_dim
+        if bool(getattr(self, "_pixel_obs_enabled", False)):
+            reg_obs_dim = None
+            caps.update(
+                {
+                    "obs_kind": "pixels",
+                    "obs_width": int(getattr(self, "_pixel_obs_w", 0) or 0),
+                    "obs_height": int(getattr(self, "_pixel_obs_h", 0) or 0),
+                    "obs_channels": 3,
+                    "obs_dtype": "uint8",
+                }
+            )
+        self.learner.register(self.instance_id, cfg.policy_name, obs_dim=reg_obs_dim, capabilities=caps)
         try:
             if cfg.eval_mode is not None:
                 self.rollout.eval_mode = bool(cfg.eval_mode)
@@ -6974,11 +7378,59 @@ if app:
 
         # Cache miss: attempt demand-paged snapshot (single frame).
         snap = None
-        try:
-            if service.streamer is not None and hasattr(service.streamer, "capture_jpeg"):
-                snap = service.streamer.capture_jpeg(timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5")))
-        except Exception:
-            snap = None
+        # Synthetic Eye (pixels obs) fallback: if we're running GPU-only observations and have a
+        # recent pixel tensor cached, convert it into a small JPEG. This avoids relying on
+        # PipeWire being available/healthy for the debug UI + smoke tests.
+        if (
+            getattr(service, "_frame_source", "") in ("synthetic_eye", "smithay", "smithay_dmabuf")
+            and bool(getattr(service, "_pixel_obs_enabled", False))
+        ):
+            try:
+                obs_u8, _fid, _ts, _src_size = service._get_latest_pixel_obs()  # type: ignore[attr-defined]
+            except Exception:
+                obs_u8 = None
+            if obs_u8 is not None:
+                try:
+                    import io
+                    from PIL import Image
+
+                    t = obs_u8
+                    try:
+                        # Move to CPU for JPEG encoding (debug endpoint only).
+                        if hasattr(t, "detach"):
+                            t = t.detach()
+                        if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
+                            t = t.to(device="cpu", non_blocking=True)
+                        elif hasattr(t, "cpu"):
+                            t = t.cpu()
+                    except Exception:
+                        if hasattr(t, "cpu"):
+                            t = t.cpu()
+                    # Expect CHW uint8 (3xHxW).
+                    if hasattr(t, "ndim") and int(getattr(t, "ndim", 0)) == 3:
+                        try:
+                            t = t[:3].permute(1, 2, 0).contiguous()
+                        except Exception:
+                            pass
+                        arr = t.numpy() if hasattr(t, "numpy") else None
+                        if arr is not None:
+                            img = Image.fromarray(arr)
+                            buf = io.BytesIO()
+                            try:
+                                q = int(os.environ.get("METABONK_FRAME_JPEG_QUALITY", "80"))
+                            except Exception:
+                                q = 80
+                            q = max(10, min(95, int(q)))
+                            img.save(buf, format="JPEG", quality=q)
+                            snap = buf.getvalue()
+                except Exception:
+                    snap = None
+        if not snap:
+            try:
+                if service.streamer is not None and hasattr(service.streamer, "capture_jpeg"):
+                    snap = service.streamer.capture_jpeg(timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5")))
+            except Exception:
+                snap = None
         if snap:
             try:
                 service._latest_jpeg_bytes = snap

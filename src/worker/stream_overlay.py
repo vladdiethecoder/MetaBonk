@@ -14,6 +14,7 @@ to consume the overlay (per-client process in `NVENCStreamer`).
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import threading
@@ -110,6 +111,8 @@ def start_world_overlay_watcher(
     instance_id: Optional[str] = None,
     poll_s: float = 0.5,
     max_kb: int = 2048,
+    max_hz: float = 2.0,
+    dedupe: bool = True,
 ) -> None:
     """Watch a PNG overlay file and emit meta events when it changes."""
     overlay_path = str(path or "").strip()
@@ -117,41 +120,72 @@ def start_world_overlay_watcher(
         return
 
     def _loop() -> None:
-        last_mtime = 0.0
+        last_seen_mtime = 0.0
+        last_emit_ts = 0.0
+        last_hash: Optional[bytes] = None
+        pending_mtime = 0.0
+        pending_data: Optional[bytes] = None
+        pending_hash: Optional[bytes] = None
         while True:
+            sleep_s = max(poll_s, 0.1)
+            min_emit_s = 0.0
+            try:
+                hz = float(max_hz)
+                if hz > 0:
+                    min_emit_s = 1.0 / hz
+            except Exception:
+                min_emit_s = 0.0
             try:
                 stat = os.stat(overlay_path)
             except Exception:
-                time.sleep(max(poll_s, 0.1))
+                time.sleep(sleep_s)
                 continue
-            if stat.st_mtime <= last_mtime:
-                time.sleep(max(poll_s, 0.1))
-                continue
-            last_mtime = stat.st_mtime
-            if max_kb > 0 and stat.st_size > max_kb * 1024:
-                emit_overlay(
-                    kind="file",
-                    payload={"path": overlay_path, "bytes": int(stat.st_size), "reason": "overlay_too_large"},
-                    instance_id=instance_id,
-                )
-                time.sleep(max(poll_s, 0.1))
-                continue
-            try:
-                data = Path(overlay_path).read_bytes()
-            except Exception:
-                time.sleep(max(poll_s, 0.1))
-                continue
-            if not data:
-                time.sleep(max(poll_s, 0.1))
-                continue
-            b64 = base64.b64encode(data).decode("ascii")
-            emit_overlay(
-                kind="file",
-                payload={"path": overlay_path, "bytes": int(len(data))},
-                png_base64=b64,
-                instance_id=instance_id,
-            )
-            time.sleep(max(poll_s, 0.1))
+
+            if stat.st_mtime > last_seen_mtime:
+                last_seen_mtime = float(stat.st_mtime)
+                if max_kb > 0 and stat.st_size > max_kb * 1024:
+                    # Emit an issue-like overlay meta, but avoid spamming.
+                    now = time.time()
+                    if min_emit_s <= 0 or (now - last_emit_ts) >= min_emit_s:
+                        emit_overlay(
+                            kind="file",
+                            payload={"path": overlay_path, "bytes": int(stat.st_size), "reason": "overlay_too_large"},
+                            instance_id=instance_id,
+                        )
+                        last_emit_ts = now
+                    time.sleep(sleep_s)
+                    continue
+
+                try:
+                    data = Path(overlay_path).read_bytes()
+                except Exception:
+                    time.sleep(sleep_s)
+                    continue
+                if data:
+                    h = hashlib.blake2b(data, digest_size=16).digest()
+                    pending_mtime = float(stat.st_mtime)
+                    pending_data = data
+                    pending_hash = h
+
+            now = time.time()
+            if pending_data and pending_hash:
+                if dedupe and last_hash is not None and pending_hash == last_hash:
+                    pending_data = None
+                    pending_hash = None
+                elif min_emit_s <= 0 or (now - last_emit_ts) >= min_emit_s:
+                    b64 = base64.b64encode(pending_data).decode("ascii")
+                    emit_overlay(
+                        kind="file",
+                        payload={"path": overlay_path, "bytes": int(len(pending_data)), "mtime": float(pending_mtime)},
+                        png_base64=b64,
+                        instance_id=instance_id,
+                    )
+                    last_emit_ts = now
+                    last_hash = pending_hash
+                    pending_data = None
+                    pending_hash = None
+
+            time.sleep(sleep_s)
 
     threading.Thread(target=_loop, daemon=True).start()
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import List
@@ -18,6 +20,38 @@ def _add_repo_root() -> Path:
 def _dump_yaml(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def _selinux_enabled() -> bool:
+    if shutil.which("selinuxenabled") is None:
+        return False
+    try:
+        proc = subprocess.run(
+            ["selinuxenabled"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _relabel_fifo_dir_for_containers(fifo_dir: Path) -> None:
+    """Best-effort: ensure FIFO dir is readable from containers on SELinux hosts."""
+    if not _selinux_enabled():
+        return
+    if shutil.which("chcon") is None:
+        return
+    try:
+        subprocess.run(
+            ["chcon", "-R", "-t", "container_file_t", "-l", "s0", str(fifo_dir)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return
 
 
 def main() -> int:
@@ -102,6 +136,7 @@ def main() -> int:
         fifo_dir.mkdir(parents=True, exist_ok=True)
         for iid in instance_ids:
             ensure_fifo(str(fifo_dir / f"{iid}.{fifo_ext}"))
+        _relabel_fifo_dir_for_containers(fifo_dir)
     else:
         cmd_template = str(args.exec_cmd_template or "").strip()
         if exec_profile:

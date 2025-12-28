@@ -305,10 +305,23 @@ def main() -> int:
         if compose == "docker":
             cmd += ["compose"]
         cmd += ["-f", str(repo_root / "docker" / "docker-compose.go2rtc.yml"), "down", "--remove-orphans"]
+        env0 = dict(os.environ)
         try:
-            subprocess.call(cmd, cwd=str(repo_root))
+            subprocess.call(cmd, cwd=str(repo_root), env=env0)
         except Exception:
             pass
+
+        # Some environments export DOCKER_HOST to a rootless podman socket while the
+        # MetaBonk go2rtc container is managed by rootful docker. Best-effort: also
+        # try stopping via the default docker socket (DOCKER_HOST unset).
+        dh = str(env0.get("DOCKER_HOST") or "")
+        if dh and "podman" in dh:
+            env1 = dict(env0)
+            env1.pop("DOCKER_HOST", None)
+            try:
+                subprocess.call(cmd, cwd=str(repo_root), env=env1)
+            except Exception:
+                pass
 
     # Verification pass: ensure no known MetaBonk processes remain.
     user = os.environ.get("USER") or ""
