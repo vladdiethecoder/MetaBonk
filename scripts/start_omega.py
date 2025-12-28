@@ -72,6 +72,98 @@ def _truthy(value: Optional[str]) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _strip_shell_quotes(value: str) -> str:
+    v = str(value or "").strip()
+    if len(v) >= 2 and ((v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'"))):
+        return v[1:-1]
+    return v
+
+
+def _parse_env_exports_from_sh(path: Path) -> Dict[str, str]:
+    """Parse a simple env export shell script (best-effort).
+
+    Supported line formats:
+      - export KEY="VALUE"
+      - KEY="VALUE"
+    """
+    env_vars: Dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return env_vars
+    for raw in text.splitlines():
+        line = str(raw or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        key = str(k or "").strip()
+        if not key:
+            continue
+        env_vars[key] = _strip_shell_quotes(v)
+    return env_vars
+
+
+def _resolve_discovery_dir(repo_root: Path, env: Dict[str, str]) -> Path:
+    raw = str(
+        env.get("METABONK_DISCOVERY_ENV")
+        or env.get("METABONK_ENV_ID")
+        or env.get("METABONK_ENV")
+        or "megabonk"
+    ).strip()
+    if not raw:
+        raw = "megabonk"
+    candidates = [
+        raw,
+        raw.lower(),
+        raw.replace(" ", "_"),
+        raw.lower().replace(" ", "_"),
+        raw.replace(" ", ""),
+        raw.lower().replace(" ", ""),
+    ]
+    base = repo_root / "cache" / "discovery"
+    for c in candidates:
+        d = base / str(c)
+        if d.exists():
+            return d
+    return base / raw.lower()
+
+
+def _apply_discovery_artifacts(repo_root: Path, env: Dict[str, str]) -> None:
+    """Best-effort apply Phase 3 discovery artifacts to the launcher env.
+
+    If the user explicitly set relevant vars in their shell, we do not override them.
+    """
+    discovery_dir = _resolve_discovery_dir(repo_root, env)
+    action_json = discovery_dir / "learned_action_space.json"
+    config_sh = discovery_dir / "ppo_config.sh"
+
+    if not (action_json.exists() and config_sh.exists()):
+        return
+
+    print(f"[start_omega] 🧬 Auto-Discovery: loading {discovery_dir}", flush=True)
+    env.setdefault("METABONK_ACTION_SPACE_FILE", str(action_json.resolve()))
+
+    overrides = _parse_env_exports_from_sh(config_sh)
+    if not overrides:
+        print(f"[start_omega] WARN: failed to parse {config_sh}", flush=True)
+        return
+
+    applied = 0
+    for k, v in overrides.items():
+        if not str(env.get(k) or "").strip():
+            env[k] = str(v)
+            applied += 1
+
+    if applied:
+        print(f"[start_omega] 🧬 Auto-Discovery: applied {applied} env vars from ppo_config.sh", flush=True)
+    else:
+        print(f"[start_omega] 🧬 Auto-Discovery: no env vars applied (already configured)", flush=True)
+
+
 def _file_sha256(path: Path) -> Optional[str]:
     try:
         h = hashlib.sha256()
@@ -1372,6 +1464,7 @@ def main() -> int:
         if logs_dir:
             logs_dir.mkdir(parents=True, exist_ok=True)
         autonomous_mode = _truthy(env.get("METABONK_AUTONOMOUS_MODE"))
+        _apply_discovery_artifacts(repo_root, env)
         auto_seed_buttons: Optional[str] = None
         auto_input_space: Optional[dict] = None
         if autonomous_mode and not (
@@ -1550,6 +1643,13 @@ def main() -> int:
                 frame_sock = f"{run_root}/{iid}/frame.sock"
                 wenv["METABONK_FRAME_SOURCE"] = "synthetic_eye"
                 wenv["METABONK_FRAME_SOCK"] = frame_sock
+                obs_backend = str(wenv.get("METABONK_OBS_BACKEND") or "").strip().lower()
+                if not obs_backend:
+                    print(
+                        "[start_omega] 👁️  Synthetic Eye enabled: defaulting METABONK_OBS_BACKEND=pixels",
+                        flush=True,
+                    )
+                    wenv["METABONK_OBS_BACKEND"] = "pixels"
                 # Prevent Unity/Unreal focus throttling (black/frozen frames) by ensuring the
                 # Synthetic Eye compositor keeps keyboard focus on the active capture surface.
                 wenv.setdefault("METABONK_EYE_FORCE_FOCUS", "1")
