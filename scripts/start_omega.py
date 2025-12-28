@@ -307,11 +307,20 @@ def _read_env_kv_file(path: Path) -> dict[str, str]:
     return out
 
 
-def _wait_for_compositor_env(env_path: Path, timeout_s: float) -> dict[str, str]:
+def _wait_for_compositor_env(
+    env_path: Path, timeout_s: float, *, min_mtime_ns: Optional[int] = None
+) -> dict[str, str]:
     deadline = time.time() + max(0.1, float(timeout_s))
     last: dict[str, str] = {}
     while time.time() < deadline:
         if env_path.exists():
+            if min_mtime_ns is not None:
+                try:
+                    if env_path.stat().st_mtime_ns <= int(min_mtime_ns):
+                        time.sleep(0.1)
+                        continue
+                except Exception:
+                    pass
             last = _read_env_kv_file(env_path)
             if last.get("DISPLAY") and last.get("WAYLAND_DISPLAY") and last.get("XDG_RUNTIME_DIR"):
                 return last
@@ -1857,6 +1866,15 @@ def main() -> int:
                     eye_cmd.append("--xwayland")
                 if gpu_choice is not None:
                     eye_cmd += ["--vk-device-index", str(gpu_choice)]
+                env_path = None
+                min_mtime_ns = None
+                if use_eye_compositor:
+                    env_path = Path(run_root) / iid / "compositor.env"
+                    try:
+                        if env_path.exists():
+                            min_mtime_ns = env_path.stat().st_mtime_ns
+                    except Exception:
+                        min_mtime_ns = None
                 eye_env = wenv.copy()
                 procs.append(
                     _spawn(
@@ -1868,12 +1886,13 @@ def main() -> int:
                     )
                 )
                 if use_eye_compositor:
-                    env_path = Path(run_root) / iid / "compositor.env"
+                    if env_path is None:
+                        env_path = Path(run_root) / iid / "compositor.env"
                     try:
                         wait_s = float(os.environ.get("METABONK_SYNTHETIC_EYE_ENV_WAIT_S", "10.0"))
                     except Exception:
                         wait_s = 10.0
-                    kv = _wait_for_compositor_env(env_path, wait_s)
+                    kv = _wait_for_compositor_env(env_path, wait_s, min_mtime_ns=min_mtime_ns)
                     disp = str(kv.get("DISPLAY") or "").strip()
                     wl = str(kv.get("WAYLAND_DISPLAY") or "").strip()
                     xdg = str(kv.get("XDG_RUNTIME_DIR") or "").strip()
