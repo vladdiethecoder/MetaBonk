@@ -52,13 +52,6 @@ export default function App() {
       </Suspense>
     );
   }
-  if (loc.pathname === "/") {
-    return (
-      <ErrorBoundary label="NeuroSynaptic">
-        <NeuroSynaptic />
-      </ErrorBoundary>
-    );
-  }
   const nav = [
     { to: "/", label: "Neuro" },
     { to: "/overview", label: "Overview" },
@@ -94,6 +87,7 @@ export default function App() {
         <div className="page-scroll">
           <Suspense fallback={<div className="card">loading…</div>}>
             <Routes>
+              <Route path="/" element={<ErrorBoundary label="NeuroSynaptic"><NeuroSynaptic /></ErrorBoundary>} />
               <Route path="/overview" element={<ErrorBoundary label="Overview"><Overview /></ErrorBoundary>} />
               <Route path="/supervisor" element={<ErrorBoundary label="Supervisor"><Supervisor /></ErrorBoundary>} />
               <Route path="/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />

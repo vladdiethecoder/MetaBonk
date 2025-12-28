@@ -192,6 +192,16 @@ fn stop_omega(app: AppHandle, state: State<'_, OmegaState>) -> Result<(), String
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+  // WebKitGTK can crash on NVIDIA/Wayland when DMA-BUF renderer is enabled.
+  // Default to disabling it on Linux unless the user explicitly overrides.
+  if cfg!(target_os = "linux") {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+      std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+      std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+  }
   tauri::Builder::default()
     .manage(OmegaState {
       child: Mutex::new(None),

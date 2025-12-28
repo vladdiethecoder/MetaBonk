@@ -6,12 +6,13 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchOverviewHealth, fetchOverviewIssues, fetchStatus, fetchWorkers } from "../api";
 import { fmtFixed, timeAgo } from "../lib/format";
 import useActivationResizeKick from "../hooks/useActivationResizeKick";
-import QueryStateGate from "../components/QueryStateGate";
 import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
 import { useWebglResetNonce } from "../hooks/useWebglReset";
+import { isTauri } from "../lib/tauri";
 
 const NAV = [
   { to: "/", label: "Neuro" },
+  { to: "/supervisor", label: "Supervisor" },
   { to: "/runs", label: "Runs" },
   { to: "/instances", label: "Instances" },
   { to: "/build", label: "Build Lab" },
@@ -19,6 +20,8 @@ const NAV = [
   { to: "/spy", label: "Spy" },
   { to: "/stream", label: "Stream" },
 ];
+
+type Mode = "train" | "play" | "dream";
 
 function useCanvasLoop(draw: (ctx: CanvasRenderingContext2D, t: number, w: number, h: number) => void) {
   const ref = useRef<HTMLCanvasElement | null>(null);
@@ -468,6 +471,65 @@ export default function NeuroSynaptic() {
     refetchInterval: 6000,
   });
 
+  const [tauriReady, setTauriReady] = useState(false);
+  const [omegaRunning, setOmegaRunning] = useState(false);
+  const [launchMode, setLaunchMode] = useState<Mode>("train");
+  const [launchWorkers, setLaunchWorkers] = useState(1);
+  const [launchBusy, setLaunchBusy] = useState(false);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const ok = isTauri();
+    setTauriReady(ok);
+    if (!ok) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const running = await invoke<boolean>("omega_running");
+        if (!cancelled) setOmegaRunning(Boolean(running));
+      } catch (e: any) {
+        if (!cancelled) setLaunchError(String(e?.message ?? e));
+      }
+    };
+    poll();
+    const t = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, []);
+
+  const startOmega = async () => {
+    if (!tauriReady || launchBusy) return;
+    setLaunchBusy(true);
+    setLaunchError(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("start_omega", { mode: launchMode, workers: launchWorkers });
+      setOmegaRunning(true);
+    } catch (e: any) {
+      setLaunchError(String(e?.message ?? e));
+    } finally {
+      setLaunchBusy(false);
+    }
+  };
+
+  const stopOmega = async () => {
+    if (!tauriReady || launchBusy) return;
+    setLaunchBusy(true);
+    setLaunchError(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("stop_omega");
+      setOmegaRunning(false);
+    } catch (e: any) {
+      setLaunchError(String(e?.message ?? e));
+    } finally {
+      setLaunchBusy(false);
+    }
+  };
+
   const workers = workersQ.data ?? {};
   const workerList = Object.values(workers);
   const activeCount = workerList.length;
@@ -721,6 +783,68 @@ export default function NeuroSynaptic() {
         </section>
 
         <section className="syn-right">
+          <article className="syn-panel syn-panel-launch">
+            <div className="syn-panel-header">
+              <div>
+                <h3>Launch Control</h3>
+                <p>Start or stop the Omega stack (Tauri).</p>
+              </div>
+              <div className="syn-panel-metric">
+                <span>Status</span>
+                <strong>{omegaRunning ? "LIVE" : "IDLE"}</strong>
+              </div>
+            </div>
+            <div className="syn-panel-body" style={{ minHeight: 160 }}>
+              <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+                {tauriReady ? (
+                  <>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      <label style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 120 }}>
+                        <span className="label">Mode</span>
+                        <select
+                          value={launchMode}
+                          onChange={(e) => setLaunchMode(e.target.value as Mode)}
+                          style={{ padding: "6px 10px", borderRadius: 10 }}
+                        >
+                          <option value="train">train</option>
+                          <option value="play">play</option>
+                          <option value="dream">dream</option>
+                        </select>
+                      </label>
+                      <label style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 120 }}>
+                        <span className="label">Workers</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={launchWorkers}
+                          onChange={(e) => setLaunchWorkers(Math.max(1, Number(e.target.value || 1)))}
+                          style={{ padding: "6px 10px", borderRadius: 10 }}
+                        />
+                      </label>
+                    </div>
+                    <div className="syn-actions">
+                      <button className="syn-action" disabled={launchBusy || omegaRunning} onClick={startOmega}>
+                        {launchBusy ? "Starting..." : "Start Omega"}
+                      </button>
+                      <button className="syn-action ghost" disabled={launchBusy || !omegaRunning} onClick={stopOmega}>
+                        Stop Omega
+                      </button>
+                      <Link className="syn-action ghost" to="/stream">
+                        Open Stream
+                      </Link>
+                    </div>
+                    {launchError ? <div className="muted">error: {launchError}</div> : null}
+                  </>
+                ) : (
+                  <div className="muted">
+                    Launch control is available in the packaged app. Run{" "}
+                    <code>python scripts/run_production.py --mode train --workers 1</code> in dev.
+                  </div>
+                )}
+              </div>
+            </div>
+          </article>
+
           <article className="syn-panel syn-panel-system2">
             <div className="syn-panel-header">
               <div>

@@ -553,7 +553,20 @@ export type PbtMuteState = {
   policies: Record<string, boolean>;
 };
 
-const ORCH = "/api";
+const DEFAULT_ORCH = "/api";
+
+const resolveOrchBase = () => {
+  if (typeof window === "undefined") return DEFAULT_ORCH;
+  const w = window as any;
+  const explicit = typeof w.__MB_ORCH_URL__ === "string" ? String(w.__MB_ORCH_URL__) : "";
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const envUrl = (import.meta as any)?.env?.VITE_ORCH_URL;
+  if (envUrl) return String(envUrl).replace(/\/+$/, "");
+  if ("__TAURI__" in w) return "http://127.0.0.1:8040";
+  return DEFAULT_ORCH;
+};
+
+const ORCH = resolveOrchBase();
 
 const getTraceContext = () => {
   if (typeof window === "undefined" || !(window.crypto?.getRandomValues)) return null;

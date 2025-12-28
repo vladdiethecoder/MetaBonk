@@ -2644,19 +2644,19 @@ if app:
         start = time.time()
         status_code = 500
         try:
+            path = request.url.path
+        except Exception:
+            path = ""
+        # Skip long-lived stream endpoints to avoid polluting latency stats.
+        skip_metrics = path.startswith("/events/stream") or path.startswith("/stream")
+        try:
             response = await call_next(request)
             status_code = getattr(response, "status_code", 500)
             return response
         finally:
-            try:
-                path = request.url.path
-            except Exception:
-                path = ""
-            # Skip long-lived stream endpoints to avoid polluting latency stats.
-            if path.startswith("/events/stream") or path.startswith("/stream"):
-                return
-            elapsed_ms = (time.time() - start) * 1000.0
-            _record_api_latency(path, int(status_code), float(elapsed_ms))
+            if not skip_metrics:
+                elapsed_ms = (time.time() - start) * 1000.0
+                _record_api_latency(path, int(status_code), float(elapsed_ms))
 
     # Serve highlight clips directory if present.
     try:

@@ -283,6 +283,7 @@ def _spawn(
     role: str = "service",
     restart_count: int = 0,
     stdout_path: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Proc:
     print(f"[start_omega] starting {name}: {' '.join(cmd)}")
     preexec_fn = None
@@ -312,7 +313,7 @@ def _spawn(
         stderr = subprocess.STDOUT
         print(f"[start_omega] {name} logs -> {log_path}")
 
-    p = subprocess.Popen(cmd, env=env, preexec_fn=preexec_fn, stdout=stdout, stderr=stderr)
+    p = subprocess.Popen(cmd, env=env, preexec_fn=preexec_fn, stdout=stdout, stderr=stderr, cwd=cwd)
     if log_file:
         log_file.close()
     return Proc(
@@ -1757,6 +1758,7 @@ def main() -> int:
                     env=env,
                     role="service",
                     stdout_path=str(ui_log) if ui_log else None,
+                    cwd=str(frontend),
                 )
             )
             print(f"[start_omega] ui -> http://{args.ui_host}:{args.ui_port}")
