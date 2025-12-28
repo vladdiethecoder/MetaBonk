@@ -29,6 +29,7 @@ import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
 import RouteScope from "../components/RouteScope";
 import { bumpWebglCount, reportWebglLost } from "../hooks/useWebglCounter";
 import { useWebglResetNonce } from "../hooks/useWebglReset";
+import Reasoning from "./Reasoning";
 
 const HUD_W = 3840;
 const HUD_H = 2160;
@@ -184,7 +185,7 @@ function HoloStreamCanvas({
   );
 }
 
-type RailTab = "moments" | "community" | "bucks" | "poll" | "progress" | "controls";
+type RailTab = "moments" | "community" | "bucks" | "poll" | "progress" | "mind" | "controls";
 
 type SpriteIconProps = {
   idx: number;
@@ -617,7 +618,19 @@ function StreamTile({
   const frameUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/frame.jpg` : "";
   const go2rtcBase = String((w as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
-  const useGo2rtc = Boolean(go2rtcBase && go2rtcName);
+  const fallbackGo2rtcBase = useMemo(() => {
+    if (typeof window === "undefined") return "";
+    const host = window.location.hostname || "localhost";
+    const protocol = window.location.protocol.startsWith("http") ? window.location.protocol : "http:";
+    return `${protocol}//${host}:1984`;
+  }, []);
+  const fallbackGo2rtcName = "metabonk";
+  const effectiveGo2rtcBase = go2rtcBase || (focused ? fallbackGo2rtcBase : "");
+  const effectiveGo2rtcName = go2rtcName || (focused ? fallbackGo2rtcName : "");
+  const useGo2rtc = Boolean(effectiveGo2rtcBase && effectiveGo2rtcName);
+  const go2rtcEmbedUrl = useGo2rtc
+    ? `${effectiveGo2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(effectiveGo2rtcName)}`
+    : "";
   const featuredRole = String((w as any)?.featured_role ?? "").toLowerCase();
 
   const danger = Math.max(0, Math.min(1, Number(w?.danger_level ?? (w?.survival_prob != null ? 1 - Number(w.survival_prob) : 0)) || 0));
@@ -626,7 +639,7 @@ function StreamTile({
   const hype = String((w as any)?.hype_label ?? "");
   const shame = String((w as any)?.shame_label ?? "");
   const showLabels = Boolean(focused);
-  const noFeed = !streamUrl || !isVideo;
+  const noFeed = !useGo2rtc && (!streamUrl || !isVideo);
   let lastFrameAgeS: number | null = null;
   try {
     const raw = Number(w?.stream_last_frame_ts ?? 0);
@@ -642,6 +655,10 @@ function StreamTile({
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
 
   useEffect(() => {
+    if (useGo2rtc) {
+      if (standbyStable) setStandbyStable(false);
+      return;
+    }
     if (noFeed || lastFrameAgeS == null) {
       if (!standbyStable) setStandbyStable(true);
       return;
@@ -651,7 +668,7 @@ function StreamTile({
     } else {
       if (lastFrameAgeS >= 6.0) setStandbyStable(true);
     }
-  }, [noFeed, lastFrameAgeS, standbyStable]);
+  }, [useGo2rtc, noFeed, lastFrameAgeS, standbyStable]);
 
   const standby = standbyStable;
   const offlineDetail = (() => {
@@ -741,11 +758,12 @@ function StreamTile({
         ) : null}
         {useGo2rtc ? (
           <Go2rtcWebRTC
-            baseUrl={go2rtcBase}
-            streamName={go2rtcName}
+            baseUrl={effectiveGo2rtcBase}
+            streamName={effectiveGo2rtcName}
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debugHud={DEBUG_HUD}
+            embedUrl={go2rtcEmbedUrl || undefined}
           />
         ) : streamUrl && isVideo ? (
           <MseMp4Video
@@ -1600,7 +1618,7 @@ export default function Stream() {
 
   useEffect(() => {
     if (!railAuto) return;
-    const order: RailTab[] = ["moments", "community", "bucks", "poll", "progress"];
+    const order: RailTab[] = ["moments", "community", "bucks", "poll", "progress", "mind"];
     const t = window.setInterval(() => {
       setRailTab((cur) => {
         const idx = order.indexOf(cur);
@@ -2401,6 +2419,15 @@ export default function Stream() {
                             <SpriteIcon idx={sheetIcon("tome_mastery")} size={16} className="tab-ico" /> Progress
                           </button>
                           <button
+                            className={`stream-tabbtn ${railTab === "mind" ? "active" : ""}`}
+                            onClick={() => {
+                              setRailAuto(false);
+                              setRailTab("mind");
+                            }}
+                          >
+                            <SpriteIcon idx={sheetIcon("planning")} size={16} className="tab-ico" /> Mind
+                          </button>
+                          <button
                             className={`stream-tabbtn ${railTab === "controls" ? "active" : ""}`}
                             onClick={() => {
                               setRailAuto(false);
@@ -2427,6 +2454,9 @@ export default function Stream() {
                           </span>
                           <span className={`stream-tablabel ${railTab === "progress" ? "active" : ""}`}>
                             <SpriteIcon idx={sheetIcon("tome_mastery")} size={16} className="tab-ico" title="Progress" />
+                          </span>
+                          <span className={`stream-tablabel ${railTab === "mind" ? "active" : ""}`}>
+                            <SpriteIcon idx={sheetIcon("planning")} size={16} className="tab-ico" title="Mind" />
                           </span>
                         </>
                       )}
@@ -2546,6 +2576,11 @@ export default function Stream() {
                               <div className="muted">progress controls are available in dev mode</div>
                             </div>
                           )
+                        ) : null}
+                        {railTab === "mind" ? (
+                          <div className="stream-reasoning-embed">
+                            <Reasoning embedded defaultInstanceId={focus?.instance_id ? String(focus.instance_id) : null} />
+                          </div>
                         ) : null}
                         {railTab === "controls" && debugParamOn ? (
                           <div className="stream-card">

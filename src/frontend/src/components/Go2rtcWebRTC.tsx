@@ -55,12 +55,14 @@ export default function Go2rtcWebRTC({
   className,
   onVideoReady,
   debugHud = false,
+  embedUrl,
 }: {
   baseUrl: string;
   streamName: string;
   className?: string;
   onVideoReady?: (el: HTMLVideoElement | null) => void;
   debugHud?: boolean;
+  embedUrl?: string;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -83,6 +85,7 @@ export default function Go2rtcWebRTC({
     avgJitterMs: number | null;
     freezeCount: number | null;
   } | null>(null);
+  const showEmbed = Boolean(embedUrl && status === "error");
 
   useEffect(() => {
     if (!onVideoReady) return;
@@ -348,7 +351,15 @@ export default function Go2rtcWebRTC({
   return (
     <div className="mse-wrap">
       <video ref={videoRef} className={className} muted playsInline autoPlay />
-      {status !== "playing" ? (
+      {showEmbed ? (
+        <iframe
+          className="mse-embed"
+          src={embedUrl}
+          title={`go2rtc-${streamName}`}
+          allow="autoplay; fullscreen"
+        />
+      ) : null}
+      {status !== "playing" && !showEmbed ? (
         <div className="mse-overlay">
           <div className="mse-overlay-inner">
             <div className="mse-overlay-title">{status === "error" ? "SIGNAL LOST" : "CONNECTING"}</div>

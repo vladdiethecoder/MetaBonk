@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import PageShell from "../components/PageShell";
 import QueryStateGate from "../components/QueryStateGate";
@@ -20,26 +20,49 @@ type ThoughtPacket = {
   payload?: any;
 };
 
-export default function Reasoning() {
+type ReasoningProps = {
+  embedded?: boolean;
+  defaultInstanceId?: string | null;
+};
+
+export default function Reasoning({ embedded = false, defaultInstanceId = null }: ReasoningProps) {
   const loc = useLocation();
-  const isActive = loc.pathname === "/reasoning";
+  const embeddedMode = Boolean(embedded);
+  const isActive = !embeddedMode && loc.pathname === "/reasoning";
   useActivationResizeKick(isActive);
 
   const instQ = useQuery({ queryKey: ["instances"], queryFn: fetchInstances, refetchInterval: 2000 });
   const instances = (instQ.data ?? {}) as Record<string, InstanceView>;
 
   const [selected, setSelected] = useState<string>("");
+  const lastDefaultRef = useRef<string>("");
+  const defaultId = defaultInstanceId ? String(defaultInstanceId) : "";
   useEffect(() => {
+    if (embeddedMode) return;
     const qs = new URLSearchParams(loc.search);
     const id = qs.get("id") ?? qs.get("instance") ?? qs.get("iid") ?? qs.get("instance_id");
     if (id && String(id) !== selected) setSelected(String(id));
-  }, [loc.search, selected]);
+  }, [embeddedMode, loc.search, selected]);
+
+  useEffect(() => {
+    if (!embeddedMode) return;
+    if (!defaultId) return;
+    const last = lastDefaultRef.current;
+    if (!selected || selected === last) {
+      if (selected !== defaultId) setSelected(defaultId);
+    }
+    lastDefaultRef.current = defaultId;
+  }, [embeddedMode, defaultId, selected]);
 
   useEffect(() => {
     if (selected) return;
+    if (defaultId && instances[defaultId]) {
+      setSelected(defaultId);
+      return;
+    }
     const ids = Object.keys(instances);
     if (ids.length) setSelected(ids[0]);
-  }, [instances, selected]);
+  }, [instances, selected, defaultId]);
 
   const selectedHb = selected ? instances[selected]?.heartbeat : null;
   const controlUrl = selectedHb?.control_url ? String(selectedHb.control_url) : "";
@@ -94,8 +117,8 @@ export default function Reasoning() {
     });
   }, [instances]);
 
-  return (
-    <PageShell>
+  const content = (
+    <>
       <div className="card">
         <div className="row-between">
           <div style={{ flex: 1 }}>
@@ -119,7 +142,7 @@ export default function Reasoning() {
 
       <QueryStateGate query={instQ} label="instances" />
 
-      <div className="grid" style={{ gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+      <div className="grid" style={{ gridTemplateColumns: embeddedMode ? "1fr" : "1fr 1fr", gap: 12 }}>
         <div className="card" style={{ gridColumn: "1 / -1" }}>
           <div className="row-between">
             <div className="title">Thought Stream</div>
@@ -132,7 +155,7 @@ export default function Reasoning() {
               waiting for agent-thought events…
             </div>
           ) : tauriAvailable ? (
-            <div style={{ marginTop: 8, maxHeight: 260, overflow: "auto" }}>
+            <div style={{ marginTop: 8, maxHeight: embeddedMode ? 220 : 260, overflow: "auto" }}>
               {thoughtRows.slice(0, 50).map((t, i) => (
                 <div key={i} className="card" style={{ marginBottom: 8 }}>
                   <div className="row-between">
@@ -214,10 +237,12 @@ export default function Reasoning() {
             {controlUrl ? `${controlUrl.replace(/\/+$/, "")}/status` : "—"}
           </div>
         </div>
-        <pre className="code" style={{ maxHeight: 360, overflow: "auto" }}>
+        <pre className="code" style={{ maxHeight: embeddedMode ? 240 : 360, overflow: "auto" }}>
           {JSON.stringify(statusQ.data ?? null, null, 2)}
         </pre>
       </div>
-    </PageShell>
+    </>
   );
+
+  return embeddedMode ? <div className="reasoning-embed">{content}</div> : <PageShell>{content}</PageShell>;
 }
