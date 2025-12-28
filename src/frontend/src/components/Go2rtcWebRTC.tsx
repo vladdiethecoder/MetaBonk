@@ -56,6 +56,7 @@ export default function Go2rtcWebRTC({
   onVideoReady,
   debugHud = false,
   embedUrl,
+  embedOnError = false,
   fallbackJpegUrl,
   fallbackIntervalMs = 900,
 }: {
@@ -65,6 +66,7 @@ export default function Go2rtcWebRTC({
   onVideoReady?: (el: HTMLVideoElement | null) => void;
   debugHud?: boolean;
   embedUrl?: string;
+  embedOnError?: boolean;
   fallbackJpegUrl?: string;
   fallbackIntervalMs?: number;
 }) {
@@ -90,7 +92,7 @@ export default function Go2rtcWebRTC({
     avgJitterMs: number | null;
     freezeCount: number | null;
   } | null>(null);
-  const showEmbed = Boolean(embedUrl && status === "error");
+  const showEmbed = Boolean(embedOnError && embedUrl && status === "error");
   const showFallback = Boolean(fallbackJpegUrl && status !== "playing" && !showEmbed);
   const fallbackSrc = fallbackJpegUrl
     ? `${fallbackJpegUrl}${fallbackJpegUrl.includes("?") ? "&" : "?"}t=${fallbackTick}`

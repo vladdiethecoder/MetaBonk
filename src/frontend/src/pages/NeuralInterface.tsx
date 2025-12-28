@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { fetchStatus, fetchWorkers } from "../api";
 import { fmtFixed } from "../lib/format";
 import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
+import MseMp4Video from "../components/MseMp4Video";
 import Reasoning from "./Reasoning";
 import useTauriEvent from "../hooks/useTauriEvent";
 
@@ -20,6 +21,13 @@ type OverlayEvent = {
 
 const fallbackGo2rtcBase = () => {
   if (typeof window === "undefined") return "";
+  const g = window as any;
+  const explicit = typeof g.__MB_GO2RTC_URL__ === "string" ? String(g.__MB_GO2RTC_URL__) : "";
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const envUrl = (import.meta as any)?.env?.VITE_GO2RTC_URL;
+  if (envUrl) return String(envUrl).replace(/\/+$/, "");
+  const qs = new URLSearchParams(window.location.search);
+  if (qs.get("go2rtc") !== "1") return "";
   const host = window.location.hostname || "localhost";
   const protocol = window.location.protocol.startsWith("http") ? window.location.protocol : "http:";
   return `${protocol}//${host}:1984`;
@@ -35,8 +43,13 @@ export default function NeuralInterface() {
   const selectedWorker = selectedId ? workers.find((w) => String(w.instance_id ?? "") === selectedId) ?? null : null;
   const focused = selectedWorker ?? runningWorker ?? workers[0] ?? null;
   const instanceId = focused?.instance_id ?? null;
+  const streamUrl = String((focused as any)?.stream_url ?? "").trim();
+  const isVideo = String((focused as any)?.stream_type ?? "").toLowerCase() === "mp4";
   const go2rtcBase = String((focused as any)?.go2rtc_base_url ?? "").trim() || fallbackGo2rtcBase();
-  const go2rtcName = String((focused as any)?.go2rtc_stream_name ?? "").trim() || "metabonk";
+  const go2rtcName = String((focused as any)?.go2rtc_stream_name ?? "").trim() || String(instanceId ?? "omega-0");
+  const useGo2rtc = Boolean(go2rtcBase && go2rtcName);
+  const debugOn =
+    import.meta.env.DEV && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1";
   const embedUrl = go2rtcBase ? `${go2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(go2rtcName)}` : "";
   const fallbackJpegUrl = focused?.control_url ? `${String(focused.control_url).replace(/\/+$/, "")}/frame.jpg` : "";
 
@@ -88,13 +101,22 @@ export default function NeuralInterface() {
             {liveLabel}
             {focused ? ` | ${focused.display_name ?? focused.instance_id}` : ""}
           </div>
-          <Go2rtcWebRTC
-            streamName={go2rtcName}
-            baseUrl={go2rtcBase}
-            embedUrl={embedUrl || undefined}
-            className="neural-video"
-            fallbackJpegUrl={fallbackJpegUrl || undefined}
-          />
+          {useGo2rtc ? (
+            <Go2rtcWebRTC
+              streamName={go2rtcName}
+              baseUrl={go2rtcBase}
+              embedUrl={embedUrl || undefined}
+              embedOnError={debugOn}
+              className="neural-video"
+              fallbackJpegUrl={fallbackJpegUrl || undefined}
+            />
+          ) : streamUrl && isVideo ? (
+            <MseMp4Video url={streamUrl} className="neural-video" fallbackUrl={fallbackJpegUrl || undefined} exclusiveKey={instanceId || streamUrl} />
+          ) : fallbackJpegUrl ? (
+            <img className="neural-video" src={fallbackJpegUrl} alt="neural fallback" />
+          ) : (
+            <div className="neural-video muted">no stream</div>
+          )}
           {overlayMode !== "none" && overlayImage ? (
             <img className="neural-overlay" src={overlayImage} alt="world-model overlay" />
           ) : null}

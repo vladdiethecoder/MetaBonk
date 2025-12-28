@@ -13,6 +13,8 @@ import NeuralInterface from "./pages/NeuralInterface";
 import Laboratory from "./pages/Laboratory";
 import Codex from "./pages/Codex";
 import NeuroSynaptic from "./pages/NeuroSynaptic";
+import Singularity from "./pages/Singularity";
+import Clips from "./pages/Clips";
 import Runs from "./pages/Runs";
 import Instances from "./pages/Instances";
 import Skills from "./pages/Skills";
@@ -321,11 +323,13 @@ export default function App() {
               <Route path="/lab/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />
               <Route path="/lab/instances" element={<ErrorBoundary label="Instances"><Instances /></ErrorBoundary>} />
               <Route path="/lab/build" element={<ErrorBoundary label="Build Lab"><BuildLab /></ErrorBoundary>} />
+              <Route path="/lab/clips" element={<ErrorBoundary label="Clips"><Clips /></ErrorBoundary>} />
               <Route path="/lab/discovery" element={<ErrorBoundary label="Discovery"><Discovery /></ErrorBoundary>} />
 
               <Route path="/codex" element={<ErrorBoundary label="Codex"><Codex /></ErrorBoundary>} />
               <Route path="/codex/skills" element={<ErrorBoundary label="Skills"><Skills /></ErrorBoundary>} />
               <Route path="/codex/brain" element={<ErrorBoundary label="NeuroSynaptic"><NeuroSynaptic /></ErrorBoundary>} />
+              <Route path="/codex/singularity" element={<ErrorBoundary label="Singularity"><Singularity /></ErrorBoundary>} />
 
               <Route path="/agents" element={<Navigate to="/neural" replace />} />
               <Route path="/spy" element={<Navigate to="/neural" replace />} />

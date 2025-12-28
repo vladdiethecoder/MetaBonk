@@ -3,6 +3,8 @@ import { useMemo, useState } from "react";
 import useTauriEvent from "../hooks/useTauriEvent";
 import { fmtFixed } from "../lib/format";
 import { useTauriRuntime } from "../tauri/RuntimeProvider";
+import { TrainingPanel } from "../components/TrainingPanel";
+import { VideoProcessing } from "../components/VideoProcessing";
 
 type TelemetryPayload = {
   ts?: number;
@@ -133,6 +135,30 @@ export default function Laboratory() {
               </div>
             </div>
           </section>
+
+          <section className="card">
+            <div className="card-header">
+              <div>
+                <h3>Video Processing</h3>
+                <p className="muted">GUI wrapper for `scripts/video_to_trajectory.py` + `scripts/video_pretrain.py`.</p>
+              </div>
+            </div>
+            <div className="card-body">
+              <VideoProcessing />
+            </div>
+          </section>
+
+          <section className="card">
+            <div className="card-header">
+              <div>
+                <h3>Training Panel</h3>
+                <p className="muted">Start a training run and persist the requested config.</p>
+              </div>
+            </div>
+            <div className="card-body">
+              <TrainingPanel />
+            </div>
+          </section>
         </div>
       ) : null}
 
@@ -176,4 +202,3 @@ export default function Laboratory() {
     </div>
   );
 }
-

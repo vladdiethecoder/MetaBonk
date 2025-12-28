@@ -23,8 +23,14 @@ export default function Codex() {
             Open Neural Atlas
           </Link>
         </section>
+        <section className="card">
+          <h3>Singularity</h3>
+          <p className="muted">Semantic control + anticipatory telemetry + holographic viz.</p>
+          <Link to="/codex/singularity" className="btn btn-ghost">
+            Open Singularity
+          </Link>
+        </section>
       </div>
     </div>
   );
 }
-

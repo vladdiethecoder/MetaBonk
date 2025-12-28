@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "tauri": "tauri",
     "test:ui": "playwright test"
   },
   "dependencies": {
@@ -14,6 +15,7 @@
     "@react-three/postprocessing": "^2.16.1",
     "@tanstack/react-query": "^5.62.0",
     "@tauri-apps/api": "^2.9.1",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
     "cytoscape": "^3.33.1",
     "leva": "^0.9.35",
     "maath": "^0.10.7",

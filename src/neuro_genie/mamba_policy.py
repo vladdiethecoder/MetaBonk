@@ -239,7 +239,8 @@ if TORCH_AVAILABLE:
             outputs = []
             for l in range(L):
                 # State update: h = dA * h + dB * x
-                state = dA[:, l] * state + dB[:, l] * x[:, l:l+1]
+                # x[:, l] is [B, D]; expand across the state dimension N.
+                state = dA[:, l] * state + dB[:, l] * x[:, l].unsqueeze(-1)
                 
                 # Output: y = C * h
                 y = torch.einsum('bdn,bn->bd', state, C[:, l])

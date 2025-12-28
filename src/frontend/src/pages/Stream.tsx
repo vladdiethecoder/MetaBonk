@@ -23,6 +23,7 @@ import iconSheetUrl from "../assets/icon_sheet.png";
 import { iconIndex, iconVariantClass, type IconKey, type IconVariant } from "../lib/icon_map";
 import { PROGRESS_GOALS, type GoalTier, type ProgressGoal } from "../lib/megabonk_progress";
 import { UI_TOKENS } from "../lib/ui_tokens";
+import { getFeatureFlags } from "../lib/feature_flags";
 import { timeAgo } from "../lib/format";
 import MseMp4Video from "../components/MseMp4Video";
 import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
@@ -620,11 +621,18 @@ function StreamTile({
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
   const fallbackGo2rtcBase = useMemo(() => {
     if (typeof window === "undefined") return "";
+    const g = window as any;
+    const explicit = typeof g.__MB_GO2RTC_URL__ === "string" ? String(g.__MB_GO2RTC_URL__) : "";
+    if (explicit) return explicit.replace(/\/+$/, "");
+    const envUrl = (import.meta as any)?.env?.VITE_GO2RTC_URL;
+    if (envUrl) return String(envUrl).replace(/\/+$/, "");
+    const qs = new URLSearchParams(window.location.search);
+    if (qs.get("go2rtc") !== "1") return "";
     const host = window.location.hostname || "localhost";
     const protocol = window.location.protocol.startsWith("http") ? window.location.protocol : "http:";
     return `${protocol}//${host}:1984`;
   }, []);
-  const fallbackGo2rtcName = "metabonk";
+  const fallbackGo2rtcName = w?.instance_id || "omega-0";
   const effectiveGo2rtcBase = go2rtcBase || (focused ? fallbackGo2rtcBase : "");
   const effectiveGo2rtcName = go2rtcName || (focused ? fallbackGo2rtcName : "");
   const useGo2rtc = Boolean(effectiveGo2rtcBase && effectiveGo2rtcName);
@@ -764,6 +772,7 @@ function StreamTile({
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debugHud={DEBUG_HUD}
             embedUrl={go2rtcEmbedUrl || undefined}
+            embedOnError={DEBUG_ON}
             fallbackJpegUrl={frameUrl || undefined}
           />
         ) : streamUrl && isVideo ? (
@@ -1227,14 +1236,18 @@ function ReplayPiP({
 }
 
 export default function Stream() {
+  const loc = useLocation();
+  const qs = useMemo(() => new URLSearchParams(loc.search), [loc.search]);
+  const flags = useMemo(() => getFeatureFlags(qs), [qs]);
+
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 2000 });
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 750 });
   const featuredQ = useQuery({ queryKey: ["featured"], queryFn: fetchFeatured, refetchInterval: 750 });
   const fuseQ = useQuery({ queryKey: ["fuse"], queryFn: () => fetchTimelineFuse(2000), refetchInterval: 2500 });
   const hofQ = useQuery({ queryKey: ["hofTop"], queryFn: () => fetchHofTop(5, "score"), refetchInterval: 3500 });
   const timelineQ = useQuery({ queryKey: ["timeline"], queryFn: () => fetchTimeline(120), refetchInterval: 3500 });
-  const bettingQ = useQuery({ queryKey: ["betting"], queryFn: fetchBettingState, refetchInterval: 2500 });
-  const pollQ = useQuery({ queryKey: ["poll"], queryFn: fetchPollState, refetchInterval: 2500 });
+  const bettingQ = useQuery({ queryKey: ["betting"], queryFn: fetchBettingState, refetchInterval: 2500, enabled: flags.betting });
+  const pollQ = useQuery({ queryKey: ["poll"], queryFn: fetchPollState, refetchInterval: 2500, enabled: flags.poll });
   const attractQ = useQuery({ queryKey: ["attractHighlights"], queryFn: fetchAttractHighlights, refetchInterval: 4000 });
   const histQ = useQuery({ queryKey: ["historicLeaderboard"], queryFn: () => fetchHistoricLeaderboard(200, "best_score"), refetchInterval: 5000 });
   const events = useEventStream(250);
@@ -1246,14 +1259,16 @@ export default function Stream() {
   const [railAuto, setRailAuto] = useState(true);
   const [replayQueue, setReplayQueue] = useState<Array<{ clipUrl: string; ts: number; label: string }>>([]);
   const lastReplayKeyRef = useRef<string>("");
+  useEffect(() => {
+    if (!flags.betting && railTab === "bucks") setRailTab("moments");
+    if (!flags.poll && railTab === "poll") setRailTab("moments");
+  }, [flags.betting, flags.poll, railTab]);
 
   const [directorOn, setDirectorOn] = useState(true);
   const [directorId, setDirectorId] = useState<string | null>(null);
   const [directorUntil, setDirectorUntil] = useState(0);
   const directorLastSwitchRef = useRef(0);
-  const loc = useLocation();
   const [layoutMode, setLayoutMode] = useState<"broadcast" | "dense">("broadcast");
-  const qs = useMemo(() => new URLSearchParams(loc.search), [loc.search]);
   const debugParamOn = useMemo(() => qs.get("debug") === "1", [qs]);
   const fxOn = useMemo(() => qs.get("fx") === "1", [qs]);
   const [publicMode, setPublicMode] = useState(false);
@@ -1836,8 +1851,8 @@ export default function Stream() {
     return b;
   };
 
-  const betting = bettingQ.data as any;
-  const poll = pollQ.data as any;
+  const betting = flags.betting ? (bettingQ.data as any) : null;
+  const poll = flags.poll ? (pollQ.data as any) : null;
   const timeline = timelineQ.data as TimelineState | undefined;
 
   const focusTitle = focus?.display_name ?? focus?.instance_id ?? "—";
@@ -2438,24 +2453,28 @@ export default function Stream() {
                           >
                             <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" /> Community
                           </button>
-                          <button
-                            className={`stream-tabbtn ${railTab === "bucks" ? "active" : ""}`}
-                            onClick={() => {
-                              setRailAuto(false);
-                              setRailTab("bucks");
-                            }}
-                          >
-                            <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" /> Bonk Bucks
-                          </button>
-                          <button
-                            className={`stream-tabbtn ${railTab === "poll" ? "active" : ""}`}
-                            onClick={() => {
-                              setRailAuto(false);
-                              setRailTab("poll");
-                            }}
-                          >
-                            <SpriteIcon idx={sheetIcon("tome_random")} size={16} className="tab-ico" /> Vote
-                          </button>
+                          {flags.betting ? (
+                            <button
+                              className={`stream-tabbtn ${railTab === "bucks" ? "active" : ""}`}
+                              onClick={() => {
+                                setRailAuto(false);
+                                setRailTab("bucks");
+                              }}
+                            >
+                              <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" /> Bonk Bucks
+                            </button>
+                          ) : null}
+                          {flags.poll ? (
+                            <button
+                              className={`stream-tabbtn ${railTab === "poll" ? "active" : ""}`}
+                              onClick={() => {
+                                setRailAuto(false);
+                                setRailTab("poll");
+                              }}
+                            >
+                              <SpriteIcon idx={sheetIcon("tome_random")} size={16} className="tab-ico" /> Vote
+                            </button>
+                          ) : null}
                           <button
                             className={`stream-tabbtn ${railTab === "progress" ? "active" : ""}`}
                             onClick={() => {
@@ -2493,12 +2512,16 @@ export default function Stream() {
                           <span className={`stream-tablabel ${railTab === "community" ? "active" : ""}`}>
                             <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" title="Community" />
                           </span>
-                          <span className={`stream-tablabel ${railTab === "bucks" ? "active" : ""}`}>
-                            <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" title="Bonk Bucks" />
-                          </span>
-                          <span className={`stream-tablabel ${railTab === "poll" ? "active" : ""}`}>
-                            <SpriteIcon idx={sheetIcon("tome_random")} size={16} className="tab-ico" title="Vote" />
-                          </span>
+                          {flags.betting ? (
+                            <span className={`stream-tablabel ${railTab === "bucks" ? "active" : ""}`}>
+                              <SpriteIcon idx={sheetIcon("bonk_bucks")} size={16} className="tab-ico" title="Bonk Bucks" />
+                            </span>
+                          ) : null}
+                          {flags.poll ? (
+                            <span className={`stream-tablabel ${railTab === "poll" ? "active" : ""}`}>
+                              <SpriteIcon idx={sheetIcon("tome_random")} size={16} className="tab-ico" title="Vote" />
+                            </span>
+                          ) : null}
                           <span className={`stream-tablabel ${railTab === "progress" ? "active" : ""}`}>
                             <SpriteIcon idx={sheetIcon("tome_mastery")} size={16} className="tab-ico" title="Progress" />
                           </span>

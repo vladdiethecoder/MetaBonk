@@ -42,6 +42,7 @@ export type Heartbeat = {
   stream_error?: string | null;
   streamer_last_error?: string | null;
   stream_backend?: string | null;
+  nvenc_sessions_used?: number | null;
   stream_active_clients?: number | null;
   stream_max_clients?: number | null;
   stream_fps?: number | null;
@@ -117,6 +118,27 @@ export type RunCompareResponse = {
   runs: Run[];
   metrics: RunMetricSeries[];
   artifacts?: Record<string, string[]>;
+};
+
+export type ClipRecord = {
+  clip_url: string;
+  run_id?: string | null;
+  worker_id?: string | null;
+  timestamp: number;
+  tag?: string | null;
+  agent_name?: string | null;
+  seed?: string | null;
+  policy_name?: string | null;
+  policy_version?: number | null;
+  episode_idx?: number | null;
+  match_duration_sec?: number | null;
+  final_score?: number | null;
+};
+
+export type ClipsResponse = {
+  items: ClipRecord[];
+  next_before?: number | null;
+  timestamp: number;
 };
 
 export type InstanceView = {
@@ -707,6 +729,29 @@ export async function fetchBuildLabExamples(items: string[], limit = 5, verified
   qs.set("limit", String(limit));
   if (verifiedOnly) qs.set("verified_only", "1");
   return fetchJson<BuildLabExamplesResponse>(`${ORCH}/buildlab/examples?${qs.toString()}`);
+}
+
+export async function fetchClips(params: {
+  limit?: number;
+  before?: number | null;
+  tag?: string;
+  worker_id?: string;
+  run_id?: string;
+  seed?: string;
+  policy_name?: string;
+  policy_version?: number | null;
+} = {}): Promise<ClipsResponse> {
+  const qs = new URLSearchParams();
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  if (params.before != null) qs.set("before", String(params.before));
+  if (params.tag) qs.set("tag", params.tag);
+  if (params.worker_id) qs.set("worker_id", params.worker_id);
+  if (params.run_id) qs.set("run_id", params.run_id);
+  if (params.seed) qs.set("seed", params.seed);
+  if (params.policy_name) qs.set("policy_name", params.policy_name);
+  if (params.policy_version != null) qs.set("policy_version", String(params.policy_version));
+  const suffix = qs.toString();
+  return fetchJson<ClipsResponse>(`${ORCH}/clips${suffix ? `?${suffix}` : ""}`);
 }
 
 export async function fetchEvents(limit = 200): Promise<Event[]> {
