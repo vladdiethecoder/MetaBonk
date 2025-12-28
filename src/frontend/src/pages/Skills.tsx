@@ -599,7 +599,7 @@ function PrototypeGallery({ protos }: { protos: SkillPrototypesResponse | null }
 
 export default function Skills() {
   const loc = useLocation();
-  const isActive = loc.pathname === "/skills";
+  const isActive = loc.pathname === "/skills" || loc.pathname === "/codex/skills";
   useActivationResizeKick(isActive);
   const qc = useQueryClient();
   const summaryQ = useQuery({ queryKey: ["skills", "summary"], queryFn: fetchSkillsSummary, refetchInterval: 3000 });

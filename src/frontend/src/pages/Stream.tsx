@@ -1255,12 +1255,35 @@ export default function Stream() {
   const qs = useMemo(() => new URLSearchParams(loc.search), [loc.search]);
   const debugParamOn = useMemo(() => qs.get("debug") === "1", [qs]);
   const fxOn = useMemo(() => qs.get("fx") === "1", [qs]);
+  const [publicMode, setPublicMode] = useState(false);
   const safeOn = useMemo(() => {
     const safe = qs.get("safe") === "1";
     if (!safe) return false;
     return !import.meta.env.PROD || debugParamOn;
   }, [qs, debugParamOn]);
   const [lowVision, setLowVision] = useState(false);
+  useEffect(() => {
+    const pubParam = qs.get("public");
+    if (pubParam === "1") {
+      try {
+        window.localStorage.setItem("mb:streamPublic", "1");
+      } catch {}
+      setPublicMode(true);
+      return;
+    }
+    if (pubParam === "0") {
+      try {
+        window.localStorage.setItem("mb:streamPublic", "0");
+      } catch {}
+      setPublicMode(false);
+      return;
+    }
+    try {
+      setPublicMode(window.localStorage.getItem("mb:streamPublic") === "1");
+    } catch {
+      setPublicMode(false);
+    }
+  }, [qs]);
   useEffect(() => {
     const visionParam = qs.get("vision");
     if (visionParam === "1") {
@@ -1283,6 +1306,11 @@ export default function Stream() {
       setLowVision(false);
     }
   }, [qs]);
+  useEffect(() => {
+    if (!publicMode) return;
+    setLayoutMode("broadcast");
+    setRailAuto(true);
+  }, [publicMode]);
   const setQueryParams = useCallback((patch: Record<string, string | null>) => {
     const next = new URLSearchParams(window.location.search);
     for (const [k, v] of Object.entries(patch)) {
@@ -1313,6 +1341,7 @@ export default function Stream() {
   const scopeRef = useRef<HTMLDivElement | null>(null);
   const [uiScale, setUiScale] = useState(1);
   const [uiTier, setUiTier] = useState("720");
+  const activeRailTab: RailTab = publicMode ? "moments" : railTab;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -2011,7 +2040,7 @@ export default function Stream() {
               <div className="moment-sub muted">{momentCard.subtitle ?? ""}</div>
             </div>
           ) : null}
-          <div className={`stream-root layout-${layoutMode} ${lowVision ? "vision-on" : ""}`}>
+          <div className={`stream-root layout-${layoutMode} ${lowVision ? "vision-on" : ""} ${publicMode ? "public-mode" : ""}`}>
             <div className="stream-layout">
                 <div className="stream-top">
                 <div>
@@ -2029,7 +2058,7 @@ export default function Stream() {
                     </div>
                   ) : null}
                 </div>
-                <div className="stream-kpis">
+                  <div className="stream-kpis">
                   <div className="stream-kpi">
                     <div className="muted">FOCUS</div>
                     <div className="stream-kpi-value">{focusTitle}</div>
@@ -2056,6 +2085,22 @@ export default function Stream() {
                     </div>
                     <div className="muted" style={{ marginTop: 2 }}>
                       {layoutMode === "broadcast" ? "720p safe" : "dev compact"}
+                    </div>
+                  </div>
+                  <div className="stream-kpi stream-kpi-debug" style={{ minWidth: 160 }}>
+                    <div className="row-between" style={{ alignItems: "baseline" }}>
+                      <div className="muted">PUBLIC MODE</div>
+                      <button
+                        type="button"
+                        className={`status-pill ${publicMode ? "on" : "off"}`}
+                        onClick={() => setQueryParams({ public: publicMode ? null : "1" })}
+                        title="toggle viewer-safe layout"
+                      >
+                        {publicMode ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    <div className="muted" style={{ marginTop: 2 }}>
+                      {publicMode ? "viewer-safe overlay" : "operator view"}
                     </div>
                   </div>
                 </div>
@@ -2370,8 +2415,9 @@ export default function Stream() {
                     </div>
 
                   <div className="stream-tabs">
-                    <div className="stream-tabbar">
-                      {debugParamOn ? (
+                    {!publicMode ? (
+                      <div className="stream-tabbar">
+                        {debugParamOn ? (
                         <>
                           <button
                             className={`stream-tabbtn ${railTab === "moments" ? "active" : ""}`}
@@ -2438,7 +2484,7 @@ export default function Stream() {
                             <SpriteIcon idx={sheetIcon("settings")} size={16} className="tab-ico" /> Controls
                           </button>
                         </>
-                      ) : (
+                        ) : (
                         <>
                           <span className={`stream-tablabel ${railTab === "moments" ? "active" : ""}`}>
                             <SpriteIcon idx={sheetIcon("moment")} size={16} className="tab-ico" title="Moments" />
@@ -2459,11 +2505,12 @@ export default function Stream() {
                             <SpriteIcon idx={sheetIcon("planning")} size={16} className="tab-ico" title="Mind" />
                           </span>
                         </>
-                      )}
-                    </div>
+                        )}
+                      </div>
+                    ) : null}
 
                       <div className="stream-tabpanel">
-                        {railTab === "moments" ? (
+                        {activeRailTab === "moments" ? (
                           <div className="stream-card">
                             <div className="stream-card-title">Moments</div>
                             <div className="stream-events" style={{ marginTop: 8 }}>
@@ -2485,7 +2532,7 @@ export default function Stream() {
                           </div>
                         ) : null}
 
-                        {railTab === "community" ? (
+                        {activeRailTab === "community" ? (
                           <div className="stream-card">
                             <div className="stream-card-title">Community</div>
                             <div className="muted">Pins + bounties (chat + Bonk Bucks).</div>
@@ -2508,7 +2555,7 @@ export default function Stream() {
                           </div>
                         ) : null}
 
-                        {railTab === "bucks" ? (
+                        {activeRailTab === "bucks" ? (
                           <div className="stream-card">
                             <div className="stream-card-title">Bonk Bucks</div>
                             {!betting ? (
@@ -2532,7 +2579,7 @@ export default function Stream() {
                           </div>
                         ) : null}
 
-                        {railTab === "poll" ? (
+                        {activeRailTab === "poll" ? (
                           <div className="stream-card">
                             <div className="stream-card-title">Blessing vs Curse</div>
                             {!poll ? (
@@ -2567,7 +2614,7 @@ export default function Stream() {
                           </div>
                         ) : null}
 
-                        {railTab === "progress" ? (
+                        {activeRailTab === "progress" ? (
                           debugParamOn ? (
                             <ProgressTrackerPanel />
                           ) : (
@@ -2577,12 +2624,12 @@ export default function Stream() {
                             </div>
                           )
                         ) : null}
-                        {railTab === "mind" ? (
+                        {activeRailTab === "mind" ? (
                           <div className="stream-reasoning-embed">
                             <Reasoning embedded defaultInstanceId={focus?.instance_id ? String(focus.instance_id) : null} />
                           </div>
                         ) : null}
-                        {railTab === "controls" && debugParamOn ? (
+                        {activeRailTab === "controls" && debugParamOn && !publicMode ? (
                           <div className="stream-card">
                             <div className="stream-card-title">Controls</div>
                             <div className="row" style={{ gap: 10, flexWrap: "wrap", marginTop: 8 }}>

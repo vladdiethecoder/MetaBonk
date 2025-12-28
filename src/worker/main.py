@@ -264,6 +264,25 @@ class WorkerService:
                 ensure_overlay_file(overlay_path)
         except Exception:
             pass
+        try:
+            wm_overlay = str(
+                os.environ.get("METABONK_WORLD_OVERLAY_FILE")
+                or os.environ.get("METABONK_WM_OVERLAY_FILE")
+                or ""
+            ).strip()
+            if wm_overlay:
+                from src.worker.stream_overlay import start_world_overlay_watcher  # type: ignore
+
+                poll_s = float(os.environ.get("METABONK_WORLD_OVERLAY_POLL_S", "0.5"))
+                max_kb = int(os.environ.get("METABONK_WORLD_OVERLAY_MAX_KB", "2048"))
+                start_world_overlay_watcher(
+                    path=wm_overlay,
+                    instance_id=self.instance_id,
+                    poll_s=poll_s,
+                    max_kb=max_kb,
+                )
+        except Exception:
+            pass
         self._frame_source = str(os.environ.get("METABONK_FRAME_SOURCE", "pipewire") or "").strip().lower()
         if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
             if SyntheticEyeStream is None:

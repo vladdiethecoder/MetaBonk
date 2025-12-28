@@ -266,6 +266,20 @@ body::before{
 .lobby-worker{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 12px; border: 1px solid rgba(255,255,255,.08); background: rgba(10,14,18,.5); }
 .lobby-worker strong{ display: block; font-size: 13px; }
 .lobby-worker .muted{ display: block; font-size: 11px; }
+.lobby-worker-btn{
+  appearance: none;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: var(--ink);
+}
+.lobby-worker-btn:hover{ border-color: rgba(0,229,255,.35); background: rgba(0,229,255,.06); }
+.lobby-worker-btn.active{
+  border-color: rgba(0,229,255,.55);
+  background: rgba(0,229,255,.10);
+  box-shadow: 0 0 0 1px rgba(0,229,255,.25) inset;
+}
 
 .neural-shell{
   display: grid;
@@ -282,6 +296,17 @@ body::before{
   min-height: 520px;
 }
 .neural-video{ width: 100%; height: 100%; min-height: 520px; display: block; }
+.neural-overlay{
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  mix-blend-mode: screen;
+  opacity: 0.65;
+  pointer-events: none;
+  z-index: 2;
+}
 .neural-badge{
   position: absolute;
   top: 16px;
@@ -1233,6 +1258,26 @@ body::before{
 .proto img { width: 100%; height: auto; display: block; border-radius: 10px; }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .row-inline { display: flex; align-items: center; gap: 10px; }
+.field{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: rgba(190,220,235,0.7);
+}
+.field input,
+.field select{
+  background: rgba(11,15,18,.92);
+  color: var(--ink);
+  border: var(--stroke) solid var(--line);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 12px;
+  outline: none;
+  box-shadow: var(--shadow2);
+}
 .toolbar{
   display:flex;
   align-items:center;

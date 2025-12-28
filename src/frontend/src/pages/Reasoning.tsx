@@ -6,6 +6,7 @@ import QueryStateGate from "../components/QueryStateGate";
 import useActivationResizeKick from "../hooks/useActivationResizeKick";
 import { fetchInstances, fetchWorkerStatus, type InstanceView } from "../api";
 import { fmtPct01 } from "../lib/format";
+import { isTauri } from "../lib/tauri";
 
 type ThoughtPacket = {
   __meta_event?: string;
@@ -78,7 +79,7 @@ export default function Reasoning({ embedded = false, defaultInstanceId = null }
   const plan = (mb2?.debug?.plan ?? []) as any[];
 
   const [thoughts, setThoughts] = useState<ThoughtPacket[]>([]);
-  const tauriAvailable = typeof window !== "undefined" && Boolean((window as any).__TAURI__);
+  const tauriAvailable = isTauri();
 
   useEffect(() => {
     if (!tauriAvailable) return;

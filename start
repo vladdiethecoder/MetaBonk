@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "--tauri" ]]; then
+  shift
+  if [[ "${METABONK_SKIP_STOP:-0}" != "1" ]]; then
+    python scripts/stop.py --all
+  fi
+
+  : "${METABONK_STREAM_BACKEND:=auto}"
+
+  DEFAULT_GAME_DIR="/run/media/vdubrov/Active Storage/SteamLibrary/steamapps/common/Megabonk"
+  if [[ -z "${MEGABONK_GAME_DIR:-}" && -d "$DEFAULT_GAME_DIR" ]]; then
+    export MEGABONK_GAME_DIR="$DEFAULT_GAME_DIR"
+  fi
+
+  cd src/frontend
+  if [[ ! -d node_modules ]]; then
+    npm install
+  fi
+  exec npx tauri dev "$@"
+fi
+
 if [[ "${METABONK_SKIP_STOP:-0}" != "1" ]]; then
   python scripts/stop.py --all
 fi

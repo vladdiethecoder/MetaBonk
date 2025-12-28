@@ -49,6 +49,14 @@ const normalize = (value: LaunchConfig): LaunchConfig => {
 
 export default function useLaunchConfig() {
   const [cfg, setCfg] = useLocalStorageState<LaunchConfig>(STORAGE_KEY, defaults);
-  return [normalize(cfg), (next: LaunchConfig | ((prev: LaunchConfig) => LaunchConfig)) => setCfg((prev) => normalize(typeof next === "function" ? (next as any)(prev) : next))] as const;
-}
 
+  const setNormalized = (next: LaunchConfig | ((prev: LaunchConfig) => LaunchConfig)) => {
+    setCfg((prev) => {
+      const base = normalize(prev);
+      const resolved = typeof next === "function" ? (next as (p: LaunchConfig) => LaunchConfig)(base) : next;
+      return normalize(resolved);
+    });
+  };
+
+  return [normalize(cfg), setNormalized] as const;
+}

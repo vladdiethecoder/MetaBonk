@@ -4,6 +4,19 @@ import { fetchStatus, fetchWorkers } from "../api";
 import { fmtFixed } from "../lib/format";
 import Go2rtcWebRTC from "../components/Go2rtcWebRTC";
 import Reasoning from "./Reasoning";
+import useTauriEvent from "../hooks/useTauriEvent";
+
+type OverlayEvent = {
+  __meta_event?: string;
+  kind?: string;
+  instance_id?: string;
+  ts?: number;
+  payload?: any;
+  overlay_png?: string;
+  image_b64?: string;
+  png_base64?: string;
+  overlay_url?: string;
+};
 
 const fallbackGo2rtcBase = () => {
   if (typeof window === "undefined") return "";
@@ -16,7 +29,11 @@ export default function NeuralInterface() {
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 2000 });
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 1000 });
   const workers = Object.values(workersQ.data ?? {});
-  const focused = workers.find((w) => w.status === "running") ?? workers[0] ?? null;
+  const [selectedId, setSelectedId] = useState<string>("");
+
+  const runningWorker = workers.find((w) => w.status === "running") ?? null;
+  const selectedWorker = selectedId ? workers.find((w) => String(w.instance_id ?? "") === selectedId) ?? null : null;
+  const focused = selectedWorker ?? runningWorker ?? workers[0] ?? null;
   const instanceId = focused?.instance_id ?? null;
   const go2rtcBase = String((focused as any)?.go2rtc_base_url ?? "").trim() || fallbackGo2rtcBase();
   const go2rtcName = String((focused as any)?.go2rtc_stream_name ?? "").trim() || "metabonk";
@@ -24,12 +41,42 @@ export default function NeuralInterface() {
 
   const [showThoughts, setShowThoughts] = useState(true);
   const [showHUD, setShowHUD] = useState(true);
+  const [overlayMode, setOverlayMode] = useState<"attention" | "trajectory" | "prediction" | "none">("none");
+  const [overlayEvent, setOverlayEvent] = useState<OverlayEvent | null>(null);
+
+  useTauriEvent<OverlayEvent>("omega-meta", (payload) => {
+    const kind = String(payload?.__meta_event ?? payload?.kind ?? "");
+    if (!kind) return;
+    if (!kind.includes("world") && !kind.includes("overlay") && !kind.includes("trajectory")) return;
+    if (payload?.instance_id && instanceId && String(payload.instance_id) !== String(instanceId)) return;
+    setOverlayEvent(payload);
+  });
 
   const liveLabel = useMemo(() => {
     if (statusQ.isError) return "OFFLINE";
     if (!focused) return "IDLE";
     return "LIVE";
   }, [statusQ.isError, focused]);
+
+  const overlayImage = useMemo(() => {
+    const raw = overlayEvent?.overlay_png || overlayEvent?.png_base64 || overlayEvent?.image_b64 || "";
+    if (raw) {
+      return raw.startsWith("data:") ? raw : `data:image/png;base64,${raw}`;
+    }
+    const url = overlayEvent?.overlay_url;
+    return url || "";
+  }, [overlayEvent]);
+
+  const agentRows = useMemo(() => {
+    const list = workers.slice();
+    list.sort((a, b) => {
+      const ar = a.status === "running" ? 1 : 0;
+      const br = b.status === "running" ? 1 : 0;
+      if (ar !== br) return br - ar;
+      return String(a.display_name ?? a.instance_id ?? "").localeCompare(String(b.display_name ?? b.instance_id ?? ""));
+    });
+    return list.slice(0, 12);
+  }, [workers]);
 
   return (
     <div className="page neural-page">
@@ -46,6 +93,9 @@ export default function NeuralInterface() {
             embedUrl={embedUrl || undefined}
             className="neural-video"
           />
+          {overlayMode !== "none" && overlayImage ? (
+            <img className="neural-overlay" src={overlayImage} alt="world-model overlay" />
+          ) : null}
           {showHUD ? (
             <div className="neural-hud">
               <div>
@@ -69,6 +119,42 @@ export default function NeuralInterface() {
         </div>
 
         <aside className="neural-side">
+          <section className="card">
+            <div className="card-header">
+              <div>
+                <h3>Agents</h3>
+                <p className="muted">Select a live instance to focus.</p>
+              </div>
+            </div>
+            <div className="card-body">
+              <div className="lobby-worker-list" style={{ marginTop: 0 }}>
+                {agentRows.length === 0 ? (
+                  <div className="muted">No workers detected yet.</div>
+                ) : (
+                  agentRows.map((w) => {
+                    const id = String(w.instance_id ?? "");
+                    const name = String(w.display_name ?? id).trim() || "Worker";
+                    const isSelected = Boolean(id) && (id === selectedId || (!selectedId && id === instanceId));
+                    return (
+                      <button
+                        key={id || name}
+                        type="button"
+                        className={`lobby-worker lobby-worker-btn ${isSelected ? "active" : ""}`.trim()}
+                        onClick={() => setSelectedId(id)}
+                      >
+                        <div>
+                          <strong>{name}</strong>
+                          <span className="muted">{w.policy_name ?? "policy"}</span>
+                        </div>
+                        <div className={`badge ${w.status === "running" ? "" : "warn"}`}>{w.status ?? "idle"}</div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </section>
+
           <section className="card">
             <div className="card-header">
               <div>
@@ -102,13 +188,59 @@ export default function NeuralInterface() {
                 HUD metrics
               </label>
               <label>
-                <input type="checkbox" disabled />
-                Attention map (coming soon)
+                <input
+                  type="checkbox"
+                  checked={overlayMode === "attention"}
+                  onChange={(e) => setOverlayMode(e.target.checked ? "attention" : "none")}
+                  disabled={!overlayImage}
+                />
+                Attention map {overlayImage ? "" : "(waiting)"}
               </label>
               <label>
-                <input type="checkbox" disabled />
-                Predicted trajectory (coming soon)
+                <input
+                  type="checkbox"
+                  checked={overlayMode === "trajectory"}
+                  onChange={(e) => setOverlayMode(e.target.checked ? "trajectory" : "none")}
+                  disabled={!overlayImage}
+                />
+                Predicted trajectory {overlayImage ? "" : "(waiting)"}
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={overlayMode === "prediction"}
+                  onChange={(e) => setOverlayMode(e.target.checked ? "prediction" : "none")}
+                  disabled={!overlayImage}
+                />
+                Imagination preview {overlayImage ? "" : "(waiting)"}
+              </label>
+            </div>
+          </section>
+
+          <section className="card">
+            <div className="card-header">
+              <div>
+                <h3>World Model Feed</h3>
+                <p className="muted">Latest overlay payload from Omega.</p>
+              </div>
+            </div>
+            <div className="card-body">
+              {overlayEvent ? (
+                <div className="mono" style={{ whiteSpace: "pre-wrap" }}>
+                  {JSON.stringify(
+                    {
+                      event: overlayEvent.__meta_event ?? overlayEvent.kind,
+                      ts: overlayEvent.ts,
+                      instance_id: overlayEvent.instance_id,
+                      payload: overlayEvent.payload ?? null,
+                    },
+                    null,
+                    2,
+                  )}
+                </div>
+              ) : (
+                <div className="muted">No world-model overlay packets yet.</div>
+              )}
             </div>
           </section>
 

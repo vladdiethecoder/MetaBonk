@@ -2,9 +2,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter, Manager, State};
+use sysinfo::System;
 
 struct OmegaState {
   child: Mutex<Option<Child>>,
@@ -12,6 +13,10 @@ struct OmegaState {
 
 struct DiscoveryState {
   child: Mutex<Option<Child>>,
+}
+
+fn discovery_dir(repo_root: &Path, env_id: &str) -> PathBuf {
+  repo_root.join("cache").join("discovery").join(env_id)
 }
 
 fn find_repo_root() -> Option<PathBuf> {
@@ -108,6 +113,89 @@ fn parse_json_from_output(raw: &str) -> Result<serde_json::Value, String> {
     return Err("invalid json bounds".to_string());
   }
   serde_json::from_str::<serde_json::Value>(&s[start..=end]).map_err(|e| format!("failed to parse json: {e}"))
+}
+
+fn read_json_file(path: &Path) -> Result<serde_json::Value, String> {
+  let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
+  serde_json::from_str::<serde_json::Value>(&content).map_err(|e| format!("failed to parse json {path:?}: {e}"))
+}
+
+fn parse_env_exports(path: &Path) -> Result<serde_json::Value, String> {
+  let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
+  let mut map = serde_json::Map::new();
+  for line in content.lines() {
+    let line = line.trim();
+    if !line.starts_with("export ") {
+      continue;
+    }
+    let rest = line.trim_start_matches("export ").trim();
+    if let Some((k, v)) = rest.split_once('=') {
+      let key = k.trim().to_string();
+      let mut val = v.trim().to_string();
+      if (val.starts_with('"') && val.ends_with('"')) || (val.starts_with('\'') && val.ends_with('\'')) {
+        val = val[1..val.len() - 1].to_string();
+      }
+      map.insert(key, serde_json::Value::String(val));
+    }
+  }
+  Ok(serde_json::Value::Object(map))
+}
+
+fn read_gpu_stats() -> Option<serde_json::Value> {
+  let output = Command::new("nvidia-smi")
+    .arg("--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu")
+    .arg("--format=csv,noheader,nounits")
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let line = stdout.lines().next()?.trim();
+  if line.is_empty() {
+    return None;
+  }
+  let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+  let util = parts.get(0).and_then(|v| v.parse::<f32>().ok());
+  let mem_used = parts.get(1).and_then(|v| v.parse::<f32>().ok());
+  let mem_total = parts.get(2).and_then(|v| v.parse::<f32>().ok());
+  let temp = parts.get(3).and_then(|v| v.parse::<f32>().ok());
+  Some(serde_json::json!({
+    "util_pct": util,
+    "mem_used_mb": mem_used,
+    "mem_total_mb": mem_total,
+    "temp_c": temp,
+  }))
+}
+
+fn spawn_system_telemetry(app: AppHandle) {
+  std::thread::spawn(move || {
+    let mut sys = System::new();
+    loop {
+      sys.refresh_cpu();
+      sys.refresh_memory();
+      let cpu = sys.global_cpu_info().cpu_usage();
+      let mem_used_mb = sys.used_memory() as f32 / 1024.0;
+      let mem_total_mb = sys.total_memory() as f32 / 1024.0;
+      let payload = serde_json::json!({
+        "ts": SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .unwrap_or_default()
+          .as_secs_f64(),
+        "cpu": {
+          "usage_pct": cpu,
+          "cores": sys.cpus().len(),
+        },
+        "memory": {
+          "used_mb": mem_used_mb,
+          "total_mb": mem_total_mb,
+        },
+        "gpu": read_gpu_stats(),
+      });
+      let _ = app.emit("system-telemetry", payload);
+      std::thread::sleep(Duration::from_millis(1000));
+    }
+  });
 }
 
 fn stop_omega_inner(app: Option<&AppHandle>, state: &OmegaState) {
@@ -272,7 +360,7 @@ fn discovery_running(state: State<'_, DiscoveryState>) -> bool {
 fn discovery_status(env_id: String) -> Result<serde_json::Value, String> {
   let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
   let env_name = env_id.trim();
-  let cache_dir = repo_root.join("cache").join("discovery").join(env_name);
+  let cache_dir = discovery_dir(&repo_root, env_name);
   let phase0 = cache_dir.join("input_space.json").exists();
   let phase1 = cache_dir.join("effect_map.json").exists();
   let phase2 = cache_dir.join("action_clusters.json").exists();
@@ -299,6 +387,28 @@ fn discovery_status(env_id: String) -> Result<serde_json::Value, String> {
     "has_ppo_config": ppo_cfg,
   });
   Ok(out)
+}
+
+#[tauri::command]
+fn load_action_space(env_id: String) -> Result<serde_json::Value, String> {
+  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+  let env_name = env_id.trim();
+  let action_path = discovery_dir(&repo_root, env_name).join("learned_action_space.json");
+  if !action_path.exists() {
+    return Err("learned_action_space.json not found for env".to_string());
+  }
+  read_json_file(&action_path)
+}
+
+#[tauri::command]
+fn load_ppo_config(env_id: String) -> Result<serde_json::Value, String> {
+  let repo_root = find_repo_root().ok_or_else(|| "failed to locate repo root (missing scripts/)".to_string())?;
+  let env_name = env_id.trim();
+  let cfg_path = discovery_dir(&repo_root, env_name).join("ppo_config.sh");
+  if !cfg_path.exists() {
+    return Err("ppo_config.sh not found for env".to_string());
+  }
+  parse_env_exports(&cfg_path)
 }
 
 #[tauri::command]
@@ -442,6 +552,7 @@ pub fn run() {
             .build(),
         )?;
       }
+      spawn_system_telemetry(app.handle().clone());
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -450,6 +561,8 @@ pub fn run() {
       stop_omega,
       discovery_running,
       discovery_status,
+      load_action_space,
+      load_ppo_config,
       start_discovery,
       stop_discovery,
       run_synthetic_eye_bench

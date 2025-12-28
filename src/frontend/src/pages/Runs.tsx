@@ -63,7 +63,7 @@ function RunsCoreViz() {
 
 export default function Runs() {
   const loc = useLocation();
-  const isActive = loc.pathname === "/runs";
+  const isActive = loc.pathname === "/runs" || loc.pathname === "/lab/runs";
   useActivationResizeKick(isActive);
   const [kickKey, setKickKey] = useState(0);
   useEffect(() => {

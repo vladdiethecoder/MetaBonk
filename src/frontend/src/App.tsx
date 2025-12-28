@@ -10,24 +10,20 @@ import OnboardingModal from "./components/Onboarding/OnboardingModal";
 import WelcomeWizard from "./components/Onboarding/WelcomeWizard";
 import Lobby from "./pages/Lobby";
 import NeuralInterface from "./pages/NeuralInterface";
+import Laboratory from "./pages/Laboratory";
+import Codex from "./pages/Codex";
 import NeuroSynaptic from "./pages/NeuroSynaptic";
 import Runs from "./pages/Runs";
 import Instances from "./pages/Instances";
 import Skills from "./pages/Skills";
-import Reasoning from "./pages/Reasoning";
-import Spy from "./pages/Spy";
-import Stream from "./pages/Stream";
-import Supervisor from "./pages/Supervisor";
-import Analytics from "./pages/Analytics";
 import Discovery from "./pages/Discovery";
-import Settings from "./pages/Settings";
+import Stream from "./pages/Stream";
 import useLaunchConfig from "./hooks/useLaunchConfig";
 import useLocalStorageState from "./hooks/useLocalStorageState";
 import { tauriInvoke, type DiscoveryStatus } from "./lib/tauri_api";
 import { useTauriRuntime } from "./tauri/RuntimeProvider";
 
 const BuildLab = lazy(() => import("./pages/BuildLab"));
-const CCTV3D = lazy(() => import("./pages/CCTV3D"));
 
 export default function App() {
   const loc = useLocation();
@@ -135,30 +131,24 @@ export default function App() {
 
   const nav = useMemo(
     () => [
-      { to: "/", label: "Home" },
-      { to: "/agents", label: "Agents" },
-      { to: "/discovery", label: "Discovery" },
-      { to: "/analytics", label: "Analytics" },
-      { to: "/settings", label: "Settings" },
+      { to: "/", label: "Lobby" },
+      { to: "/neural", label: "Neural Interface" },
+      { to: "/lab", label: "Laboratory" },
+      { to: "/codex", label: "Codex" },
     ],
     [],
   );
 
   // Stream overlay wants a clean fullscreen surface (OBS browser source).
-  if (loc.pathname.startsWith("/stream") || loc.pathname.startsWith("/broadcast")) {
+  if (
+    loc.pathname.startsWith("/stream") ||
+    loc.pathname.startsWith("/broadcast") ||
+    loc.pathname.startsWith("/neural/broadcast")
+  ) {
     return (
       <ErrorBoundary label="Stream">
         <Stream />
       </ErrorBoundary>
-    );
-  }
-  if (loc.pathname.startsWith("/cctv")) {
-    return (
-      <Suspense fallback={<div className="card">Booting System...</div>}>
-        <ErrorBoundary label="CCTV">
-          <CCTV3D />
-        </ErrorBoundary>
-      </Suspense>
     );
   }
 
@@ -284,11 +274,11 @@ export default function App() {
                     <button className="btn btn-compact btn-ghost" disabled={launchBusy || !omegaRunning} onClick={stopOmega}>
                       stop
                     </button>
-                    <Link className="btn btn-compact btn-ghost" to="/stream">
-                      stream
+                    <Link className="btn btn-compact btn-ghost" to="/neural/broadcast">
+                      broadcast
                     </Link>
-                    <Link className="btn btn-compact btn-ghost" to="/settings">
-                      settings
+                    <Link className="btn btn-compact btn-ghost" to="/">
+                      lobby
                     </Link>
                   </div>
                   <div className="muted" style={{ marginTop: 8 }}>
@@ -322,25 +312,37 @@ export default function App() {
         <div className="page-scroll">
           <Suspense fallback={<div className="card">loading…</div>}>
             <Routes>
-              <Route path="/" element={<ErrorBoundary label="Home"><Lobby /></ErrorBoundary>} />
-              <Route path="/agents" element={<ErrorBoundary label="Agents"><NeuralInterface /></ErrorBoundary>} />
-              <Route path="/discovery" element={<ErrorBoundary label="Discovery"><Discovery /></ErrorBoundary>} />
-              <Route path="/analytics" element={<ErrorBoundary label="Analytics"><Analytics /></ErrorBoundary>} />
-              <Route path="/settings" element={<ErrorBoundary label="Settings"><Settings /></ErrorBoundary>} />
-              <Route path="/neural" element={<Navigate to="/agents" replace />} />
-              <Route path="/lab" element={<Navigate to="/analytics" replace />} />
-              <Route path="/knowledge" element={<Navigate to="/analytics" replace />} />
-              <Route path="/supervisor" element={<ErrorBoundary label="Supervisor"><Supervisor /></ErrorBoundary>} />
-              <Route path="/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />
-              <Route path="/instances" element={<ErrorBoundary label="Instances"><Instances /></ErrorBoundary>} />
-              <Route path="/reasoning" element={<ErrorBoundary label="Reasoning"><Reasoning /></ErrorBoundary>} />
-              <Route path="/build" element={<ErrorBoundary label="Build Lab"><BuildLab /></ErrorBoundary>} />
-              <Route path="/skills" element={<ErrorBoundary label="Skills"><Skills /></ErrorBoundary>} />
-              <Route path="/spy" element={<ErrorBoundary label="Spy"><Spy /></ErrorBoundary>} />
-              <Route path="/stream" element={<ErrorBoundary label="Stream"><Stream /></ErrorBoundary>} />
-              <Route path="/broadcast" element={<ErrorBoundary label="Broadcast"><Stream /></ErrorBoundary>} />
-              <Route path="/cctv" element={<ErrorBoundary label="CCTV"><CCTV3D /></ErrorBoundary>} />
-              <Route path="/brain" element={<ErrorBoundary label="NeuroSynaptic"><NeuroSynaptic /></ErrorBoundary>} />
+              <Route path="/" element={<ErrorBoundary label="Lobby"><Lobby /></ErrorBoundary>} />
+              <Route path="/neural" element={<ErrorBoundary label="Neural Interface"><NeuralInterface /></ErrorBoundary>} />
+              <Route path="/neural/broadcast" element={<ErrorBoundary label="Broadcast"><Stream /></ErrorBoundary>} />
+
+              <Route path="/lab" element={<ErrorBoundary label="Laboratory"><Laboratory /></ErrorBoundary>} />
+              <Route path="/lab/runs" element={<ErrorBoundary label="Runs"><Runs /></ErrorBoundary>} />
+              <Route path="/lab/instances" element={<ErrorBoundary label="Instances"><Instances /></ErrorBoundary>} />
+              <Route path="/lab/build" element={<ErrorBoundary label="Build Lab"><BuildLab /></ErrorBoundary>} />
+              <Route path="/lab/discovery" element={<ErrorBoundary label="Discovery"><Discovery /></ErrorBoundary>} />
+
+              <Route path="/codex" element={<ErrorBoundary label="Codex"><Codex /></ErrorBoundary>} />
+              <Route path="/codex/skills" element={<ErrorBoundary label="Skills"><Skills /></ErrorBoundary>} />
+              <Route path="/codex/brain" element={<ErrorBoundary label="NeuroSynaptic"><NeuroSynaptic /></ErrorBoundary>} />
+
+              <Route path="/agents" element={<Navigate to="/neural" replace />} />
+              <Route path="/spy" element={<Navigate to="/neural" replace />} />
+              <Route path="/stream" element={<Navigate to="/neural/broadcast" replace />} />
+              <Route path="/broadcast" element={<Navigate to="/neural/broadcast" replace />} />
+
+              <Route path="/analytics" element={<Navigate to="/lab" replace />} />
+              <Route path="/discovery" element={<Navigate to="/lab/discovery" replace />} />
+              <Route path="/runs" element={<Navigate to="/lab/runs" replace />} />
+              <Route path="/instances" element={<Navigate to="/lab/instances" replace />} />
+              <Route path="/build" element={<Navigate to="/lab/build" replace />} />
+              <Route path="/skills" element={<Navigate to="/codex/skills" replace />} />
+              <Route path="/brain" element={<Navigate to="/codex/brain" replace />} />
+              <Route path="/settings" element={<Navigate to="/" replace />} />
+              <Route path="/supervisor" element={<Navigate to="/" replace />} />
+              <Route path="/reasoning" element={<Navigate to="/neural" replace />} />
+              <Route path="/cctv" element={<Navigate to="/neural" replace />} />
+              <Route path="/knowledge" element={<Navigate to="/codex" replace />} />
             </Routes>
           </Suspense>
         </div>

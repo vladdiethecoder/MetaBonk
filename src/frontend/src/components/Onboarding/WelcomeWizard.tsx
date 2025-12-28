@@ -15,7 +15,7 @@ const steps: Step[] = [
   },
   {
     target: ".nav",
-    content: "Navigate between Home, Agents, Discovery, Analytics, and Settings.",
+    content: "Navigate between Lobby, Neural Interface, Laboratory, and Codex.",
     placement: "bottom",
   },
 ];

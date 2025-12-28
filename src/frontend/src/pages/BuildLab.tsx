@@ -401,7 +401,7 @@ function layoutRadialTree(root: TreeNode, w: number, h: number, ringGap: number)
 
 export default function BuildLab() {
   const loc = useLocation();
-  const isActive = loc.pathname === "/build";
+  const isActive = loc.pathname === "/build" || loc.pathname === "/lab/build";
   useActivationResizeKick(isActive);
   const resetNonce = useWebglResetNonce();
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 1500 });
@@ -1126,11 +1126,11 @@ export default function BuildLab() {
           <div className="stream-highlight-placeholder" style={{ minHeight: 80 }}>
             {noWorkers ? "No workers connected yet — start a worker to populate builds." : "No workers match filters yet — relax filters or switch policy."}
             <div className="row" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-              <Link className="btn" to="/instances">
+              <Link className="btn" to="/lab/instances">
                 Go to Instances
               </Link>
-              <Link className="btn btn-ghost" to="/spy">
-                Open Spy
+              <Link className="btn btn-ghost" to="/neural">
+                Open Neural Interface
               </Link>
             </div>
           </div>
@@ -1271,11 +1271,11 @@ export default function BuildLab() {
                           : "Waiting for inventory_items in worker heartbeats…"}
                 </div>
                 <div className="row" style={{ gap: 10, marginTop: 10, justifyContent: "center", flexWrap: "wrap" }}>
-                  <Link className="btn" to="/instances">
+                  <Link className="btn" to="/lab/instances">
                     Go to Instances
                   </Link>
-                  <Link className="btn btn-ghost" to="/spy">
-                    Open Spy
+                  <Link className="btn btn-ghost" to="/neural">
+                    Open Neural Interface
                   </Link>
                 </div>
               </div>

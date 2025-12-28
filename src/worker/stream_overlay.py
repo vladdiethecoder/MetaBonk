@@ -13,10 +13,15 @@ to consume the overlay (per-client process in `NVENCStreamer`).
 
 from __future__ import annotations
 
+import base64
 import os
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Optional
+
+from src.common.observability import emit_overlay
 
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1F\x7F]")
@@ -99,9 +104,62 @@ def write_thought_overlay(
     write_overlay_text(overlay_path, line)
 
 
+def start_world_overlay_watcher(
+    *,
+    path: str,
+    instance_id: Optional[str] = None,
+    poll_s: float = 0.5,
+    max_kb: int = 2048,
+) -> None:
+    """Watch a PNG overlay file and emit meta events when it changes."""
+    overlay_path = str(path or "").strip()
+    if not overlay_path:
+        return
+
+    def _loop() -> None:
+        last_mtime = 0.0
+        while True:
+            try:
+                stat = os.stat(overlay_path)
+            except Exception:
+                time.sleep(max(poll_s, 0.1))
+                continue
+            if stat.st_mtime <= last_mtime:
+                time.sleep(max(poll_s, 0.1))
+                continue
+            last_mtime = stat.st_mtime
+            if max_kb > 0 and stat.st_size > max_kb * 1024:
+                emit_overlay(
+                    kind="file",
+                    payload={"path": overlay_path, "bytes": int(stat.st_size), "reason": "overlay_too_large"},
+                    instance_id=instance_id,
+                )
+                time.sleep(max(poll_s, 0.1))
+                continue
+            try:
+                data = Path(overlay_path).read_bytes()
+            except Exception:
+                time.sleep(max(poll_s, 0.1))
+                continue
+            if not data:
+                time.sleep(max(poll_s, 0.1))
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            emit_overlay(
+                kind="file",
+                payload={"path": overlay_path, "bytes": int(len(data))},
+                png_base64=b64,
+                instance_id=instance_id,
+            )
+            time.sleep(max(poll_s, 0.1))
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 __all__ = [
     "ensure_overlay_file",
     "sanitize_overlay_text",
     "write_overlay_text",
     "write_thought_overlay",
+    "start_world_overlay_watcher",
 ]

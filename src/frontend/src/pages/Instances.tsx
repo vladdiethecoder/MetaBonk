@@ -114,7 +114,7 @@ function TelemetryChart({ points }: { points: Array<{ score?: number; reward?: n
 
 export default function Instances() {
   const loc = useLocation();
-  const isActive = loc.pathname === "/instances";
+  const isActive = loc.pathname === "/instances" || loc.pathname === "/lab/instances";
   useActivationResizeKick(isActive);
   const [kickKey, setKickKey] = useState(0);
   useEffect(() => {

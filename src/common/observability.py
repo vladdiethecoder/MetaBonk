@@ -124,3 +124,27 @@ def emit_thought(
     except Exception:
         # Never let overlays break workers.
         return
+
+
+def emit_overlay(
+    *,
+    kind: str,
+    payload: Optional[Dict[str, Any]] = None,
+    png_base64: Optional[str] = None,
+    overlay_url: Optional[str] = None,
+    instance_id: Optional[str] = None,
+) -> None:
+    """Emit a world-model overlay packet for UI consumption."""
+    base: Dict[str, Any] = {
+        "__meta_event": "world_model_overlay",
+        "kind": str(kind),
+    }
+    if instance_id:
+        base["instance_id"] = str(instance_id)
+    if png_base64:
+        base["png_base64"] = str(png_base64)
+    if overlay_url:
+        base["overlay_url"] = str(overlay_url)
+    if payload:
+        base["payload"] = dict(payload)
+    emit_meta_event(base)
