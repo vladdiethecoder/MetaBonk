@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import time
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple
 
@@ -26,6 +27,9 @@ except Exception as e:  # pragma: no cover
     _torch_import_error = e
 else:
     _torch_import_error = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -43,6 +47,11 @@ def _resolve_autocast_dtype(name: str) -> Optional["torch.dtype"]:  # type: igno
         return torch.float16
     if s in ("bf16", "bfloat16"):
         return torch.bfloat16
+    if s in ("fp8", "float8"):
+        if hasattr(torch, "float8_e4m3fn"):
+            return getattr(torch, "float8_e4m3fn")
+        if hasattr(torch, "float8_e5m2"):
+            return getattr(torch, "float8_e5m2")
     # FP8 is optional and GPU/torch-version dependent; treat as best-effort.
     if s in ("fp8_e4m3fn", "e4m3", "float8_e4m3fn") and hasattr(torch, "float8_e4m3fn"):
         return getattr(torch, "float8_e4m3fn")
@@ -144,22 +153,31 @@ class SiliconCortex:
         if not hasattr(torch, "compile"):
             self._compiled_ok = False
             self._compiled_err = "torch.compile unavailable"
+            logger.warning("SiliconCortex disabled: torch.compile unavailable")
             return
 
         # Compilation is only worthwhile on CUDA in our production target.
         if str(self.device.type) != "cuda":
             self._compiled_ok = False
             self._compiled_err = "non-cuda device"
+            logger.warning("SiliconCortex disabled: non-cuda device (%s)", self.device)
             return
 
         self._maybe_enable_tf32()
 
         try:
+            logger.info(
+                "SiliconCortex compiling policy (mode=%s fullgraph=%s dtype=%s)",
+                self.cfg.compile_mode,
+                bool(self.cfg.fullgraph),
+                str(self.cfg.autocast_dtype),
+            )
             compiled = torch.compile(self.raw_policy, mode=self.cfg.compile_mode, fullgraph=bool(self.cfg.fullgraph))
         except Exception as e:
             self._compiled_ok = False
             self._compiled_err = f"torch.compile failed: {e}"
             self._compiled = None
+            logger.error("SiliconCortex compile failed: %s", e)
             return
 
         self._compiled = compiled
@@ -182,10 +200,12 @@ class SiliconCortex:
                 pass
             self._compiled_ok = True
             self._compiled_err = None
+            logger.info("SiliconCortex ready (warmup iters=%s)", iters)
         except Exception as e:
             self._compiled_ok = False
             self._compiled_err = f"warmup failed: {e}"
             self._compiled = None
+            logger.error("SiliconCortex warmup failed: %s", e)
 
     def forward(self, obs: "torch.Tensor", *args: Any, **kwargs: Any) -> Any:  # type: ignore[name-defined]
         """Run the (compiled) policy forward pass under autocast."""
@@ -195,4 +215,3 @@ class SiliconCortex:
 
 
 __all__ = ["SiliconCortex", "SiliconCortexConfig"]
-

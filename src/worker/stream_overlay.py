@@ -95,7 +95,7 @@ def write_thought_overlay(
     except Exception:
         conf = 0.0
     s_step = f"{int(step)}" if step is not None else "—"
-    line = f"STEP {s_step} | {mode} | CONF {conf:.2f} | {body}"
+    line = f"STEP {s_step} | STRATEGY: {mode} | CONF {conf:.2f} | {body}"
     write_overlay_text(overlay_path, line)
 
 
@@ -105,4 +105,3 @@ __all__ = [
     "write_overlay_text",
     "write_thought_overlay",
 ]
-
