@@ -38,6 +38,7 @@ export default function NeuralInterface() {
   const go2rtcBase = String((focused as any)?.go2rtc_base_url ?? "").trim() || fallbackGo2rtcBase();
   const go2rtcName = String((focused as any)?.go2rtc_stream_name ?? "").trim() || "metabonk";
   const embedUrl = go2rtcBase ? `${go2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(go2rtcName)}` : "";
+  const fallbackJpegUrl = focused?.control_url ? `${String(focused.control_url).replace(/\/+$/, "")}/frame.jpg` : "";
 
   const [showThoughts, setShowThoughts] = useState(true);
   const [showHUD, setShowHUD] = useState(true);
@@ -92,6 +93,7 @@ export default function NeuralInterface() {
             baseUrl={go2rtcBase}
             embedUrl={embedUrl || undefined}
             className="neural-video"
+            fallbackJpegUrl={fallbackJpegUrl || undefined}
           />
           {overlayMode !== "none" && overlayImage ? (
             <img className="neural-overlay" src={overlayImage} alt="world-model overlay" />

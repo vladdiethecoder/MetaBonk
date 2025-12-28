@@ -118,6 +118,8 @@ class Heartbeat(MBBaseModel):
     pipewire_node_ok: Optional[bool] = None
     pipewire_ok: Optional[bool] = None
     pipewire_session_ok: Optional[bool] = None
+    stream_require_pipewire: Optional[bool] = None
+    frame_source: Optional[str] = None
     # Optional control base URL (for clip triggers, etc.)
     control_url: Optional[str] = None
     # Spectator selection (set by orchestrator).

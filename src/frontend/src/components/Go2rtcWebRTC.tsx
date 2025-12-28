@@ -56,6 +56,8 @@ export default function Go2rtcWebRTC({
   onVideoReady,
   debugHud = false,
   embedUrl,
+  fallbackJpegUrl,
+  fallbackIntervalMs = 900,
 }: {
   baseUrl: string;
   streamName: string;
@@ -63,6 +65,8 @@ export default function Go2rtcWebRTC({
   onVideoReady?: (el: HTMLVideoElement | null) => void;
   debugHud?: boolean;
   embedUrl?: string;
+  fallbackJpegUrl?: string;
+  fallbackIntervalMs?: number;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
@@ -75,6 +79,7 @@ export default function Go2rtcWebRTC({
   const samplesRef = useRef<HudSample[]>([]);
 
   const [status, setStatus] = useState<"loading" | "playing" | "error">("loading");
+  const [fallbackTick, setFallbackTick] = useState(0);
   const [hud, setHud] = useState<{
     fps: number | null;
     p95: number | null;
@@ -86,12 +91,25 @@ export default function Go2rtcWebRTC({
     freezeCount: number | null;
   } | null>(null);
   const showEmbed = Boolean(embedUrl && status === "error");
+  const showFallback = Boolean(fallbackJpegUrl && status !== "playing" && !showEmbed);
+  const fallbackSrc = fallbackJpegUrl
+    ? `${fallbackJpegUrl}${fallbackJpegUrl.includes("?") ? "&" : "?"}t=${fallbackTick}`
+    : "";
 
   useEffect(() => {
     if (!onVideoReady) return;
     onVideoReady(videoRef.current);
     return () => onVideoReady(null);
   }, [onVideoReady]);
+
+  useEffect(() => {
+    if (!fallbackJpegUrl || status === "playing") return;
+    const intervalMs = Math.max(250, Number(fallbackIntervalMs || 900));
+    const t = window.setInterval(() => {
+      setFallbackTick((v) => (v + 1) % 10_000_000);
+    }, intervalMs);
+    return () => window.clearInterval(t);
+  }, [fallbackJpegUrl, fallbackIntervalMs, status]);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -359,6 +377,7 @@ export default function Go2rtcWebRTC({
           allow="autoplay; fullscreen"
         />
       ) : null}
+      {showFallback ? <img className="mse-fallback" src={fallbackSrc} alt="stream fallback" /> : null}
       {status !== "playing" && !showEmbed ? (
         <div className="mse-overlay">
           <div className="mse-overlay-inner">

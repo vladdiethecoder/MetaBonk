@@ -9,13 +9,14 @@ type QueryLike = {
 
 type QueryStateGateProps = {
   label: string;
-  queries: QueryLike[];
+  queries?: QueryLike[];
   children: ReactNode;
 };
 
 export default function QueryStateGate({ label, queries, children }: QueryStateGateProps) {
-  const loading = queries.some((q) => q.isLoading);
-  const errorQuery = queries.find((q) => q.isError);
+  const list = Array.isArray(queries) ? queries : [];
+  const loading = list.some((q) => q.isLoading);
+  const errorQuery = list.find((q) => q.isError);
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     const store = ((window as any).__mbQueryStates ||= {});

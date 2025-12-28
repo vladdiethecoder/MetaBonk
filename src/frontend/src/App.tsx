@@ -133,6 +133,7 @@ export default function App() {
     () => [
       { to: "/", label: "Lobby" },
       { to: "/neural", label: "Neural Interface" },
+      { to: "/stream", label: "Stream" },
       { to: "/lab", label: "Laboratory" },
       { to: "/codex", label: "Codex" },
     ],

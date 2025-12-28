@@ -454,10 +454,14 @@ def _derive_reason_code_backend(hb: Heartbeat) -> Optional[str]:
         if "offline" in status:
             return "WORKER_OFFLINE"
         return f"WORKER_{status.upper()}"
-    if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False or "no_pipewire" in status:
-        return "STREAM_MISSING_NO_PIPEWIRE"
-    if bool(getattr(hb, "pipewire_session_ok", True)) is False:
-        return "STREAM_MISSING_SESSION"
+    require_pw = getattr(hb, "stream_require_pipewire", None)
+    if require_pw is None:
+        require_pw = True
+    if require_pw:
+        if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False or "no_pipewire" in status:
+            return "STREAM_MISSING_NO_PIPEWIRE"
+        if bool(getattr(hb, "pipewire_session_ok", True)) is False:
+            return "STREAM_MISSING_SESSION"
     if not getattr(hb, "stream_url", None):
         return "STREAM_MISSING_NO_URL"
     if getattr(hb, "stream_ok", None) is False:
@@ -2724,10 +2728,11 @@ if app:
                 ok += 1
             else:
                 stale += 1
-            if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False:
-                pipewire_missing += 1
-            if bool(getattr(hb, "pipewire_session_ok", True)) is False:
-                session_missing += 1
+            if bool(getattr(hb, "stream_require_pipewire", True)):
+                if bool(getattr(hb, "pipewire_ok", True)) is False or bool(getattr(hb, "pipewire_node_ok", True)) is False:
+                    pipewire_missing += 1
+                if bool(getattr(hb, "pipewire_session_ok", True)) is False:
+                    session_missing += 1
             ts = getattr(hb, "stream_last_frame_ts", None)
             if ts:
                 try:

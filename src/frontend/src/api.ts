@@ -55,6 +55,8 @@ export type Heartbeat = {
   pipewire_node_ok?: boolean | null;
   pipewire_ok?: boolean | null;
   pipewire_session_ok?: boolean | null;
+  stream_require_pipewire?: boolean | null;
+  frame_source?: string | null;
   worker_device?: string | null;
   vision_device?: string | null;
   learned_reward_device?: string | null;

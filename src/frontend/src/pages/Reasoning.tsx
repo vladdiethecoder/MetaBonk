@@ -141,7 +141,7 @@ export default function Reasoning({ embedded = false, defaultInstanceId = null }
         </div>
       </div>
 
-      <QueryStateGate query={instQ} label="instances" />
+      <QueryStateGate label="instances" queries={[instQ]} />
 
       <div className="grid" style={{ gridTemplateColumns: embeddedMode ? "1fr" : "1fr 1fr", gap: 12 }}>
         <div className="card" style={{ gridColumn: "1 / -1" }}>

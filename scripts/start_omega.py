@@ -783,6 +783,46 @@ def main() -> int:
         default=os.environ.get("METABONK_STREAM_BACKEND", "auto"),
         help="Stream backend: auto|gst|ffmpeg (default: env or auto).",
     )
+    parser.add_argument(
+        "--dashboard-stream",
+        choices=["auto", "synthetic-eye", "pipewire"],
+        default=os.environ.get("METABONK_DASHBOARD_STREAM", "auto"),
+        help="Dashboard stream source: auto|synthetic-eye|pipewire (auto favors Synthetic Eye).",
+    )
+    parser.add_argument(
+        "--enable-public-stream",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("METABONK_ENABLE_PUBLIC_STREAM", "0") or "0").lower() in ("1", "true", "yes", "on"),
+        help="Enable go2rtc public streaming (PipeWire required).",
+    )
+    parser.add_argument(
+        "--force-pipewire",
+        action=argparse.BooleanOptionalAction,
+        default=str(os.environ.get("METABONK_FORCE_PIPEWIRE", "0") or "0").lower() in ("1", "true", "yes", "on"),
+        help="Force PipeWire for observations + streaming (disable Synthetic Eye).",
+    )
+    parser.add_argument(
+        "--public-stream-url",
+        default=os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984"),
+        help="go2rtc base URL for public viewers.",
+    )
+    parser.add_argument(
+        "--public-stream-mode",
+        default=os.environ.get("METABONK_GO2RTC_MODE", "fifo"),
+        help="go2rtc source mode: fifo (default) or exec.",
+    )
+    parser.add_argument("--public-stream-exec-cmd", default=os.environ.get("METABONK_GO2RTC_EXEC_CMD", ""))
+    parser.add_argument("--public-stream-exec-profile", default=os.environ.get("METABONK_GO2RTC_EXEC_PROFILE", ""))
+    parser.add_argument(
+        "--public-stream-exec-wrap",
+        default=os.environ.get("METABONK_GO2RTC_EXEC_WRAP", "raw"),
+        help="go2rtc exec wrapper format: raw (default) or mpegts.",
+    )
+    parser.add_argument(
+        "--public-stream-exec-wrapper",
+        default=os.environ.get("METABONK_GO2RTC_EXEC_WRAPPER", "scripts/go2rtc_exec_mpegts.sh"),
+        help="Exec mode wrapper script path.",
+    )
 
     # Worker spawns (train/play).
     parser.add_argument("--workers", type=int, default=0, help="Number of workers to spawn (train mode)")
@@ -883,7 +923,7 @@ def main() -> int:
     # due to a slow/half-closed client. The UI still enforces a per-worker lock to avoid
     # intentional multi-client contention.
     env.setdefault("METABONK_STREAM_MAX_CLIENTS", "3")
-    # GPU-only: PipeWire is mandatory (no x11grab/CPU capture fallback).
+    # GPU-only: PipeWire is optional when Synthetic Eye is the primary sensor (set below).
     env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
     env.setdefault("METABONK_CAPTURE_DISABLED", "0")
     env.setdefault("METABONK_CAPTURE_ALL", "0")
@@ -912,6 +952,26 @@ def main() -> int:
     env.setdefault("MEGABONK_HEIGHT", str(int(args.gamescope_height)))
     env.setdefault("METABONK_STREAM_WIDTH", env.get("MEGABONK_WIDTH"))
     env.setdefault("METABONK_STREAM_HEIGHT", env.get("MEGABONK_HEIGHT"))
+    # Streaming mode selection (Synthetic Eye first, PipeWire optional).
+    if bool(getattr(args, "force_pipewire", False)) and bool(getattr(args, "synthetic_eye", False)):
+        print("[start_omega] forcing PipeWire: disabling Synthetic Eye", flush=True)
+        args.synthetic_eye = False
+    use_synthetic_eye = bool(getattr(args, "synthetic_eye", False))
+    public_stream = bool(getattr(args, "enable_public_stream", False)) and args.mode in ("train", "play")
+    dash_stream = str(getattr(args, "dashboard_stream", "auto") or "auto").strip().lower()
+    if dash_stream == "auto":
+        dash_stream = "synthetic-eye" if use_synthetic_eye else "pipewire"
+    env["METABONK_DASHBOARD_STREAM"] = "synthetic_eye" if dash_stream.startswith("synthetic") else "pipewire"
+    if bool(getattr(args, "force_pipewire", False)):
+        env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
+        env["METABONK_FRAME_SOURCE"] = "pipewire"
+    elif use_synthetic_eye:
+        env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1" if public_stream else "0"
+    else:
+        env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
+    if public_stream:
+        env["METABONK_PUBLIC_STREAM"] = "1"
+        env["METABONK_GO2RTC_URL"] = str(args.public_stream_url)
     # Synthetic Eye is the default run state: when enabled, default to the compositor/XWayland hosting
     # path unless the user explicitly opts out (METABONK_SYNTHETIC_EYE_COMPOSITOR=0).
     if bool(getattr(args, "synthetic_eye", False)):
@@ -1371,7 +1431,73 @@ def main() -> int:
     procs: List[Proc] = []
     forward_meta = _forward_meta_events_enabled(env)
     meta_stop = threading.Event()
+    go2rtc_started = False
+
+    def _go2rtc_compose(*extra: str) -> int:
+        compose = os.environ.get("METABONK_DOCKER_COMPOSE") or "docker"
+        base = [compose]
+        if compose == "docker":
+            base += ["compose"]
+        mode = str(args.public_stream_mode or "fifo").strip().lower()
+        compose_file = "docker-compose.go2rtc.exec.yml" if mode == "exec" else "docker-compose.go2rtc.yml"
+        base += ["-f", str(repo_root / "docker" / compose_file)]
+        base += list(extra)
+        try:
+            return int(subprocess.call(base, cwd=str(repo_root), env=env))
+        except Exception:
+            return 1
     try:
+        if public_stream:
+            try:
+                go2rtc_mode = str(args.public_stream_mode or "fifo").strip().lower()
+                if go2rtc_mode == "fifo":
+                    fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
+                    env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
+                    env.setdefault("METABONK_FIFO_CONTAINER", "mpegts")
+                    env["METABONK_FIFO_STREAM"] = "1"
+                else:
+                    env["METABONK_FIFO_STREAM"] = "0"
+                env["METABONK_GO2RTC_URL"] = str(args.public_stream_url)
+                try:
+                    cur_max = int(str(env.get("METABONK_STREAM_MAX_CLIENTS", "") or "1"))
+                except Exception:
+                    cur_max = 1
+                if cur_max < 3:
+                    env["METABONK_STREAM_MAX_CLIENTS"] = "3"
+                out_cfg = str(repo_root / "temp" / "go2rtc.yaml")
+                env["METABONK_GO2RTC_CONFIG"] = out_cfg
+                subprocess.check_call(
+                    [
+                        py,
+                        str(repo_root / "scripts" / "go2rtc_generate_config.py"),
+                        "--workers",
+                        str(int(args.workers) if args.mode == "train" else 1),
+                        "--instance-prefix",
+                        str(args.instance_prefix),
+                        "--mode",
+                        go2rtc_mode,
+                        "--exec-cmd-template",
+                        str(args.public_stream_exec_cmd or ""),
+                        "--exec-profile",
+                        str(args.public_stream_exec_profile or ""),
+                        "--exec-wrap",
+                        str(args.public_stream_exec_wrap or "raw"),
+                        "--exec-wrapper",
+                        str(args.public_stream_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh"),
+                        "--fifo-dir",
+                        str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams")),
+                        "--out",
+                        out_cfg,
+                    ],
+                    cwd=str(repo_root),
+                    env=env,
+                )
+                _go2rtc_compose("up", "-d", "--remove-orphans")
+                go2rtc_started = True
+                print(f"[start_omega] public stream -> {env.get('METABONK_GO2RTC_URL')}/")
+            except Exception as e:
+                print(f"[start_omega] WARN: failed to start go2rtc ({e})", file=sys.stderr)
+
         if not args.no_orchestrator:
             procs.append(
                 _spawn(
@@ -1924,6 +2050,11 @@ def main() -> int:
     finally:
         meta_stop.set()
         _terminate_all(procs)
+        if go2rtc_started:
+            try:
+                _go2rtc_compose("down", "--remove-orphans")
+            except Exception:
+                pass
         # Last-resort cleanup for stragglers is handled by the top-level launcher
         # (`scripts/start.py` / `./start`). Avoid running stop.py from within omega
         # itself to prevent self-termination via job-state PGID cleanup.

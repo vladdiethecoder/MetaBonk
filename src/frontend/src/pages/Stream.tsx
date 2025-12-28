@@ -764,6 +764,7 @@ function StreamTile({
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debugHud={DEBUG_HUD}
             embedUrl={go2rtcEmbedUrl || undefined}
+            fallbackJpegUrl={frameUrl || undefined}
           />
         ) : streamUrl && isVideo ? (
           <MseMp4Video

@@ -973,11 +973,8 @@ class WorkerService:
         self._stream_enabled = os.environ.get("METABONK_STREAM", "1") in ("1", "true", "True")
         # Hard requirement: when enabled, the worker must use PipeWire+NVENC for stream.
         # No MJPEG/CPU streaming fallback is allowed in this mode.
-        self._require_pipewire_stream = os.environ.get("METABONK_REQUIRE_PIPEWIRE_STREAM", "1") in (
-            "1",
-            "true",
-            "True",
-        )
+        require_raw = os.environ.get("METABONK_REQUIRE_PIPEWIRE_STREAM")
+        self._require_pipewire_stream = str(require_raw or "1") in ("1", "true", "True")
         try:
             sb = str(os.environ.get("METABONK_STREAM_BACKEND", "auto") or "").strip().lower()
             if sb == "obs":
@@ -987,11 +984,27 @@ class WorkerService:
                 self._require_pipewire_stream = False
         except Exception:
             pass
+        if require_raw is None and self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            # Synthetic Eye doesn't rely on PipeWire for observations; avoid gating health on it by default.
+            self._require_pipewire_stream = False
         self._pipewire_node_ok = False
         self._pipewire_node = os.environ.get("PIPEWIRE_NODE")
         self._stream_error: Optional[str] = None
         self._featured_slot: Optional[str] = None
         self._featured_role: Optional[str] = None
+        dash_stream = str(os.environ.get("METABONK_DASHBOARD_STREAM", "auto") or "").strip().lower()
+        if dash_stream == "auto":
+            dash_stream = "synthetic_eye" if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf") else "pipewire"
+        self._dashboard_stream = dash_stream
+        try:
+            self._dashboard_fps = float(os.environ.get("METABONK_DASHBOARD_FPS", "12"))
+        except Exception:
+            self._dashboard_fps = 12.0
+        try:
+            self._dashboard_scale = float(os.environ.get("METABONK_DASHBOARD_SCALE", "0.5"))
+        except Exception:
+            self._dashboard_scale = 0.5
+        self._dashboard_last_ts = 0.0
 
         self.highlight: Optional[HighlightRecorder] = None
         if os.environ.get("METABONK_HIGHLIGHTS", "0") in ("1", "true", "True"):
@@ -3890,6 +3903,8 @@ class WorkerService:
                 pipewire_node_ok=bool(getattr(self, "_pipewire_node_ok", False)),
                 pipewire_ok=self._pipewire_daemon_ok,
                 pipewire_session_ok=self._pipewire_session_ok,
+                stream_require_pipewire=bool(getattr(self, "_require_pipewire_stream", False)),
+                frame_source=self._frame_source,
                 worker_device=worker_device or None,
                 vision_device=vision_device or None,
                 learned_reward_device=learned_reward_device or None,
@@ -4337,6 +4352,31 @@ class WorkerService:
                                         )
                                         raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
                                         obs = raw_tensor.permute(2, 0, 1)[:3].float().div(255.0)
+                                        if (
+                                            self._dashboard_stream == "synthetic_eye"
+                                            and self._dashboard_fps > 0
+                                            and (now - float(self._dashboard_last_ts or 0.0)) >= (1.0 / float(self._dashboard_fps))
+                                        ):
+                                            try:
+                                                import io
+                                                from PIL import Image
+                                                import torch.nn.functional as F
+
+                                                img_t = raw_tensor[..., :3].permute(2, 0, 1).unsqueeze(0).float()
+                                                if 0 < self._dashboard_scale < 1:
+                                                    h_out = max(2, int(img_t.shape[2] * self._dashboard_scale))
+                                                    w_out = max(2, int(img_t.shape[3] * self._dashboard_scale))
+                                                    img_t = F.interpolate(img_t, size=(h_out, w_out), mode="bilinear", align_corners=False)
+                                                img_t = img_t.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().to("cpu")
+                                                img = Image.fromarray(img_t.numpy(), mode="RGB")
+                                                buf = io.BytesIO()
+                                                img.save(buf, format="JPEG", quality=80)
+                                                latest_image_bytes = buf.getvalue()
+                                                latest_image_source = "synthetic_eye"
+                                                self._set_latest_jpeg(latest_image_bytes)
+                                                self._dashboard_last_ts = now
+                                            except Exception:
+                                                pass
                                         if os.environ.get("METABONK_VISION_AUDIT", "0") == "1":
                                             if int(frame.frame_id) % 60 == 0:
                                                 mean_val = float(obs.mean().item())

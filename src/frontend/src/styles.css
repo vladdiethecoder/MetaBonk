@@ -2180,6 +2180,7 @@ body::before{
   z-index: 1;
 }
 .mse-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; transition: opacity 260ms ease; }
+.mse-fallback { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0.92; filter: saturate(1.05) contrast(1.05); }
 .mse-overlay-inner { padding: 14px 16px; border-radius: 14px; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.08); backdrop-filter: blur(6px); max-width: 90%; text-align: center; }
 .mse-overlay-title { font-weight: 900; letter-spacing: .08em; font-size: 12px; }
 .mse-overlay-sub { margin-top: 6px; font-size: 12px; line-height: 1.25; }
