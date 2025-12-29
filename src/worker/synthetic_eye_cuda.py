@@ -133,6 +133,7 @@ class SyntheticEyeCudaIngestor:
             "on",
         )
         self._warned_no_fence: bool = False
+        self._logged_quality_debug: bool = False
 
     def _debug_fd(self, fd: int, name: str) -> None:
         if not self._debug_fds:
@@ -256,6 +257,21 @@ class SyntheticEyeCudaIngestor:
         self.last_width = int(frame.width)
         self.last_height = int(frame.height)
         self.last_size_bytes = int(getattr(frame, "size_bytes", 0) or 0)
+        if not self._logged_quality_debug:
+            self._logged_quality_debug = True
+            try:
+                print(
+                    "[QUALITY_DEBUG] "
+                    f"synthetic_eye frame={int(frame.frame_id)} "
+                    f"src={int(frame.width)}x{int(frame.height)} "
+                    f"stride={int(frame.stride)} "
+                    f"fourcc=0x{int(frame.drm_fourcc) & 0xFFFFFFFF:08x} "
+                    f"modifier=0x{int(frame.modifier) & 0xFFFFFFFFFFFFFFFF:016x} "
+                    f"target={str(os.environ.get('METABONK_STREAM_NVENC_TARGET_SIZE', '') or '').strip() or 'none'}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         if self._debug_fds and int(frame.modifier) == 0:
             print(
                 f"[WARN] Synthetic Eye modifier=0 (linear) for frame {int(frame.frame_id)}",

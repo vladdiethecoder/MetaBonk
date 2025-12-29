@@ -1079,6 +1079,10 @@ body::before{
   align-items: center;
   font-size: 13px;
 }
+.route-scope[data-tier="720"] .lb-row,
+.route-scope[data-tier="1080"] .lb-row{
+  grid-template-columns: 36px 18px 1fr 10ch 9ch 28px;
+}
 .layout-broadcast .lb-row{ font-size: 14px; }
 .route-scope[data-tier="720"] .layout-broadcast .lb-row{ font-size: 15px; }
 .layout-broadcast .lb-agent-name{ font-size: 14px; }
@@ -1881,6 +1885,7 @@ body::before{
   min-width: 0;
   height: 100%;
 }
+.layout-broadcast .stream-main{ grid-template-columns: minmax(0, 1fr) clamp(520px, 44%, 1600px); }
 .stream-main > *{
   min-height: 0;
   min-width: 0;
@@ -1920,6 +1925,7 @@ body::before{
   grid-template-rows: 1.6fr 1fr;
   gap: 12px;
 }
+.layout-broadcast .run-stage{ grid-template-rows: 1.1fr 1fr; }
 .run-stage-focus{ min-height: 0; }
 .run-stage-mosaic{
   min-height: 0;
@@ -3022,6 +3028,7 @@ body::before{
 .stream-rail { display: flex; flex-direction: column; gap: 12px; min-height: 0; min-width: 0; overflow: hidden; }
 .stream-rail-fixed { display: flex; flex-direction: column; gap: 12px; }
 .stream-leaderboard-card{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.layout-broadcast .stream-leaderboard-card{ flex: 1.6; }
 .stream-leaderboard-card .lb-table{ flex: 1; min-height: 0; overflow: hidden; }
 .lb-afford{
   display: inline-flex;

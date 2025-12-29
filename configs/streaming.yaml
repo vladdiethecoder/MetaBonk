@@ -29,6 +29,27 @@ profiles:
       allow_gst_mp4: false
       require_zero_copy: false
 
+  # Local app defaults (Tauri / Vite spectator):
+  # - MP4/MSE friendly output
+  # - no go2rtc dependency
+  # - allow pixel_obs fallback for fully headless stacks
+  # - reduce FPS to keep 1080p stable across multiple featured tiles
+  local:
+    streaming:
+      backend: auto
+      container: mp4
+      bitrate: 10M
+      fps: 30
+      gop: 15
+      allow_gst_mp4: false
+      require_zero_copy: false
+      max_clients: 3
+      nvenc_max_sessions: 0
+    fifo:
+      enabled: false
+    go2rtc:
+      enabled: false
+
   # Production/training defaults:
   # - deterministic backend (GStreamer)
   # - enforce GPU-only streaming (no CPU raw-frame fallback)

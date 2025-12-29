@@ -247,7 +247,7 @@ def main() -> int:
     parser.add_argument(
         "--stream-profile",
         default=os.environ.get("METABONK_STREAM_PROFILE", ""),
-        help="Streaming profile (from configs/streaming.yaml): dev|prod (default: based on mode).",
+        help="Streaming profile (from configs/streaming.yaml): local|dev|prod (default: based on mode/UI).",
     )
     parser.add_argument(
         "--stream-backend",
@@ -422,6 +422,13 @@ def main() -> int:
     env["METABONK_USE_LEARNED_REWARD"] = "1"
     env["METABONK_VIDEO_REWARD_CKPT"] = args.reward_ckpt
 
+    # Streaming profile selection:
+    # - default to "local" when the local UI is enabled (no go2rtc/docker dependency)
+    # - default to "prod" for headless/service runs unless overridden
+    if not str(getattr(args, "stream_profile", "") or "").strip() and not str(env.get("METABONK_STREAM_PROFILE") or "").strip():
+        if bool(getattr(args, "ui", True)) and not bool(getattr(args, "go2rtc", False)) and args.mode in ("train", "play"):
+            env["METABONK_STREAM_PROFILE"] = "local"
+
     # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
     try:
         apply_streaming_profile(env, mode=str(args.mode), profile=str(getattr(args, "stream_profile", "") or "") or None)
@@ -447,6 +454,16 @@ def main() -> int:
     env.setdefault("METABONK_GST_CAPTURE", "0")
     env.setdefault("METABONK_CAPTURE_CPU", "0")
     env.setdefault("METABONK_WORKER_TTL_S", "20")
+    # Local app viewing quality: upscale pixel_obs streams to 1080p unless explicitly overridden.
+    # This does not affect the agent's observation tensor.
+    if bool(getattr(args, "ui", True)) and not bool(getattr(args, "go2rtc", False)):
+        env.setdefault("METABONK_STREAM_NVENC_TARGET_SIZE", "1920x1080")
+        # Default to "crop-to-fill" scaling so the Stream UI does not show huge black bars
+        # when the source aspect ratio is slightly off.
+        env.setdefault("METABONK_STREAM_SCALE_MODE", "crop")
+        env.setdefault("METABONK_STREAM_SCALE_FLAGS", "bicubic")
+        env.setdefault("METABONK_STREAM_STARTUP_TIMEOUT_S", "30")
+        env.setdefault("METABONK_STREAM_STALL_TIMEOUT_S", "60")
     if "METABONK_STREAM_WIDTH" not in env and env.get("MEGABONK_WIDTH"):
         env["METABONK_STREAM_WIDTH"] = str(env.get("MEGABONK_WIDTH"))
     if "METABONK_STREAM_HEIGHT" not in env and env.get("MEGABONK_HEIGHT"):

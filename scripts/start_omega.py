@@ -818,7 +818,7 @@ def main() -> int:
     parser.add_argument(
         "--stream-profile",
         default=os.environ.get("METABONK_STREAM_PROFILE", ""),
-        help="Streaming profile (from configs/streaming.yaml): dev|prod (default: based on mode).",
+        help="Streaming profile (from configs/streaming.yaml): local|dev|prod (default: based on mode/UI).",
     )
     parser.add_argument(
         "--stream-backend",
@@ -952,6 +952,13 @@ def main() -> int:
     env.setdefault("METABONK_USE_LEARNED_REWARD", "1")
     env.setdefault("METABONK_VIDEO_REWARD_CKPT", str(repo_root / "checkpoints" / "video_reward_model.pt"))
 
+    # Streaming profile selection:
+    # - default to "local" when the local UI is enabled (no go2rtc/docker dependency)
+    # - default to "prod" for headless/service runs unless overridden
+    if not str(getattr(args, "stream_profile", "") or "").strip() and not str(env.get("METABONK_STREAM_PROFILE") or "").strip():
+        if bool(getattr(args, "ui", True)) and not bool(getattr(args, "enable_public_stream", False)) and args.mode in ("train", "play"):
+            env["METABONK_STREAM_PROFILE"] = "local"
+
     # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
     try:
         apply_streaming_profile(env, mode=str(args.mode), profile=str(getattr(args, "stream_profile", "") or "") or None)
@@ -966,6 +973,15 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_BITRATE", "6M")
     env.setdefault("METABONK_STREAM_FPS", "60")
     env.setdefault("METABONK_STREAM_GOP", "60")
+    # Local app viewing quality: upscale pixel_obs streams to 1080p unless explicitly overridden.
+    # This does not affect the agent's observation tensor.
+    if bool(getattr(args, "ui", True)) and not _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0")):
+        env.setdefault("METABONK_STREAM_NVENC_TARGET_SIZE", "1920x1080")
+        env.setdefault("METABONK_STREAM_SCALE_MODE", "crop")
+        env.setdefault("METABONK_STREAM_SCALE_FLAGS", "bicubic")
+        # Give slow-starting game instances more time before declaring the stream dead.
+        env.setdefault("METABONK_STREAM_STARTUP_TIMEOUT_S", "30")
+        env.setdefault("METABONK_STREAM_STALL_TIMEOUT_S", "60")
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
     # Production/zero-copy guardrail: don't allow auto selection to drift into CPU paths.

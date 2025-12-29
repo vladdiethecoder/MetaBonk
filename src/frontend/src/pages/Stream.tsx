@@ -997,15 +997,15 @@ function HighlightPanel({
       // ignore
     }
   };
+
+  if (!clipUrl) {
+    return null;
+  }
   return (
     <div className={`stream-card stream-highlight ${pulse ? "stream-highlight-pulse" : ""}`}>
       <div className="stream-card-title">#1 Replay</div>
       <div className="stream-highlight-media">
-        {clipUrl ? (
-          <video className="stream-highlight-video" src={clipUrl} autoPlay muted playsInline loop onLoadedMetadata={onVideoReady} />
-        ) : (
-          <div className="stream-highlight-placeholder">waiting for hot runs…</div>
-        )}
+        <video className="stream-highlight-video" src={clipUrl} autoPlay muted playsInline loop onLoadedMetadata={onVideoReady} />
         <div className="stream-replay-overlay">
           <div className="stream-replay-top">
             <span className="stream-replay-name">#1 {name} • {score == null ? "—" : fmt(score, 2)}</span>
@@ -2409,10 +2409,10 @@ export default function Stream() {
                       pulse={highlightPulseUntil > Date.now()}
                     />
 
-                    <div className="stream-card stream-highlight" style={{ marginTop: 12 }}>
-                      <div className="stream-card-title">Replay Buffer</div>
-                      <div className="stream-highlight-media">
-                        {replayQueue.length ? (
+                    {replayQueue.length ? (
+                      <div className="stream-card stream-highlight" style={{ marginTop: 12 }}>
+                        <div className="stream-card-title">Replay Buffer</div>
+                        <div className="stream-highlight-media">
                           <div className="replay-queue">
                             {replayQueue.map((r) => (
                               <div key={r.clipUrl} className="replay-queue-item">
@@ -2424,11 +2424,9 @@ export default function Stream() {
                               </div>
                             ))}
                           </div>
-                        ) : (
-                          <div className="stream-highlight-placeholder">waiting for event-driven clips…</div>
-                        )}
+                        </div>
                       </div>
-                    </div>
+                    ) : null}
 
                   <div className="stream-tabs">
                     {!publicMode ? (

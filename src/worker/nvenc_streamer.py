@@ -427,6 +427,16 @@ def _select_gst_encoder(codec: str) -> str:
 
 
 def _select_ffmpeg_encoder(codec: str) -> str:
+    for enc in _ffmpeg_encoder_candidates(codec):
+        if _ffmpeg_encoder_available(enc):
+            return enc
+    c = str(codec or "h264").strip().lower()
+    if c in ("avc",):
+        c = "h264"
+    raise RuntimeError(f"no FFmpeg encoder available for codec '{c}' (install ffmpeg with nvenc/vaapi or libx264)")
+
+
+def _ffmpeg_encoder_candidates(codec: str) -> list[str]:
     override = (
         os.environ.get("METABONK_FFMPEG_ENCODER")
         or os.environ.get("METABONK_STREAM_FFMPEG_ENCODER")
@@ -434,11 +444,9 @@ def _select_ffmpeg_encoder(codec: str) -> str:
     )
     if override:
         enc = override.strip()
-        if not _ffmpeg_encoder_available(enc):
-            if _env_truthy("METABONK_FFMPEG_ENCODER_ALLOW_UNVERIFIED"):
-                return enc
+        if not _ffmpeg_encoder_available(enc) and not _env_truthy("METABONK_FFMPEG_ENCODER_ALLOW_UNVERIFIED"):
             raise RuntimeError(f"requested FFmpeg encoder '{enc}' is not available")
-        return enc
+        return [enc]
 
     c = str(codec or "h264").strip().lower()
     if c in ("avc",):
@@ -450,10 +458,7 @@ def _select_ffmpeg_encoder(codec: str) -> str:
         "hevc": ["hevc_nvenc", "hevc_vaapi", "hevc_amf", "hevc_v4l2m2m", "libx265"],
         "av1": ["av1_nvenc", "av1_vaapi", "av1_amf", "av1_v4l2m2m", "libsvtav1", "libaom-av1"],
     }
-    for enc in candidates.get(c, []):
-        if _ffmpeg_encoder_available(enc):
-            return enc
-    raise RuntimeError(f"no FFmpeg encoder available for codec '{c}' (install ffmpeg with nvenc/vaapi or libx264)")
+    return list(candidates.get(c, []))
 
 
 def _gst_kv_opts(elem: str, opts: dict[str, str]) -> str:
@@ -490,7 +495,7 @@ class NVENCConfig:
     bitrate: str = "6M"
     fps: int = 60
     gop: int = 60
-    preset: str = "p1"  # p1 fastest / low latency
+    preset: str = "p4"  # p1..p7; p4 is balanced (nvenc default)
     tune: str = "ll"    # low-latency
     container: str = "mp4"  # mp4|mpegts
     # Optional: bypass PipeWire/X11 capture by encoding frames provided by the caller
@@ -1065,15 +1070,8 @@ class NVENCStreamer:
         gop = max(1, int(self.cfg.gop))
         bitrate = str(self.cfg.bitrate or "6M").strip() or "6M"
 
-        enc = _select_ffmpeg_encoder(codec)
         max_nvenc = _nvenc_max_sessions()
-        if max_nvenc > 0 and "nvenc" in str(enc):
-            gpu_idx = _nvml_gpu_index()
-            if gpu_idx is not None:
-                used = _nvenc_sessions_used(gpu_index=gpu_idx)
-                self.nvenc_sessions_used_last = used
-                if used is not None and int(used) >= int(max_nvenc):
-                    raise RuntimeError(f"NVENC session limit reached (used={used} max={max_nvenc})")
+        gpu_idx = _nvml_gpu_index() if max_nvenc > 0 else None
 
         # OBS-like defaults: low-latency, no audio, fragment-friendly containers.
         # Keep options conservative across encoders; users can override via env.
@@ -1107,17 +1105,133 @@ class NVENCStreamer:
             "-an",
         ]
 
+        filters: list[str] = []
+        extra_out_l = extra_out.lower()
+        out_has_filter = ("-vf" in extra_out_l or "-filter:" in extra_out_l or "-filter_complex" in extra_out_l)
+        scale_force = _env_truthy("METABONK_STREAM_SCALE_FORCE")
+        scale_enabled = str(os.environ.get("METABONK_STREAM_SCALE", "1") or "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        scale_mode = str(os.environ.get("METABONK_STREAM_SCALE_MODE", "pad") or "pad").strip().lower()
+        if scale_mode not in ("pad", "crop", "stretch"):
+            scale_mode = "pad"
+        scale_flags = str(os.environ.get("METABONK_STREAM_SCALE_FLAGS", "") or "").strip().lower()
+        if not scale_flags:
+            # Heuristic default: for tiny obs tensors prefer nearest-neighbor; for spectator frames
+            # and other larger sources prefer a smoother scaler.
+            try:
+                max_dim = max(int(width), int(height))
+            except Exception:
+                max_dim = 0
+            scale_flags = "neighbor" if max_dim > 0 and max_dim <= 512 else "bicubic"
+
+        def _parse_size(raw: str) -> tuple[Optional[int], Optional[int]]:
+            s = str(raw or "").strip().lower()
+            if not s:
+                return None, None
+            m = re.match(r"^(\\d+)\\s*x\\s*(\\d+)$", s)
+            if not m:
+                return None, None
+            try:
+                tw = int(m.group(1))
+                th = int(m.group(2))
+            except Exception:
+                return None, None
+            if tw <= 0 or th <= 0:
+                return None, None
+            # Most encoders require even dimensions for 4:2:0.
+            if tw % 2:
+                tw += 1
+            if th % 2:
+                th += 1
+            return int(tw), int(th)
+
+        # Output scaling: in the local app we want featured tiles to be 1080p without
+        # exploding rawvideo pipe bandwidth. Scale inside ffmpeg instead of upscaling
+        # frames in Python.
+        target_w: Optional[int] = None
+        target_h: Optional[int] = None
+        if scale_enabled:
+            tw, th = _parse_size(os.environ.get("METABONK_STREAM_NVENC_TARGET_SIZE", "") or "")
+            target_w, target_h = tw, th
+            if target_w is None or target_h is None:
+                # Back-compat: allow separate width/height env vars to request scaling.
+                raw_w = str(os.environ.get("MEGABONK_WIDTH", "") or os.environ.get("METABONK_STREAM_WIDTH", "") or "").strip()
+                raw_h = str(os.environ.get("MEGABONK_HEIGHT", "") or os.environ.get("METABONK_STREAM_HEIGHT", "") or "").strip()
+                try:
+                    if raw_w and raw_h:
+                        target_w = int(raw_w)
+                        target_h = int(raw_h)
+                except Exception:
+                    target_w, target_h = None, None
+                if target_w is not None and target_h is not None:
+                    if target_w <= 0 or target_h <= 0:
+                        target_w, target_h = None, None
+                    else:
+                        if int(target_w) % 2:
+                            target_w = int(target_w) + 1
+                        if int(target_h) % 2:
+                            target_h = int(target_h) + 1
+
+        if scale_enabled and not out_has_filter and target_w is not None and target_h is not None:
+            if int(target_w) != int(width) or int(target_h) != int(height):
+                # Normalize sample aspect ratio. Broken SAR metadata can make browsers render the
+                # frame at the wrong display size (pillarbox/letterbox artifacts).
+                filters.append("setsar=1")
+                if scale_mode == "crop":
+                    # Fill target frame without black bars (scale up + crop center).
+                    filters.append(
+                        f"scale={int(target_w)}:{int(target_h)}:flags={scale_flags}:force_original_aspect_ratio=increase"
+                    )
+                    filters.append(f"crop={int(target_w)}:{int(target_h)}")
+                elif scale_mode == "stretch":
+                    filters.append(f"scale={int(target_w)}:{int(target_h)}:flags={scale_flags}")
+                else:
+                    # Preserve aspect ratio and pad (avoids stretching square obs into 16:9).
+                    filters.append(
+                        f"scale={int(target_w)}:{int(target_h)}:flags={scale_flags}:force_original_aspect_ratio=decrease"
+                    )
+                    filters.append(
+                        f"pad={int(target_w)}:{int(target_h)}:(ow-iw)/2:(oh-ih)/2:color=black"
+                    )
+        elif scale_enabled and out_has_filter and (target_w is not None and target_h is not None) and not scale_force:
+            _log_stream_event("stream_scale_skipped", reason="user_filter_present")
+
+        # Encoder safety net: ensure we don't feed tiny frames into NVENC. Prefer doing
+        # this in ffmpeg rather than Python to keep stdin bandwidth low.
+        try:
+            min_dim = int(os.environ.get("METABONK_STREAM_NVENC_MIN_DIM", "256"))
+        except Exception:
+            min_dim = 256
+        if (
+            scale_enabled
+            and not out_has_filter
+            and (target_w is None or target_h is None)
+            and int(min_dim) > 0
+            and (int(width) < int(min_dim) or int(height) < int(min_dim))
+        ):
+            scale = max(float(min_dim) / float(max(1, int(width))), float(min_dim) / float(max(1, int(height))))
+            out_w = max(int(min_dim), int(round(float(width) * scale)))
+            out_h = max(int(min_dim), int(round(float(height) * scale)))
+            if out_w % 2:
+                out_w += 1
+            if out_h % 2:
+                out_h += 1
+            if out_w != int(width) or out_h != int(height):
+                filters.append("setsar=1")
+                filters.append(f"scale={int(out_w)}:{int(out_h)}:flags={scale_flags}")
+
         # Optional: mind HUD overlay (best-effort). Enabled by setting:
         #   METABONK_STREAM_OVERLAY=1
         #   METABONK_STREAM_OVERLAY_FILE=/path/to/text.txt
         overlay_file = str(os.environ.get("METABONK_STREAM_OVERLAY_FILE", "") or "").strip()
         overlay_on = _env_truthy("METABONK_STREAM_OVERLAY") and bool(overlay_file)
         if overlay_on:
-            extra_out_l = extra_out.lower()
             # Avoid clobbering user-provided filter graphs.
-            if ("-vf" in extra_out_l or "-filter:" in extra_out_l or "-filter_complex" in extra_out_l) and not _env_truthy(
-                "METABONK_STREAM_OVERLAY_FORCE"
-            ):
+            if out_has_filter and not _env_truthy("METABONK_STREAM_OVERLAY_FORCE"):
                 _log_stream_event("stream_overlay_skipped", reason="user_filter_present")
             elif not _ffmpeg_filter_available(ffmpeg, "drawtext"):
                 _log_stream_event("stream_overlay_unavailable", reason="ffmpeg_drawtext_missing")
@@ -1158,21 +1272,11 @@ class NVENCStreamer:
                 ]
                 if fontfile:
                     parts.append(f"fontfile='{_ffmpeg_escape_drawtext_path(fontfile)}'")
-                # Keep filtergraph simple: just drawtext on decoded frames.
-                cmd += ["-vf", "drawtext=" + ":".join(parts)]
+                filters.append("drawtext=" + ":".join(parts))
                 _log_stream_event("stream_overlay_enabled", file=overlay_file, font=fontfile or "default")
 
-        # Encoder options.
-        if enc.endswith("_nvenc"):
-            cmd += ["-c:v", enc, "-preset", str(self.cfg.preset or "p1"), "-tune", str(self.cfg.tune or "ll")]
-            cmd += ["-rc", os.environ.get("METABONK_FFMPEG_RC", "cbr")]
-            cmd += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", os.environ.get("METABONK_FFMPEG_BUFSIZE", str(bitrate))]
-            cmd += ["-g", str(gop), "-bf", "0", "-forced-idr", "1", "-rc-lookahead", "0", "-force_key_frames", "0"]
-        elif enc.endswith("_vaapi"):
-            # Note: VAAPI encoders typically expect hw frames; we still allow it but it may fall back/ fail.
-            cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop), "-force_key_frames", "0"]
-        else:
-            cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop), "-force_key_frames", "0"]
+        if filters and (not out_has_filter or scale_force):
+            cmd += ["-vf", ",".join([f for f in filters if f])]
 
         # Browser-friendly default: force H.264/MP4 output to 4:2:0 so MSE decoders don't reject
         # 4:4:4 / 10-bit formats (users can override via METABONK_FFMPEG_OUT_OPTS).
@@ -1180,53 +1284,181 @@ class NVENCStreamer:
             has_out_pix_fmt = "-pix_fmt" in (extra_out.split() if extra_out else [])
         except Exception:
             has_out_pix_fmt = False
-        if not has_out_pix_fmt:
-            cmd += ["-pix_fmt", "yuv420p"]
 
-        if extra_out:
-            cmd += extra_out.split()
+        base_cmd = list(cmd)
+        start_errors: list[str] = []
 
-        cmd += _ffmpeg_cfr_args()
+        for enc in _ffmpeg_encoder_candidates(codec):
+            # Skip unavailable encoders (unless the user explicitly forces an unverified override).
+            if not _ffmpeg_encoder_available(enc) and not _env_truthy("METABONK_FFMPEG_ENCODER_ALLOW_UNVERIFIED"):
+                continue
 
-        if container == "h264":
-            # Raw Annex-B elementary stream (for FIFO/go2rtc).
-            # Ensure parameter sets (SPS/PPS) are present at keyframes so late-joining
-            # consumers (go2rtc/WebRTC) can start decoding quickly.
-            if codec == "h264":
-                cmd += ["-bsf:v", "dump_extra"]
-            cmd += ["-f", "h264", "-flush_packets", "1", "pipe:1"]
-        elif container == "mpegts":
-            cmd += ["-f", "mpegts", "-flush_packets", "1", "pipe:1"]
-        else:
-            # Fragmented MP4 for MSE in the dev UI.
-            movflags = os.environ.get(
-                "METABONK_FFMPEG_MOVFLAGS",
-                "frag_keyframe+empty_moov+default_base_moof",
+            if max_nvenc > 0 and "nvenc" in str(enc):
+                if gpu_idx is not None:
+                    used = _nvenc_sessions_used(gpu_index=gpu_idx)
+                    self.nvenc_sessions_used_last = used
+                    if used is not None and int(used) >= int(max_nvenc):
+                        start_errors.append(f"{enc}: NVENC session limit reached (used={used} max={max_nvenc})")
+                        continue
+
+            cmd = list(base_cmd)
+            # Encoder options.
+            if enc.endswith("_nvenc"):
+                preset = str(os.environ.get("METABONK_STREAM_PRESET") or self.cfg.preset or "p4").strip() or "p4"
+                tune = str(os.environ.get("METABONK_STREAM_TUNE") or self.cfg.tune or "ll").strip() or "ll"
+                rc = (
+                    str(os.environ.get("METABONK_STREAM_RC") or os.environ.get("METABONK_FFMPEG_RC") or "vbr").strip()
+                    or "vbr"
+                )
+                try:
+                    bf = int(os.environ.get("METABONK_STREAM_BF", "0") or 0)
+                except Exception:
+                    bf = 0
+                try:
+                    keyint_min = int(os.environ.get("METABONK_STREAM_KEYINT_MIN", str(gop)) or gop)
+                except Exception:
+                    keyint_min = int(gop)
+                forced_raw = os.environ.get("METABONK_STREAM_FORCE_IDR")
+                if forced_raw is None or not str(forced_raw).strip():
+                    forced_idr = True
+                else:
+                    forced_idr = str(forced_raw).strip().lower() in ("1", "true", "yes", "on")
+                bufsize = (
+                    str(
+                        os.environ.get("METABONK_STREAM_BUFSIZE")
+                        or os.environ.get("METABONK_FFMPEG_BUFSIZE")
+                        or str(bitrate)
+                    ).strip()
+                    or str(bitrate)
+                )
+                cmd += ["-c:v", enc, "-preset", preset, "-tune", tune]
+                cmd += ["-rc", rc]
+                cmd += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bufsize]
+                cmd += ["-g", str(gop), "-keyint_min", str(max(1, int(keyint_min))), "-bf", str(max(0, int(bf)))]
+                cmd += ["-forced-idr", "1" if forced_idr else "0", "-rc-lookahead", "0"]
+            elif enc.endswith("_vaapi"):
+                # Note: VAAPI encoders typically expect hw frames; we still allow it but it may fall back/ fail.
+                try:
+                    keyint_min = int(os.environ.get("METABONK_STREAM_KEYINT_MIN", str(gop)) or gop)
+                except Exception:
+                    keyint_min = int(gop)
+                cmd += [
+                    "-c:v",
+                    enc,
+                    "-b:v",
+                    bitrate,
+                    "-maxrate",
+                    bitrate,
+                    "-g",
+                    str(gop),
+                    "-keyint_min",
+                    str(max(1, int(keyint_min))),
+                ]
+            else:
+                try:
+                    keyint_min = int(os.environ.get("METABONK_STREAM_KEYINT_MIN", str(gop)) or gop)
+                except Exception:
+                    keyint_min = int(gop)
+                cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop), "-keyint_min", str(max(1, int(keyint_min)))]
+                if enc == "libx264":
+                    cmd += ["-preset", str(os.environ.get("METABONK_STREAM_X264_PRESET", "veryfast")), "-tune", "zerolatency"]
+
+            if not has_out_pix_fmt:
+                cmd += ["-pix_fmt", "yuv420p"]
+
+            if extra_out:
+                cmd += extra_out.split()
+
+            cmd += _ffmpeg_cfr_args()
+
+            if container == "h264":
+                # Raw Annex-B elementary stream (for FIFO/go2rtc).
+                # Ensure parameter sets (SPS/PPS) are present at keyframes so late-joining
+                # consumers (go2rtc/WebRTC) can start decoding quickly.
+                if codec == "h264":
+                    cmd += ["-bsf:v", "dump_extra"]
+                cmd += ["-f", "h264", "-flush_packets", "1", "pipe:1"]
+            elif container == "mpegts":
+                cmd += ["-f", "mpegts", "-flush_packets", "1", "pipe:1"]
+            else:
+                # Fragmented MP4 for MSE in the dev UI.
+                movflags = os.environ.get(
+                    "METABONK_FFMPEG_MOVFLAGS",
+                    "frag_keyframe+empty_moov+default_base_moof",
+                )
+                cmd += [
+                    "-f",
+                    "mp4",
+                    "-movflags",
+                    movflags,
+                    "-muxdelay",
+                    "0",
+                    "-muxpreload",
+                    "0",
+                    "-flush_packets",
+                    "1",
+                    "pipe:1",
+                ]
+
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
             )
-            cmd += ["-f", "mp4", "-movflags", movflags, "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1", "pipe:1"]
 
-        p = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
-        _log_stream_event(
-            "ffmpeg_spawn",
-            encoder=enc,
-            container=container,
-            codec=codec,
-            bitrate=bitrate,
-            fps=fps,
-            gop=gop,
-            width=width,
-            height=height,
-            in_pix_fmt=str(pix_fmt or ""),
-            out_pix_fmt="user" if has_out_pix_fmt else "yuv420p",
-        )
-        self.backend = f"ffmpeg:{enc}"
-        return p
+            # If NVENC cannot initialize (common when concurrent session limits are hit), it
+            # tends to exit immediately. Detect this and fall back to the next available encoder.
+            try:
+                p.wait(timeout=0.2)
+                exited_early = True
+            except subprocess.TimeoutExpired:
+                exited_early = False
+
+            if exited_early:
+                extra = ""
+                try:
+                    if p.stderr is not None:
+                        extra = (p.stderr.read() or b"").decode("utf-8", "replace").strip()
+                except Exception:
+                    extra = ""
+                start_errors.append(f"{enc}: exited early ({p.returncode}){': ' + extra if extra else ''}")
+                try:
+                    if p.stdin:
+                        p.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    if p.stdout:
+                        p.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if p.stderr:
+                        p.stderr.close()
+                except Exception:
+                    pass
+                continue
+
+            _log_stream_event(
+                "ffmpeg_spawn",
+                encoder=enc,
+                container=container,
+                codec=codec,
+                bitrate=bitrate,
+                fps=fps,
+                gop=gop,
+                width=width,
+                height=height,
+                in_pix_fmt=str(pix_fmt or ""),
+                out_pix_fmt="user" if has_out_pix_fmt else "yuv420p",
+            )
+            self.backend = f"ffmpeg:{enc}"
+            return p
+
+        detail = "\n".join(start_errors[-10:]) if start_errors else "no encoder candidates succeeded"
+        raise RuntimeError(f"failed to start ffmpeg encoder for codec='{codec}' container='{container}':\n{detail}")
 
     @staticmethod
     def _normalize_backend(name: str) -> str:

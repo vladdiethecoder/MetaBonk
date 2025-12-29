@@ -3074,6 +3074,47 @@ if app:
             out[wid] = _with_sponsor_fields(hb).model_dump()
         return out
 
+    @app.get("/api/diagnostics/stream-quality")
+    def stream_quality_diagnostics():
+        """Return stream-quality diagnostics for all workers (best-effort).
+
+        This endpoint is intended for fast triage when feeds look wrong:
+        - confirms the Synthetic Eye source resolution
+        - confirms derived spectator/obs resolutions
+        - surfaces encoder/backend selection and recent streamer errors
+        """
+        _prune_stale_workers()
+        out: dict[str, dict] = {}
+        for wid, hb in workers.items():
+            d = _with_sponsor_fields(hb).model_dump()
+            src_w = d.get("spectator_src_width") or d.get("pixel_src_width")
+            src_h = d.get("spectator_src_height") or d.get("pixel_src_height")
+            spec_w = d.get("spectator_width")
+            spec_h = d.get("spectator_height")
+            obs_w = d.get("pixel_obs_width") or d.get("obs_width")
+            obs_h = d.get("pixel_obs_height") or d.get("obs_height")
+            try:
+                aspect = float(src_w) / float(src_h) if src_w and src_h else None
+            except Exception:
+                aspect = None
+            out[str(wid)] = {
+                "worker_id": str(wid),
+                "source_resolution": f"{int(src_w)}x{int(src_h)}" if src_w and src_h else None,
+                "spectator_resolution": f"{int(spec_w)}x{int(spec_h)}" if spec_w and spec_h else None,
+                "obs_resolution": f"{int(obs_w)}x{int(obs_h)}" if obs_w and obs_h else None,
+                "source_aspect": (round(float(aspect or 0.0), 4) if aspect else None),
+                "stream_backend": d.get("stream_backend"),
+                "streamer_last_error": d.get("streamer_last_error"),
+                "nvenc_sessions_used": d.get("nvenc_sessions_used"),
+                "stream_url": d.get("stream_url"),
+                "control_url": d.get("control_url"),
+                "featured_slot": d.get("featured_slot"),
+                "featured_role": d.get("featured_role"),
+                "pipewire_node": d.get("pipewire_node"),
+                "pipewire_node_ok": d.get("pipewire_node_ok"),
+            }
+        return out
+
     @app.get("/leaderboard/historic")
     def leaderboard_historic(limit: int = 20, sort: str = "best_score"):
         """Historic per-instance leaderboard that persists across restarts.

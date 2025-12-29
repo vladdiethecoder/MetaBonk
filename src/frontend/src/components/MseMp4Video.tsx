@@ -221,7 +221,9 @@ export default function MseMp4Video({
       if (!sb || sb.updating) return;
       try {
         const t = el.currentTime;
-        if (t > 15) sb.remove(0, t - 10);
+        // Keep a small rolling buffer to avoid MSE memory bloat on long runs.
+        // Removing behind `currentTime` is safer than trimming based on buffered end.
+        if (t > 8) sb.remove(0, Math.max(0, t - 5));
       } catch {
         // ignore
       }
@@ -285,7 +287,7 @@ export default function MseMp4Video({
                   return;
                 }
                 sb = ms.addSourceBuffer(`video/mp4; codecs="${picked}"`);
-                sb.mode = "segments";
+                sb.mode = "sequence";
                 sb.addEventListener("updateend", () => {
                   pump();
                   trim();
