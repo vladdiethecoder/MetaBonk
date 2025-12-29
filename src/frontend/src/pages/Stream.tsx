@@ -620,8 +620,11 @@ function StreamTile({
   const metaUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/stream_meta.json` : "";
   const go2rtcBase = String((w as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
-  const strictStreaming =
+  const strictZeroCopy =
     Boolean((w as any)?.stream_require_zero_copy) || String((import.meta as any)?.env?.VITE_STRICT_STREAMING ?? "") === "1";
+  const backend = String((w as any)?.stream_backend ?? "").trim().toLowerCase();
+  const mp4AllowedInStrict = !strictZeroCopy || backend.startsWith("gst") || backend.includes("cuda_appsrc");
+  const forceWebRtc = strictZeroCopy && !mp4AllowedInStrict;
   const effectiveGo2rtcBase = go2rtcBase;
   const effectiveGo2rtcName = go2rtcName || w?.instance_id || "omega-0";
   const useGo2rtc = Boolean(effectiveGo2rtcBase && effectiveGo2rtcName);
@@ -636,7 +639,7 @@ function StreamTile({
   const hype = String((w as any)?.hype_label ?? "");
   const shame = String((w as any)?.shame_label ?? "");
   const showLabels = Boolean(focused);
-  const noFeed = !useGo2rtc && (strictStreaming || !streamUrl || !isVideo);
+  const noFeed = !useGo2rtc && ((!streamUrl || !isVideo) || (strictZeroCopy && !mp4AllowedInStrict));
   let lastFrameAgeS: number | null = null;
   try {
     const raw = Number(w?.stream_last_frame_ts ?? 0);
@@ -743,7 +746,7 @@ function StreamTile({
           <div className="holo-r3f">
             <HoloStreamCanvas
               videoEl={videoEl}
-              fallbackUrl={!strictStreaming ? frameUrl || undefined : undefined}
+              fallbackUrl={!strictZeroCopy ? frameUrl || undefined : undefined}
               surprise={surprise}
               glitch={glitch}
             />
@@ -766,20 +769,20 @@ function StreamTile({
             </div>
           </>
         ) : null}
-        {useGo2rtc && (!preferMp4Fallback || strictStreaming) ? (
+        {useGo2rtc && (!preferMp4Fallback || forceWebRtc) ? (
           <Go2rtcWebRTC
             baseUrl={effectiveGo2rtcBase}
             streamName={effectiveGo2rtcName}
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
             onStatus={(st) => {
-              if (strictStreaming) return;
               if (st === "playing") {
                 webrtcErrorTsRef.current = null;
                 if (preferMp4Fallback) setPreferMp4Fallback(false);
                 return;
               }
               if (st !== "error") return;
+              if (strictZeroCopy && !mp4AllowedInStrict) return;
               const now = Date.now();
               const since = webrtcErrorTsRef.current ?? now;
               if (webrtcErrorTsRef.current == null) webrtcErrorTsRef.current = now;
@@ -789,14 +792,14 @@ function StreamTile({
             debugHud={DEBUG_HUD}
             embedUrl={go2rtcEmbedUrl || undefined}
             embedOnError={DEBUG_ON}
-            fallbackJpegUrl={!strictStreaming ? frameUrl || undefined : undefined}
+            fallbackJpegUrl={!strictZeroCopy ? frameUrl || undefined : undefined}
           />
         ) : null}
-        {!useGo2rtc && !strictStreaming && streamUrl && isVideo ? (
+        {!useGo2rtc && streamUrl && isVideo && (!strictZeroCopy || mp4AllowedInStrict) ? (
           <MseMp4Video
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             url={streamUrl}
-            fallbackUrl={!strictStreaming ? frameUrl || undefined : undefined}
+            fallbackUrl={!strictZeroCopy ? frameUrl || undefined : undefined}
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
             epoch={w?.stream_epoch ?? null}
             metaUrl={metaUrl || undefined}
@@ -805,7 +808,7 @@ function StreamTile({
             debugHud={DEBUG_HUD}
           />
         ) : null}
-        {useGo2rtc && !strictStreaming && preferMp4Fallback && streamUrl && isVideo ? (
+        {useGo2rtc && preferMp4Fallback && streamUrl && isVideo && (!strictZeroCopy || mp4AllowedInStrict) ? (
           <MseMp4Video
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             url={streamUrl}

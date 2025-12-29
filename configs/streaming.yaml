@@ -8,6 +8,7 @@ profiles:
       gop: 60
       max_clients: 3
       nvenc_max_sessions: 0
+      allow_cpu_fallback: false
       pipewire_fastpath: true
       gst_use_cuda_upload: false
     fifo:
@@ -65,6 +66,31 @@ profiles:
       pipewire_fastpath: true
       gst_use_cuda_upload: true
       max_clients: 2
+      nvenc_max_sessions: 2
+      gop: 60
+    fifo:
+      enabled: true
+      container: mpegts
+      dir: temp/streams
+    go2rtc:
+      enabled: true
+      url: http://127.0.0.1:1984
+      mode: fifo
+
+  # RTX 5090 / GeForce-style NVENC caps:
+  # - prefer go2rtc/WebRTC for distribution
+  # - allow CPU encoder fallback when NVENC sessions are exhausted (enables many concurrent streams)
+  # NOTE: this relaxes strict GPU-only streaming; use only when you explicitly need >2 streams.
+  rtx5090_webrtc_8:
+    streaming:
+      backend: auto
+      container: mpegts
+      allow_gst_mp4: true
+      require_zero_copy: false
+      allow_cpu_fallback: true
+      pipewire_fastpath: true
+      gst_use_cuda_upload: true
+      max_clients: 3
       nvenc_max_sessions: 2
       gop: 60
     fifo:

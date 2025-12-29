@@ -15,6 +15,26 @@ type HudSample = {
   packetsLost?: number | null;
 };
 
+function normalizeGo2rtcBaseUrl(baseUrl: string): string {
+  const raw = String(baseUrl ?? "").trim();
+  if (!raw) return "";
+  const base = raw.replace(/\/+$/, "");
+  if (base.startsWith("/")) return base;
+  if (typeof window === "undefined") return base;
+
+  try {
+    const u = new URL(base);
+    const host = u.hostname.toLowerCase();
+    const port = u.port;
+    const wHost = window.location.hostname.toLowerCase();
+    const local = new Set(["localhost", "127.0.0.1", "::1"]);
+    const sameHost = host === wHost || (local.has(host) && local.has(wHost));
+    if (sameHost && port === "1984") return "/go2rtc";
+  } catch {}
+
+  return base;
+}
+
 function waitIceComplete(pc: RTCPeerConnection, timeoutMs: number): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
@@ -198,7 +218,7 @@ export default function Go2rtcWebRTC({
         await pc.setLocalDescription(offer);
         await waitIceComplete(pc, 2000);
         const localSdp = pc.localDescription?.sdp || offer.sdp || "";
-        const apiBase = baseUrl.replace(/\/+$/, "");
+        const apiBase = normalizeGo2rtcBaseUrl(baseUrl);
         const url = `${apiBase}/api/webrtc?src=${encodeURIComponent(streamName)}`;
         const resp = await fetch(url, {
           method: "POST",

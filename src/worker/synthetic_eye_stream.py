@@ -75,6 +75,9 @@ class SyntheticEyeStream:
         self.frames_ok: int = 0
         self.frames_dropped: int = 0
         self.resets: int = 0
+        self._frame_times: Deque[float] = deque(maxlen=240)
+        self.frames_fps: float = 0.0
+        self.last_frame_ts: float = 0.0
 
     def request_frame(self) -> bool:
         """Request the next frame from the compositor (lock-step mode).
@@ -138,11 +141,18 @@ class SyntheticEyeStream:
 
     def dmabuf_stats(self) -> dict:
         """Mirror CaptureStream.dmabuf_stats() shape (best-effort)."""
+        now = time.time()
         out = {
             "synthetic_eye": True,
             "frames_ok": int(self.frames_ok),
             "frames_dropped": int(self.frames_dropped),
             "resets": int(self.resets),
+            "frames_fps": float(self.frames_fps or 0.0),
+            "last_frame_ts": float(self.last_frame_ts or 0.0),
+            "last_frame_age_ms": float(max(0.0, (now - float(self.last_frame_ts or 0.0))) * 1000.0)
+            if self.last_frame_ts
+            else None,
+            "queue_len": int(len(self._frames)),
             "last_error": self.last_error,
             "last_error_ts": float(self.last_error_ts or 0.0),
             "last_reset_ts": float(self.last_reset_ts or 0.0),
@@ -237,6 +247,21 @@ class SyntheticEyeStream:
             release_fence_fd=int(fr.release_fence_fd),
             timestamp=time.time(),
         )
+
+        # Update ingest FPS stats (rolling window).
+        try:
+            ts = float(out.timestamp or 0.0) or time.time()
+        except Exception:
+            ts = time.time()
+        try:
+            self._frame_times.append(ts)
+            self.last_frame_ts = float(ts)
+            if len(self._frame_times) >= 2:
+                dt = float(self._frame_times[-1]) - float(self._frame_times[0])
+                if dt > 0:
+                    self.frames_fps = float((len(self._frame_times) - 1) / dt)
+        except Exception:
+            pass
         # Ownership transfer: close the remaining fds we don't keep (other planes).
         try:
             # Close dmabuf fds other than the one we kept, plus avoid double-close of fence fds.

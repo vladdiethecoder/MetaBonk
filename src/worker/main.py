@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 from .trainer import Trainer
 from .perception import construct_observation
 from .rollout import LearnerClient, RolloutBuffer, PixelRolloutBuffer
-from .nvenc_streamer import NVENCConfig, NVENCStreamer, PixelFrame
+from .nvenc_streamer import NVENCConfig, NVENCStreamer, PixelFrame, CudaFrame
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
 from .stream_health import jpeg_luma_variance
@@ -618,6 +618,13 @@ class WorkerService:
         )
         self._reward_hit_once = os.environ.get("METABONK_REWARD_HIT_ONCE", "1") in ("1", "true", "True")
         self._gameplay_hit_saved = False
+        # Synthetic Eye streaming: optionally cache a full-res CUDA frame for the NVENC path.
+        # This must remain GPU-resident (no CPU fallbacks) and may be consumed by the
+        # Synthetic Eye GStreamer/NVENC streamer backend.
+        self._latest_spectator_cuda = None
+        self._latest_spectator_cuda_frame_id = None
+        self._latest_spectator_cuda_ts = 0.0
+        self._latest_spectator_cuda_src_size = None
         self._gameplay_hit_frame_path = os.environ.get(
             "METABONK_GAMEPLAY_HIT_FRAME_PATH", str(Path("temp") / "gameplay_hits")
         )
@@ -1065,6 +1072,9 @@ class WorkerService:
             "yes",
             "on",
         )
+        sb = str(os.environ.get("METABONK_STREAM_BACKEND", "auto") or "").strip().lower()
+        self._stream_backend = "ffmpeg" if sb == "obs" else sb
+        self._stream_wants_cuda_frames = self._stream_backend in ("cuda_appsrc", "synthetic_eye", "eye", "cuda")
         # When FIFO/go2rtc is enabled we generally need at least 2 stream clients:
         # - one for the browser MP4 endpoint (/stream.mp4) used by the dev UI / warmup probes
         # - one for the FIFO publisher feeding go2rtc
@@ -1087,21 +1097,12 @@ class WorkerService:
         # No MJPEG/CPU streaming fallback is allowed in this mode.
         require_raw = os.environ.get("METABONK_REQUIRE_PIPEWIRE_STREAM")
         self._require_pipewire_stream = str(require_raw or "1") in ("1", "true", "True")
-        try:
-            sb = str(os.environ.get("METABONK_STREAM_BACKEND", "auto") or "").strip().lower()
-            if sb == "obs":
-                sb = "ffmpeg"
-            if sb == "x11grab":
-                # x11grab is explicitly non-PipeWire capture; don't gate startup on PipeWire discovery.
-                self._require_pipewire_stream = False
-        except Exception:
-            pass
-        if (
-            require_raw is None
-            and not bool(getattr(self, "_stream_require_zero_copy", False))
-            and self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
-        ):
-            # Synthetic Eye doesn't rely on PipeWire for observations; avoid gating health on it by default.
+        if self._stream_backend == "x11grab":
+            # x11grab is explicitly non-PipeWire capture; don't gate startup on PipeWire discovery.
+            self._require_pipewire_stream = False
+        if require_raw is None and self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            # Synthetic Eye doesn't rely on PipeWire for observations; avoid gating stream readiness on it by default.
+            # In strict zero-copy runs, streaming can be provided via the Synthetic Eye CUDA appsrc backend.
             self._require_pipewire_stream = False
         self._pipewire_node_ok = False
         self._pipewire_node = os.environ.get("PIPEWIRE_NODE")
@@ -1361,9 +1362,22 @@ class WorkerService:
         # Back-compat: "obs" means "use OBS-like ffmpeg encoder selection" (no OBS required).
         if backend == "obs":
             backend = "ffmpeg"
-        if backend and backend not in ("gst", "gstreamer", "gst-launch", "ffmpeg", "x11grab", "auto", "pixel_obs", "pixels"):
+        if backend and backend not in (
+            "gst",
+            "gstreamer",
+            "gst-launch",
+            "ffmpeg",
+            "x11grab",
+            "auto",
+            "pixel_obs",
+            "pixels",
+            "cuda_appsrc",
+            "cuda",
+            "eye",
+            "synthetic_eye",
+        ):
             self._stream_error = (
-                f"unsupported stream backend '{backend}' (expected auto|gst|ffmpeg|x11grab|pixel_obs|obs)"
+                f"unsupported stream backend '{backend}' (expected auto|gst|cuda_appsrc|ffmpeg|x11grab|pixel_obs|obs)"
             )
             return
         node = None
@@ -1382,11 +1396,15 @@ class WorkerService:
                     pass
         try:
             pixel_provider = None
+            cuda_provider = None
             if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
-                # Prefer a dedicated spectator frame path (16:9, higher-res). This avoids
-                # streaming the agent's square pixel_obs tensor, which leads to black bars
-                # and illegible streams when upscaled to 1080p.
-                pixel_provider = self._get_latest_spectator_stream_frame
+                # Prefer the GPU-resident Synthetic Eye frame path when available.
+                # This avoids the ffmpeg/rawvideo pixel_obs path (CPU + NVENC fragility) and keeps
+                # the spectator tiles readable (true spectator surface, not upscaled obs).
+                cuda_provider = self._get_latest_spectator_cuda_frame
+                # Keep the CPU pixel provider only as a non-strict fallback/debug hook.
+                if not bool(getattr(self, "_stream_require_zero_copy", False)):
+                    pixel_provider = self._get_latest_spectator_stream_frame
             scfg = NVENCConfig(
                 pipewire_node=node,
                 codec=os.environ.get("METABONK_STREAM_CODEC", "h264"),
@@ -1398,7 +1416,10 @@ class WorkerService:
                 tune=str(os.environ.get("METABONK_STREAM_TUNE", "ll") or "ll"),
                 container=os.environ.get("METABONK_STREAM_CONTAINER", "mp4"),
                 pixel_frame_provider=pixel_provider,
+                cuda_frame_provider=cuda_provider,
             )
+            if cuda_provider is not None:
+                self._stream_wants_cuda_frames = True
             try:
                 self._stream_epoch = int(getattr(self, "_stream_epoch", 0) or 0) + 1
             except Exception:
@@ -1949,11 +1970,20 @@ class WorkerService:
                                                         offset_bytes=offset_bytes,
                                                         stream=h.stream,
                                                         sync=False,
+                                                        pack=True,
                                                     )
                                                     raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
                                                     if bool(getattr(self, "_synthetic_eye_vflip", False)):
                                                         try:
                                                             raw_tensor = raw_tensor.flip(0)
+                                                        except Exception:
+                                                            pass
+                                                    raw_tensor_for_stream = None
+                                                    if want_spectator_update and self._should_cache_synthetic_eye_cuda_stream_frame():
+                                                        raw_tensor_for_stream = raw_tensor
+                                                        try:
+                                                            if hasattr(raw_tensor_for_stream, "is_contiguous") and not raw_tensor_for_stream.is_contiguous():
+                                                                raw_tensor_for_stream = raw_tensor_for_stream.contiguous()
                                                         except Exception:
                                                             pass
                                                     obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
@@ -1965,11 +1995,20 @@ class WorkerService:
                                                     stride_bytes=frame.stride,
                                                     offset_bytes=offset_bytes,
                                                     stream=h.stream,
+                                                    pack=True,
                                                 )
                                                 raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
                                                 if bool(getattr(self, "_synthetic_eye_vflip", False)):
                                                     try:
                                                         raw_tensor = raw_tensor.flip(0)
+                                                    except Exception:
+                                                        pass
+                                                raw_tensor_for_stream = None
+                                                if want_spectator_update and self._should_cache_synthetic_eye_cuda_stream_frame():
+                                                    raw_tensor_for_stream = raw_tensor
+                                                    try:
+                                                        if hasattr(raw_tensor_for_stream, "is_contiguous") and not raw_tensor_for_stream.is_contiguous():
+                                                            raw_tensor_for_stream = raw_tensor_for_stream.contiguous()
                                                     except Exception:
                                                         pass
                                                 obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
@@ -2018,7 +2057,7 @@ class WorkerService:
                                                 obs_small = None
                                                 spectator_small = None
 
-                                            if obs_small is not None or spectator_small is not None:
+                                            if obs_small is not None or spectator_small is not None or raw_tensor_for_stream is not None:
                                                 with self._pixel_lock:
                                                     if obs_small is not None:
                                                         self._latest_pixel_obs = obs_small
@@ -2049,6 +2088,12 @@ class WorkerService:
                                                         except Exception:
                                                             self._latest_spectator_src_size = None
                                                         self._spectator_last_emit_ts = float(ts)
+                                                    if raw_tensor_for_stream is not None:
+                                                        # Full-res CUDA frame cache for Synthetic Eye NVENC streaming.
+                                                        self._latest_spectator_cuda = raw_tensor_for_stream
+                                                        self._latest_spectator_cuda_frame_id = int(frame.frame_id)
+                                                        self._latest_spectator_cuda_ts = float(ts)
+                                                        self._latest_spectator_cuda_src_size = (int(frame.width), int(frame.height))
 
                                             # One-shot quality debug log (source + derived products).
                                             if not hasattr(self, "_logged_quality_debug"):
@@ -2471,6 +2516,77 @@ class WorkerService:
             ts = float(getattr(self, "_latest_spectator_ts", 0.0) or 0.0)
             src_size = getattr(self, "_latest_spectator_src_size", None)
         return obs, frame_id, ts, src_size
+
+    def _should_cache_synthetic_eye_cuda_stream_frame(self) -> bool:
+        if self._frame_source not in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            return False
+        if not bool(getattr(self, "_stream_enabled", False)):
+            return False
+        if bool(getattr(self, "_capture_disabled", False)):
+            return False
+        if bool(getattr(self, "_fifo_stream_enabled", False)):
+            return True
+        s = getattr(self, "streamer", None)
+        if s is not None:
+            try:
+                if hasattr(s, "active_clients") and int(s.active_clients() or 0) > 0:
+                    return True
+            except Exception:
+                pass
+        # If the configured backend is explicitly CUDA-based, keep a hot cache so the first
+        # viewer gets an init segment + IDR quickly without waiting for a slow path.
+        if bool(getattr(self, "_stream_wants_cuda_frames", False)) or bool(getattr(self, "_stream_require_zero_copy", False)):
+            return s is not None
+        return False
+
+    def _get_latest_spectator_cuda_frame(self) -> Optional[CudaFrame]:
+        """Return the latest full-res Synthetic Eye frame as a CUDA tensor (best-effort)."""
+        if self._frame_source not in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+            return None
+        try:
+            lock = getattr(self, "_pixel_lock", None)
+        except Exception:
+            lock = None
+        if lock is None:
+            return None
+        with lock:
+            t = getattr(self, "_latest_spectator_cuda", None)
+            frame_id = getattr(self, "_latest_spectator_cuda_frame_id", None)
+            ts = float(getattr(self, "_latest_spectator_cuda_ts", 0.0) or 0.0)
+            src_size = getattr(self, "_latest_spectator_cuda_src_size", None)
+            stream_ptr = int(getattr(self, "_synthetic_eye_cu_stream_ptr", 0) or 0)
+        if t is None:
+            return None
+        try:
+            import torch  # type: ignore
+
+            if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda") and stream_ptr:
+                ext = torch.cuda.ExternalStream(int(stream_ptr))
+                torch.cuda.current_stream(device=ext.device).wait_stream(ext)
+        except Exception:
+            pass
+        try:
+            w, h = (int(src_size[0]), int(src_size[1])) if isinstance(src_size, tuple) and len(src_size) >= 2 else (0, 0)
+        except Exception:
+            w, h = (0, 0)
+        if w <= 0 or h <= 0:
+            try:
+                shape = getattr(t, "shape", None)
+                if shape is not None and len(shape) >= 2:
+                    h = int(shape[0])
+                    w = int(shape[1])
+            except Exception:
+                w, h = (0, 0)
+        if w <= 0 or h <= 0:
+            return None
+        return CudaFrame(
+            tensor=t,
+            width=w,
+            height=h,
+            frame_id=int(frame_id) if frame_id is not None else None,
+            timestamp=float(ts or time.time()),
+            format="RGBA",
+        )
 
     def _get_latest_spectator_stream_frame(self) -> Optional[PixelFrame]:
         """Return the latest spectator frame as raw RGB24 bytes (best-effort)."""
@@ -3590,6 +3706,68 @@ class WorkerService:
         except Exception:
             return None
 
+    def _find_confirm_button_rect(
+        self, payload: bytes
+    ) -> Optional[tuple[float, float, float, List[tuple[int, int, int, int, float]], tuple[int, int, int, int]]]:
+        if not payload:
+            return None
+        try:
+            import cv2
+            import numpy as np
+
+            img = cv2.imdecode(np.frombuffer(payload, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                return None
+            h, w = img.shape[:2]
+
+            def _scan(rx0f: float, rx1f: float, ry0f: float, ry1f: float, *, require_center: bool = False):
+                rx0 = int(w * rx0f)
+                rx1 = int(w * rx1f)
+                ry0 = int(h * ry0f)
+                ry1 = int(h * ry1f)
+                rx1 = max(rx1, rx0 + 1)
+                ry1 = max(ry1, ry0 + 1)
+                roi = img[ry0:ry1, rx0:rx1]
+                roi_h, roi_w = roi.shape[:2]
+                roi_area = float(max(1, roi_h * roi_w))
+                edges = cv2.Canny(roi, 50, 150)
+                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                candidates: List[tuple[int, int, int, int, float]] = []
+                for cnt in contours:
+                    x, y, cw, ch = cv2.boundingRect(cnt)
+                    if ch <= 0 or cw <= 0:
+                        continue
+                    area = float(cw * ch)
+                    frac = area / roi_area
+                    # Confirm buttons are medium sized and wide; exclude huge panels and tiny glyphs.
+                    if frac < 0.004 or frac > 0.18:
+                        continue
+                    aspect = float(cw) / float(ch)
+                    if aspect < 1.8 or aspect > 10.0:
+                        continue
+                    # Exclude extremely thin lines; UI buttons tend to be reasonably tall.
+                    if float(ch) < 0.05 * float(roi_h):
+                        continue
+                    ax = rx0 + x
+                    ay = ry0 + y
+                    candidates.append((ax, ay, cw, ch, frac))
+                if not candidates:
+                    return None
+                # Prefer lowest button in the region (common for CONFIRM), then larger.
+                candidates.sort(key=lambda r: (-r[1], -r[4]))
+                best = candidates[0]
+                cx = float(best[0] + best[2] * 0.5)
+                cy = float(best[1] + best[3] * 0.5)
+                return best[4], cx, cy, candidates, (rx0, ry0, rx1, ry1)
+
+            # Prefer the right-side panel region (character/map selection), fallback to centered bottom (warnings).
+            res = _scan(0.55, 0.97, 0.42, 0.95)
+            if res is None:
+                res = _scan(0.30, 0.70, 0.45, 0.95)
+            return res
+        except Exception:
+            return None
+
     def _find_play_button_rect(
         self, payload: bytes
     ) -> Optional[tuple[float, float, float, List[tuple[int, int, int, int, float]], tuple[int, int, int, int]]]:
@@ -3612,25 +3790,36 @@ class WorkerService:
                 rx1 = max(rx1, rx0 + 1)
                 ry1 = max(ry1, ry0 + 1)
                 roi = img[ry0:ry1, rx0:rx1]
-                roi_area = float(max(1, roi.shape[0] * roi.shape[1]))
+                roi_h, roi_w = roi.shape[:2]
+                roi_area = float(max(1, roi_h * roi_w))
                 edges = cv2.Canny(roi, 50, 150)
                 contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 candidates: List[tuple[int, int, int, int, float]] = []
                 for cnt in contours:
                     x, y, cw, ch = cv2.boundingRect(cnt)
-                    area = float(cw * ch)
-                    if area < 0.006 * roi_area:
+                    if ch <= 0 or cw <= 0:
                         continue
-                    if ch <= 0:
+                    area = float(cw * ch)
+                    frac = area / roi_area
+                    # The main menu has many large panels (title/leaderboard). We're trying
+                    # to find the smaller "PLAY" button in the central stack.
+                    if frac < 0.008 or frac > 0.16:
                         continue
                     aspect = float(cw) / float(ch)
-                    if aspect < 1.6:
+                    if aspect < 2.0 or aspect > 10.0:
+                        continue
+                    if float(ch) < 0.05 * float(roi_h):
                         continue
                     ax = rx0 + x
                     ay = ry0 + y
-                    candidates.append((ax, ay, cw, ch, area / roi_area))
+                    if require_center:
+                        cx_abs = float(ax) + float(cw) * 0.5
+                        if abs(cx_abs - (float(w) * 0.5)) > (float(w) * 0.14):
+                            continue
+                    candidates.append((ax, ay, cw, ch, frac))
                 if not candidates:
                     return None
+                # Prefer the highest button within the stack (PLAY is above UNLOCKS/QUESTS/SHOP).
                 candidates.sort(key=lambda r: (r[1], -r[4]))
                 best = candidates[0]
                 cx = float(best[0] + best[2] * 0.5)
@@ -3638,9 +3827,10 @@ class WorkerService:
                 return best[4], cx, cy, candidates, (rx0, ry0, rx1, ry1)
 
             # Prefer the centered "stack of buttons" region first; fallback to left column.
-            res = _scan(0.28, 0.78, 0.18, 0.80)
+            # Start lower to avoid matching the big title header.
+            res = _scan(0.28, 0.78, 0.34, 0.86, require_center=True)
             if res is None:
-                res = _scan(0.05, 0.45, 0.20, 0.85)
+                res = _scan(0.12, 0.62, 0.34, 0.90, require_center=True)
             return res
         except Exception as exc:
             if not self._menu_teacher_play_rect_warned:
@@ -5916,6 +6106,11 @@ class WorkerService:
                     ):
                         match = self._match_confirm_template(latest_image_bytes)
                         if not match:
+                            rect = self._find_confirm_button_rect(latest_image_bytes)
+                            if rect is not None:
+                                score, cx, cy, _, _ = rect
+                                match = (score, cx, cy)
+                        if not match:
                             self._menu_teacher_confirm_pending = False
                             self._menu_teacher_confirm_wait_until_ts = 0.0
                         else:
@@ -7711,8 +7906,30 @@ if app:
         if getattr(service.streamer, "is_busy", None) and service.streamer.is_busy():
             raise HTTPException(status_code=429, detail="stream busy")
         from fastapi.responses import StreamingResponse
+        from src.worker.nvenc_session_manager import try_acquire_nvenc_slot
 
-        gen = service.streamer.iter_chunks(container="mpegts")
+        allow_cpu = str(os.environ.get("METABONK_STREAM_ALLOW_CPU_FALLBACK", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        lease = None if allow_cpu else try_acquire_nvenc_slot(timeout_s=0.0, enforce_nvml=True)
+        if (
+            lease is None
+            and not allow_cpu
+            and str(os.environ.get("METABONK_NVENC_MAX_SESSIONS", "0") or "0").strip() not in ("0", "")
+        ):
+            raise HTTPException(status_code=503, detail="NVENC session limit reached")
+
+        def _gen():
+            try:
+                yield from service.streamer.iter_chunks(container="mpegts")
+            finally:
+                if lease is not None:
+                    lease.release()
+
+        gen = _gen()
         return StreamingResponse(
             gen,
             media_type="video/MP2T",
@@ -7734,8 +7951,30 @@ if app:
         if getattr(service.streamer, "is_busy", None) and service.streamer.is_busy():
             raise HTTPException(status_code=429, detail="stream busy")
         from fastapi.responses import StreamingResponse
+        from src.worker.nvenc_session_manager import try_acquire_nvenc_slot
 
-        gen = service.streamer.iter_chunks(container="mp4")
+        allow_cpu = str(os.environ.get("METABONK_STREAM_ALLOW_CPU_FALLBACK", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        lease = None if allow_cpu else try_acquire_nvenc_slot(timeout_s=0.0, enforce_nvml=True)
+        if (
+            lease is None
+            and not allow_cpu
+            and str(os.environ.get("METABONK_NVENC_MAX_SESSIONS", "0") or "0").strip() not in ("0", "")
+        ):
+            raise HTTPException(status_code=503, detail="NVENC session limit reached")
+
+        def _gen():
+            try:
+                yield from service.streamer.iter_chunks(container="mp4")
+            finally:
+                if lease is not None:
+                    lease.release()
+
+        gen = _gen()
         return StreamingResponse(
             gen,
             media_type="video/mp4",

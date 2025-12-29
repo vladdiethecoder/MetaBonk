@@ -551,6 +551,41 @@ def _probe_gst_encoder(gst_inspect: str, enc: str) -> Optional[str]:
     return None
 
 
+def _auto_nvenc_max_sessions(env: Dict[str, str]) -> Optional[int]:
+    """Best-effort default for consumer NVENC session limits.
+
+    MetaBonk is GPU-only; however, consumer GeForce GPUs often enforce a 2-3 session
+    cap in NVENC firmware. Default to a conservative limit unless the user explicitly
+    overrides METABONK_NVENC_MAX_SESSIONS.
+    """
+    raw = str(env.get("METABONK_NVENC_MAX_SESSIONS", "") or "").strip()
+    if raw:
+        return None
+    if str(env.get("METABONK_NVENC_LIMIT_AUTO", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        gpu_index = int(str(env.get("METABONK_NVML_GPU_INDEX", "0") or "0").strip() or "0")
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        name = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(name, bytes):
+            name_s = name.decode("utf-8", "replace")
+        else:
+            name_s = str(name)
+    except Exception:
+        return None
+    low = name_s.lower()
+    # Pro/Datacenter GPUs: effectively unlimited, don't force a limit.
+    if any(tok in low for tok in ("tesla", "quadro", "a100", "h100", "l40", "l4", "rtx a", "a40")):
+        return 0
+    # Consumer GPUs: conservative default.
+    if "geforce" in low:
+        return 2
+    return None
+
+
 def _forward_meta_events_enabled(env: Dict[str, str]) -> bool:
     return _truthy(env.get("METABONK_FORWARD_META_EVENTS", "0"))
 
@@ -988,6 +1023,11 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_BITRATE", "6M")
     env.setdefault("METABONK_STREAM_FPS", "60")
     env.setdefault("METABONK_STREAM_GOP", "60")
+    auto_nvenc = _auto_nvenc_max_sessions(env)
+    if auto_nvenc is not None:
+        env["METABONK_NVENC_MAX_SESSIONS"] = str(int(auto_nvenc))
+        if int(auto_nvenc) > 0:
+            print(f"[start_omega] INFO: defaulting METABONK_NVENC_MAX_SESSIONS={int(auto_nvenc)} (consumer NVENC limit)")
     # Local app viewing quality: upscale pixel_obs streams to 1080p unless explicitly overridden.
     # This does not affect the agent's observation tensor.
     if bool(getattr(args, "ui", True)) and not _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0")):
@@ -1079,11 +1119,11 @@ def main() -> int:
         env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
         env["METABONK_FRAME_SOURCE"] = "pipewire"
     elif use_synthetic_eye:
-        # Strict runs require DMA-BUF capture for streaming (no pixel_obs/rawvideo fallbacks).
-        # Synthetic Eye provides DMA-BUF frames but is currently a PipeWire-free compositor path,
-        # so we hard-fail if strict streaming is requested without a PipeWire capture source.
+        # Synthetic Eye compositor is PipeWire-free. In strict zero-copy runs, stream directly
+        # from the Synthetic Eye CUDA frame path (appsrc->NVENC) instead of requiring PipeWire.
         if strict_streaming:
-            env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
+            env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "0"
+            env.setdefault("METABONK_STREAM_BACKEND", "cuda_appsrc")
         else:
             env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1" if public_stream else "0"
     else:
@@ -1114,12 +1154,9 @@ def main() -> int:
         # Smithay Eye hosts XWayland directly; avoid wrapping the game in gamescope unless explicitly requested.
         env.setdefault("MEGABONK_USE_GAMESCOPE", "0")
         if strict_streaming and str(env.get("METABONK_SYNTHETIC_EYE_COMPOSITOR") or "0").strip() in ("1", "true", "True"):
-            raise SystemExit(
-                "[start_omega] ERROR: strict zero-copy streaming requires PipeWire DMA-BUF capture. "
-                "The Synthetic Eye compositor path is PipeWire-free and would force CPU/rawvideo fallbacks. "
-                "Disable the compositor (set METABONK_SYNTHETIC_EYE_COMPOSITOR=0 and use gamescope/pipewire) "
-                "or run with METABONK_STREAM_REQUIRE_ZERO_COPY=0 (not allowed for strict runs)."
-            )
+            # Ensure we stay on the GPU-only path even when the compositor is PipeWire-free.
+            env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "0")
+            env.setdefault("METABONK_STREAM_BACKEND", "cuda_appsrc")
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
     env.setdefault("METABONK_SUPERVISE_WORKERS", "1")
     if (
@@ -1593,8 +1630,16 @@ def main() -> int:
             try:
                 go2rtc_mode = str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower()
                 if go2rtc_mode == "fifo":
-                    fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
-                    env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
+                    fifo_dir_raw = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
+                    try:
+                        fifo_path = Path(fifo_dir_raw).expanduser()
+                        if not fifo_path.is_absolute():
+                            fifo_path = (repo_root / fifo_path).resolve()
+                        else:
+                            fifo_path = fifo_path.resolve()
+                        env["METABONK_STREAM_FIFO_DIR"] = str(fifo_path)
+                    except Exception:
+                        env["METABONK_STREAM_FIFO_DIR"] = fifo_dir_raw
                     env.setdefault("METABONK_FIFO_CONTAINER", "mpegts")
                     env["METABONK_FIFO_STREAM"] = "1"
                 else:
@@ -1781,6 +1826,20 @@ def main() -> int:
         seen_worker_ports: set[str] = set()
         seen_sidecar_ports: set[str] = set()
         seen_bonklink_ports: set[str] = set()
+        spawn_stagger_s = 0.0
+        try:
+            raw_stagger = str(env.get("METABONK_WORKER_SPAWN_STAGGER_S", "") or "").strip()
+            if raw_stagger:
+                spawn_stagger_s = float(raw_stagger)
+        except Exception:
+            spawn_stagger_s = 0.0
+        if spawn_stagger_s <= 0.0:
+            try:
+                max_nvenc = int(str(env.get("METABONK_NVENC_MAX_SESSIONS", "0") or "0").strip() or "0")
+            except Exception:
+                max_nvenc = 0
+            if max_nvenc > 0 and int(n_workers) > int(max_nvenc):
+                spawn_stagger_s = 0.5
         for i in range(max(0, n_workers)):
             _ram_governor_before_spawn(worker_idx=i)
             iid = f"{args.instance_prefix}-{i}"
@@ -2184,6 +2243,8 @@ def main() -> int:
                     kwargs={"worker_id": i, "instance_id": iid, "stop_event": meta_stop},
                     daemon=True,
                 ).start()
+            if spawn_stagger_s > 0 and i < (int(n_workers) - 1):
+                time.sleep(float(spawn_stagger_s))
 
         # UI (Vite)
         if bool(getattr(args, "ui", True)):

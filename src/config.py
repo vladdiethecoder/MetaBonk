@@ -51,6 +51,7 @@ class StreamingConfig:
     max_clients: int = 3
     nvenc_max_sessions: int = 0
     nvml_gpu_index: Optional[int] = None
+    allow_cpu_fallback: bool = False
     allow_gst_mp4: bool = False
     require_zero_copy: bool = False
     pipewire_fastpath: bool = True
@@ -166,6 +167,7 @@ class MetaBonkConfig:
             max_clients=int(_deep_get(merged, "streaming.max_clients", 3) or 3),
             nvenc_max_sessions=int(_deep_get(merged, "streaming.nvenc_max_sessions", 0) or 0),
             nvml_gpu_index=nvml_gpu_index,
+            allow_cpu_fallback=bool(_truthy(_deep_get(merged, "streaming.allow_cpu_fallback", False))),
             allow_gst_mp4=bool(_truthy(_deep_get(merged, "streaming.allow_gst_mp4", False))),
             require_zero_copy=bool(_truthy(_deep_get(merged, "streaming.require_zero_copy", False))),
             pipewire_fastpath=bool(_truthy(_deep_get(merged, "streaming.pipewire_fastpath", True))),
@@ -203,6 +205,7 @@ class MetaBonkConfig:
         _set("METABONK_NVENC_MAX_SESSIONS", str(int(self.streaming.nvenc_max_sessions)))
         if self.streaming.nvml_gpu_index is not None:
             _set("METABONK_NVML_GPU_INDEX", str(int(self.streaming.nvml_gpu_index)))
+        _set("METABONK_STREAM_ALLOW_CPU_FALLBACK", "1" if self.streaming.allow_cpu_fallback else "0")
         _set("METABONK_STREAM_ALLOW_GST_MP4", "1" if self.streaming.allow_gst_mp4 else "0")
         _set("METABONK_STREAM_REQUIRE_ZERO_COPY", "1" if self.streaming.require_zero_copy else "0")
         _set("METABONK_STREAM_PIPEWIRE_FASTPATH", "1" if self.streaming.pipewire_fastpath else "0")

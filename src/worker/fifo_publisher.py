@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from src.streaming.fifo import DemandPagedFifoWriter, ensure_fifo
+from src.worker.nvenc_session_manager import NVENCSessionsExhausted, try_acquire_nvenc_slot
 
 
 @dataclass
@@ -45,7 +46,24 @@ class FifoH264Publisher:
                 container = "h264"
             # Request raw Annex-B H.264 or MPEG-TS (for FIFO/go2rtc).
             # Small chunks reduce FIFO backpressure issues and avoid partial writes.
-            yield from self.streamer.iter_chunks(chunk_size=4096, container=container)
+            allow_cpu = str(os.environ.get("METABONK_STREAM_ALLOW_CPU_FALLBACK", "") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            lease = None if allow_cpu else try_acquire_nvenc_slot(timeout_s=0.0, enforce_nvml=True)
+            if (
+                lease is None
+                and not allow_cpu
+                and str(os.environ.get("METABONK_NVENC_MAX_SESSIONS", "0") or "0").strip() not in ("0", "")
+            ):
+                raise NVENCSessionsExhausted("NVENC session limit reached (FIFO stream denied)")
+            try:
+                yield from self.streamer.iter_chunks(chunk_size=4096, container=container)
+            finally:
+                if lease is not None:
+                    lease.release()
 
         w = DemandPagedFifoWriter(
             fifo_path=self.fifo_path,

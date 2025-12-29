@@ -474,7 +474,11 @@ def main() -> int:
     if str(env.get("METABONK_STREAM_REQUIRE_ZERO_COPY") or "0").strip().lower() in ("1", "true", "yes", "on"):
         sb = str(env.get("METABONK_STREAM_BACKEND") or "").strip().lower()
         if sb in ("", "auto"):
-            env["METABONK_STREAM_BACKEND"] = "gst"
+            if bool(getattr(args, "synthetic_eye", False)):
+                env["METABONK_STREAM_BACKEND"] = "cuda_appsrc"
+                env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "0"
+            else:
+                env["METABONK_STREAM_BACKEND"] = "gst"
     stream_backend = str(env.get("METABONK_STREAM_BACKEND") or "auto").strip().lower()
     if stream_backend == "x11grab":
         raise SystemExit("[start] ERROR: MetaBonk is GPU-only; x11grab is not supported (PipeWire DMA-BUF required).")
@@ -587,8 +591,16 @@ def main() -> int:
             if "--go2rtc-exec-wrapper" in argv:
                 env["METABONK_GO2RTC_EXEC_WRAPPER"] = str(args.go2rtc_exec_wrapper or "scripts/go2rtc_exec_mpegts.sh")
             if str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower() == "fifo":
-                fifo_dir = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
-                env["METABONK_STREAM_FIFO_DIR"] = fifo_dir
+                fifo_dir_raw = str(env.get("METABONK_STREAM_FIFO_DIR") or (repo_root / "temp" / "streams"))
+                try:
+                    fifo_path = Path(fifo_dir_raw).expanduser()
+                    if not fifo_path.is_absolute():
+                        fifo_path = (repo_root / fifo_path).resolve()
+                    else:
+                        fifo_path = fifo_path.resolve()
+                    env["METABONK_STREAM_FIFO_DIR"] = str(fifo_path)
+                except Exception:
+                    env["METABONK_STREAM_FIFO_DIR"] = fifo_dir_raw
                 env.setdefault("METABONK_FIFO_CONTAINER", "mpegts")
                 env.setdefault("METABONK_FIFO_STREAM", "1")
 
