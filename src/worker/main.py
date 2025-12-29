@@ -317,6 +317,10 @@ class WorkerService:
                 audit_log_path=audit_log_path,
                 audit_interval_s=audit_interval_s,
             )
+            try:
+                self._synthetic_eye_cu_stream_ptr = int(getattr(self._synthetic_eye_ingestor, "stream", 0) or 0)
+            except Exception:
+                self._synthetic_eye_cu_stream_ptr = 0
         else:
             use_dmabuf = True
             audit_log_path = os.environ.get("METABONK_DMABUF_AUDIT_LOG")
@@ -334,6 +338,7 @@ class WorkerService:
                 audit_log_path=audit_log_path,
             )
             self._synthetic_eye_ingestor = None
+            self._synthetic_eye_cu_stream_ptr = 0
         # Starting a GStreamer PipeWire capture pipeline can be fragile on some systems
         # (driver/gi/gstreamer mismatches). For stream HUD purposes we only need NVENC,
         # so keep capture opt-in and default it off.
@@ -439,6 +444,7 @@ class WorkerService:
             )
             raw_sw = os.environ.get("METABONK_SPECTATOR_W") or os.environ.get("METABONK_STREAM_SPECTATOR_W")
             raw_sh = os.environ.get("METABONK_SPECTATOR_H") or os.environ.get("METABONK_STREAM_SPECTATOR_H")
+            raw_res = os.environ.get("METABONK_SPECTATOR_RES") or os.environ.get("METABONK_STREAM_SPECTATOR_RES")
             tw = None
             th = None
             try:
@@ -450,6 +456,13 @@ class WorkerService:
             except Exception:
                 tw, th = None, None
             try:
+                if (not raw_sw or not raw_sh) and raw_res and "x" in str(raw_res).lower():
+                    try:
+                        a, b = [p.strip() for p in str(raw_res).lower().split("x", 1)]
+                        raw_sw = a
+                        raw_sh = b
+                    except Exception:
+                        pass
                 if raw_sw and raw_sh:
                     self._spectator_w = int(raw_sw)
                     self._spectator_h = int(raw_sh)
@@ -931,6 +944,8 @@ class WorkerService:
             self._input_scroll_scale = float(os.environ.get("METABONK_INPUT_SCROLL_SCALE", "3.0"))
         except Exception:
             self._input_scroll_scale = 3.0
+        # Menu bootstrapping is an explicit opt-in. Agents must learn navigation via their
+        # action space + reward shaping rather than hardcoded input scripts.
         self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "0") in ("1", "true", "True")
         self._menu_bootstrap_step = 0
         self._menu_bootstrap_next_ts = 0.0
@@ -976,9 +991,10 @@ class WorkerService:
             except Exception:
                 self._use_switching_controller = False
                 self._switching_controller = None
-        if self._use_switching_controller or self._use_vlm_menu:
-            # Disable heuristic menu bootstrapping when a VLM controller is active.
-            self._input_menu_bootstrap = False
+        # Note: we intentionally do NOT disable menu bootstrapping when a VLM controller is
+        # enabled. The rollout loop already skips bootstrapping when a menu override action
+        # was applied, and keeping bootstrapping available avoids deadlocks when menu detection
+        # fails (e.g., early photosensitivity prompt with `menu_hint=None`).
         # Optional causal Scientist for item/build discovery.
         self._use_causal_scientist = os.environ.get("METABONK_USE_CAUSAL", "0") in (
             "1",
@@ -1043,6 +1059,12 @@ class WorkerService:
             "yes",
             "on",
         )
+        self._stream_require_zero_copy = str(os.environ.get("METABONK_STREAM_REQUIRE_ZERO_COPY", "") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         # When FIFO/go2rtc is enabled we generally need at least 2 stream clients:
         # - one for the browser MP4 endpoint (/stream.mp4) used by the dev UI / warmup probes
         # - one for the FIFO publisher feeding go2rtc
@@ -1059,6 +1081,7 @@ class WorkerService:
                 os.environ["METABONK_STREAM_MAX_CLIENTS"] = "3"
         self._fifo_stream_path: Optional[str] = None
         self._fifo_publisher: Optional[FifoH264Publisher] = None
+        self._stream_epoch: int = 0
         self._stream_enabled = os.environ.get("METABONK_STREAM", "1") in ("1", "true", "True")
         # Hard requirement: when enabled, the worker must use PipeWire+NVENC for stream.
         # No MJPEG/CPU streaming fallback is allowed in this mode.
@@ -1073,7 +1096,11 @@ class WorkerService:
                 self._require_pipewire_stream = False
         except Exception:
             pass
-        if require_raw is None and self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf"):
+        if (
+            require_raw is None
+            and not bool(getattr(self, "_stream_require_zero_copy", False))
+            and self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf")
+        ):
             # Synthetic Eye doesn't rely on PipeWire for observations; avoid gating health on it by default.
             self._require_pipewire_stream = False
         self._pipewire_node_ok = False
@@ -1365,12 +1392,17 @@ class WorkerService:
                 codec=os.environ.get("METABONK_STREAM_CODEC", "h264"),
                 bitrate=os.environ.get("METABONK_STREAM_BITRATE", "6M"),
                 fps=int(os.environ.get("METABONK_STREAM_FPS", "60")),
-                gop=int(os.environ.get("METABONK_STREAM_GOP", "60")),
+                # Default GOP to 1s worth of frames (avoid long keyframe intervals when FPS is lowered).
+                gop=int(os.environ.get("METABONK_STREAM_GOP", os.environ.get("METABONK_STREAM_FPS", "60"))),
                 preset=str(os.environ.get("METABONK_STREAM_PRESET", "p4") or "p4"),
                 tune=str(os.environ.get("METABONK_STREAM_TUNE", "ll") or "ll"),
                 container=os.environ.get("METABONK_STREAM_CONTAINER", "mp4"),
                 pixel_frame_provider=pixel_provider,
             )
+            try:
+                self._stream_epoch = int(getattr(self, "_stream_epoch", 0) or 0) + 1
+            except Exception:
+                self._stream_epoch = 1
             self.streamer = NVENCStreamer(scfg)
             if self._fifo_stream_enabled and self._fifo_stream_path:
                 try:
@@ -1391,6 +1423,119 @@ class WorkerService:
             self._fifo_publisher = None
             if self._require_pipewire_stream:
                 self._stream_error = f"failed to initialize streamer ({e})"
+
+    def stream_meta(self) -> dict:
+        """Return minimal stream metadata for UI self-heal + diagnostics."""
+        out: dict = {
+            "instance_id": self.instance_id,
+            "epoch": int(getattr(self, "_stream_epoch", 0) or 0),
+            "frame_source": getattr(self, "_frame_source", None),
+            "stream_enabled": bool(getattr(self, "_stream_enabled", False)),
+            "capture_enabled": not bool(getattr(self, "_capture_disabled", False)),
+            "stream_require_pipewire": bool(getattr(self, "_require_pipewire_stream", False)),
+            "pipewire_node": os.environ.get("PIPEWIRE_NODE") or getattr(self, "_pipewire_node", None),
+            "pipewire_node_ok": bool(getattr(self, "_pipewire_node_ok", False)),
+            "requested_backend": str(os.environ.get("METABONK_STREAM_BACKEND", "auto") or "auto").strip().lower(),
+            "container": str(os.environ.get("METABONK_STREAM_CONTAINER", "mp4") or "mp4").strip().lower(),
+            "codec": str(os.environ.get("METABONK_STREAM_CODEC", "h264") or "h264").strip().lower(),
+        }
+        try:
+            out["fps"] = int(os.environ.get("METABONK_STREAM_FPS", "60") or 60)
+        except Exception:
+            out["fps"] = None
+        try:
+            out["gop"] = int(os.environ.get("METABONK_STREAM_GOP", os.environ.get("METABONK_STREAM_FPS", "60")) or 60)
+        except Exception:
+            out["gop"] = None
+        try:
+            if out.get("fps") and out.get("gop"):
+                out["keyframe_interval_s"] = float(out["gop"]) / float(out["fps"])
+        except Exception:
+            out["keyframe_interval_s"] = None
+        # Target output size (ffmpeg scaling).
+        target = str(os.environ.get("METABONK_STREAM_NVENC_TARGET_SIZE", "") or "").strip().lower()
+        if target and "x" in target:
+            try:
+                a, b = [p.strip() for p in target.split("x", 1)]
+                out["out_width"] = int(a)
+                out["out_height"] = int(b)
+            except Exception:
+                out["out_width"] = None
+                out["out_height"] = None
+        else:
+            out["out_width"] = None
+            out["out_height"] = None
+
+        # Source/derived products (best-effort).
+        try:
+            src = getattr(self, "_latest_spectator_src_size", None)
+            if isinstance(src, tuple) and len(src) >= 2:
+                out["src_width"] = int(src[0])
+                out["src_height"] = int(src[1])
+        except Exception:
+            pass
+        if out.get("src_width") is None:
+            try:
+                src = getattr(self, "_latest_pixel_src_size", None)
+                if isinstance(src, tuple) and len(src) >= 2:
+                    out["src_width"] = int(src[0])
+                    out["src_height"] = int(src[1])
+            except Exception:
+                pass
+        out.setdefault("src_width", None)
+        out.setdefault("src_height", None)
+        out["spectator_width"] = int(getattr(self, "_spectator_w", 0) or 0) if bool(getattr(self, "_spectator_enabled", False)) else None
+        out["spectator_height"] = int(getattr(self, "_spectator_h", 0) or 0) if bool(getattr(self, "_spectator_enabled", False)) else None
+        out["pixel_obs_width"] = int(getattr(self, "_pixel_obs_w", 0) or 0) if bool(getattr(self, "_pixel_obs_enabled", False)) else None
+        out["pixel_obs_height"] = int(getattr(self, "_pixel_obs_h", 0) or 0) if bool(getattr(self, "_pixel_obs_enabled", False)) else None
+        # Transform hints (explicitly metadata, not applied here).
+        out["vflip"] = bool(getattr(self, "_synthetic_eye_vflip", False))
+        out["pix_fmt_in"] = "rgb24" if self._frame_source in ("synthetic_eye", "smithay", "smithay_dmabuf") else None
+
+        # Streamer stats (best-effort).
+        out.setdefault("backend", None)
+        out.setdefault("active_clients", None)
+        out.setdefault("max_clients", None)
+        out.setdefault("last_keyframe_ts", None)
+        out.setdefault("last_chunk_ts", None)
+        out.setdefault("last_error", None)
+        out.setdefault("last_error_ts", None)
+        if self.streamer is not None:
+            try:
+                out["backend"] = getattr(self.streamer, "backend", None)
+            except Exception:
+                pass
+            try:
+                out["active_clients"] = self.streamer.active_clients() if hasattr(self.streamer, "active_clients") else None
+            except Exception:
+                pass
+            try:
+                out["max_clients"] = self.streamer.max_clients() if hasattr(self.streamer, "max_clients") else None
+            except Exception:
+                pass
+            try:
+                out["last_keyframe_ts"] = float(getattr(self.streamer, "last_keyframe_ts", 0.0) or 0.0) or None
+            except Exception:
+                pass
+            try:
+                ts = out.get("last_keyframe_ts")
+                if ts:
+                    out["last_keyframe_age_ms"] = int(max(0.0, (time.time() - float(ts)) * 1000.0))
+            except Exception:
+                out["last_keyframe_age_ms"] = None
+            try:
+                out["last_chunk_ts"] = float(getattr(self.streamer, "last_chunk_ts", 0.0) or 0.0) or None
+            except Exception:
+                pass
+            try:
+                out["last_error"] = getattr(self.streamer, "last_error", None)
+            except Exception:
+                pass
+            try:
+                out["last_error_ts"] = float(getattr(self.streamer, "last_error_ts", 0.0) or 0.0) or None
+            except Exception:
+                pass
+        return out
 
     def set_capture_enabled(self, enabled: bool) -> None:
         """Enable/disable PipeWire capture at runtime (best-effort)."""
@@ -1530,6 +1675,21 @@ class WorkerService:
         return float(r)
 
     def start(self):
+        # libxdo/xdotool require XTEST. Ensure the gamescope-spawned Xwayland is configured
+        # to export it even when the launcher doesn't explicitly set the env.
+        try:
+            backend = str(os.environ.get("METABONK_INPUT_BACKEND") or "").strip().lower()
+        except Exception:
+            backend = ""
+        if backend in ("libxdo", "xdotool", "xdo", ""):
+            try:
+                existing = str(os.environ.get("GAMESCOPE_XWAYLAND_ARGS") or "").strip()
+            except Exception:
+                existing = ""
+            if "XTEST" not in existing.upper():
+                want = "+extension XTEST"
+                os.environ["GAMESCOPE_XWAYLAND_ARGS"] = (existing + " " + want).strip() if existing else want
+
         self.launcher.launch()
         # If DISPLAY was explicitly provided (e.g., Smithay compositor.env handshake), honor it and
         # do not attempt gamescope log discovery.
@@ -1711,30 +1871,43 @@ class WorkerService:
                         and self._synthetic_eye_ingestor is not None
                     ):
                         try:
-                            # For soak runs, we disable capture/inference entirely. In that mode we
-                            # only need to prove that frames are advancing; skip CUDA fence import
-                            # to avoid churn/driver flakiness while still enforcing GPU-only DMA-BUF.
-                            if bool(getattr(self, "_capture_disabled", False)) or bool(getattr(self, "_capture_disabled_env", False)):
-                                self._synthetic_eye_ingestor.note_frame(frame)
-                            else:
-                                want_pixels = bool(getattr(self, "_pixel_obs_enabled", False))
-                                want_spectator = bool(getattr(self, "_spectator_enabled", False)) and int(
-                                    getattr(self, "_spectator_w", 0) or 0
-                                ) > 0 and int(getattr(self, "_spectator_h", 0) or 0) > 0
-                                want_spectator_update = False
-                                if want_spectator:
-                                    try:
-                                        interval = float(getattr(self, "_spectator_interval_s", 0.0) or 0.0)
-                                        last_emit = float(getattr(self, "_spectator_last_emit_ts", 0.0) or 0.0)
-                                        now_ts = time.time()
-                                        want_spectator_update = interval <= 0.0 or (now_ts - last_emit) >= float(interval) - 1e-4
-                                    except Exception:
-                                        want_spectator_update = True
-                                want_audit = (
-                                    os.environ.get("METABONK_VISION_AUDIT", "0") == "1"
-                                    and int(frame.frame_id) % 60 == 0
-                                )
-                                if want_pixels or want_audit or want_spectator_update:
+                            # Important distinction:
+                            # - `_capture_disabled` is a runtime toggle used by the orchestrator to stop
+                            #   *streaming/preview* for background workers (featured slots only).
+                            # - `_capture_disabled_env` is a "hard" disable for soak runs.
+                            #
+                            # Regardless of capture toggles, we must keep servicing acquire/release
+                            # fences (otherwise the compositor stalls and the watchdog restarts the
+                            # worker in a loop).
+                            capture_disabled = bool(getattr(self, "_capture_disabled", False))
+                            hard_disabled = bool(getattr(self, "_capture_disabled_env", False))
+
+                            # For soak runs we may "hard" disable capture/inference entirely. In that
+                            # mode we still must service fences, but we skip expensive CUDA imports.
+                            want_pixels = (not hard_disabled) and bool(getattr(self, "_pixel_obs_enabled", False))
+                            # Spectator frames are only needed when streaming is enabled for this worker.
+                            want_spectator = (
+                                (not hard_disabled)
+                                and (not capture_disabled)
+                                and bool(getattr(self, "_spectator_enabled", False))
+                                and int(getattr(self, "_spectator_w", 0) or 0) > 0
+                                and int(getattr(self, "_spectator_h", 0) or 0) > 0
+                            )
+                            want_spectator_update = False
+                            if want_spectator:
+                                try:
+                                    interval = float(getattr(self, "_spectator_interval_s", 0.0) or 0.0)
+                                    last_emit = float(getattr(self, "_spectator_last_emit_ts", 0.0) or 0.0)
+                                    now_ts = time.time()
+                                    want_spectator_update = interval <= 0.0 or (now_ts - last_emit) >= float(interval) - 1e-4
+                                except Exception:
+                                    want_spectator_update = True
+                            want_audit = (
+                                (not hard_disabled)
+                                and os.environ.get("METABONK_VISION_AUDIT", "0") == "1"
+                                and int(frame.frame_id) % 60 == 0
+                            )
+                            if want_pixels or want_audit or want_spectator_update:
                                     h = None
                                     try:
                                         h = self._synthetic_eye_ingestor.begin(frame)
@@ -1936,8 +2109,8 @@ class WorkerService:
                                     finally:
                                         if h is not None:
                                             self._synthetic_eye_ingestor.end(h)
-                                else:
-                                    self._synthetic_eye_ingestor.handshake_only(frame)
+                            else:
+                                self._synthetic_eye_ingestor.handshake_only(frame)
                             try:
                                 ts = float(getattr(frame, "timestamp", 0.0) or 0.0) or time.time()
                                 self._latest_frame_ts = ts
@@ -2339,7 +2512,16 @@ class WorkerService:
                 pass
             try:
                 if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
-                    t = t.to(device="cpu", non_blocking=True)
+                    try:
+                        import torch  # type: ignore
+
+                        stream_ptr = int(getattr(self, "_synthetic_eye_cu_stream_ptr", 0) or 0)
+                        if stream_ptr:
+                            ext = torch.cuda.ExternalStream(int(stream_ptr))
+                            torch.cuda.current_stream(device=ext.device).wait_stream(ext)
+                    except Exception:
+                        pass
+                    t = t.cpu()
                 elif hasattr(t, "cpu"):
                     t = t.cpu()
             except Exception:
@@ -2420,7 +2602,16 @@ class WorkerService:
                 pass
             try:
                 if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
-                    t = t.to(device="cpu", non_blocking=True)
+                    try:
+                        import torch  # type: ignore
+
+                        stream_ptr = int(getattr(self, "_synthetic_eye_cu_stream_ptr", 0) or 0)
+                        if stream_ptr:
+                            ext = torch.cuda.ExternalStream(int(stream_ptr))
+                            torch.cuda.current_stream(device=ext.device).wait_stream(ext)
+                    except Exception:
+                        pass
+                    t = t.cpu()
                 elif hasattr(t, "cpu"):
                     t = t.cpu()
             except Exception:
@@ -3677,7 +3868,11 @@ class WorkerService:
             return False
         try:
             if bool(game_state.get("isPlaying")):
-                return False
+                # Some early startup prompts can report `isPlaying=true` even though the HUD/gameplay
+                # isn't active yet (e.g., photosensitivity warning). Only suppress bootstrapping once
+                # we have positive evidence of gameplay.
+                if bool(getattr(self, "_hud_present", False)) or bool(getattr(self, "_gameplay_started", False)):
+                    return False
         except Exception:
             pass
         cm = str(game_state.get("currentMenu") or "").strip()
@@ -5105,6 +5300,11 @@ class WorkerService:
                     menu_hint = False
             elif gameplay_now:
                 menu_hint = False
+            if menu_hint is None:
+                # Safety net: during early startup the game state / vision metrics may not yet
+                # be populated. Treat non-gameplay as "menu-like" so menu automation can
+                # advance prompts (e.g., photosensitivity warning) instead of deadlocking.
+                menu_hint = bool((not gameplay_now) and (not self._gameplay_started))
             if gameplay_now and self._hud_pulse_log_s > 0.0:
                 if (now - self._hud_pulse_last_ts) >= float(self._hud_pulse_log_s):
                     try:
@@ -7274,7 +7474,9 @@ class WorkerService:
             "pipewire_node_ok": bool(getattr(self, "_pipewire_node_ok", False)),
             "stream_enabled": bool(getattr(self, "_stream_enabled", False)),
             "stream_require_pipewire": bool(getattr(self, "_require_pipewire_stream", False)),
+            "stream_require_zero_copy": bool(getattr(self, "_stream_require_zero_copy", False)),
             "stream_error": getattr(self, "_stream_error", None),
+            "stream_epoch": int(getattr(self, "_stream_epoch", 0) or 0),
             "capture_enabled": not bool(getattr(self, "_capture_disabled", False)),
             "fifo_stream_enabled": bool(getattr(self, "_fifo_stream_enabled", False)),
             "fifo_stream_path": getattr(self, "_fifo_stream_path", None),
@@ -7460,6 +7662,27 @@ class WorkerService:
                 self.set_capture_enabled(bool(cfg.capture_enabled))
         except Exception:
             pass
+        # Spectator output sizing can be updated at runtime by the orchestrator. This is used to
+        # ensure featured tiles are truly 1080p (or configured) without upscaling tiny obs tensors.
+        try:
+            sw = getattr(cfg, "spectator_width", None)
+            sh = getattr(cfg, "spectator_height", None)
+            if sw is None or sh is None:
+                raw = cfg.model_dump()
+                sw = raw.get("spectator_width")
+                sh = raw.get("spectator_height")
+            if sw is not None and sh is not None:
+                w = int(sw)
+                h = int(sh)
+                if w > 0 and h > 0:
+                    if w % 2:
+                        w += 1
+                    if h % 2:
+                        h += 1
+                    self._spectator_w = int(w)
+                    self._spectator_h = int(h)
+        except Exception:
+            pass
 
 
 service: Optional[WorkerService] = None
@@ -7490,7 +7713,11 @@ if app:
         from fastapi.responses import StreamingResponse
 
         gen = service.streamer.iter_chunks(container="mpegts")
-        return StreamingResponse(gen, media_type="video/MP2T")
+        return StreamingResponse(
+            gen,
+            media_type="video/MP2T",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/stream.mp4")
     def stream_mp4():
@@ -7509,7 +7736,22 @@ if app:
         from fastapi.responses import StreamingResponse
 
         gen = service.streamer.iter_chunks(container="mp4")
-        return StreamingResponse(gen, media_type="video/mp4")
+        return StreamingResponse(
+            gen,
+            media_type="video/mp4",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/stream_meta.json")
+    def stream_meta():
+        """Stream metadata for UI self-heal + diagnostics (best-effort)."""
+        if not service:
+            raise HTTPException(status_code=503, detail="service not initialized")
+        try:
+            return service.stream_meta()
+        except Exception:
+            # Never crash the worker on metadata calls.
+            return {"instance_id": getattr(service, "instance_id", None), "epoch": int(getattr(service, "_stream_epoch", 0) or 0)}
 
     @app.get("/frame.jpg")
     def frame_jpg():
@@ -7523,6 +7765,8 @@ if app:
         """
         if not service:
             raise HTTPException(status_code=404, detail="service not initialized")
+        if os.environ.get("METABONK_STREAM_REQUIRE_ZERO_COPY", "0") in ("1", "true", "True"):
+            raise HTTPException(status_code=404, detail="frame.jpg disabled in strict zero-copy mode")
         # Ensure streamer/node is initialized so we have a PipeWire target to snapshot.
         if (
             service.streamer is None
@@ -7582,7 +7826,16 @@ if app:
                         if hasattr(t, "detach"):
                             t = t.detach()
                         if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
-                            t = t.to(device="cpu", non_blocking=True)
+                            try:
+                                import torch  # type: ignore
+
+                                stream_ptr = int(getattr(service, "_synthetic_eye_cu_stream_ptr", 0) or 0)
+                                if stream_ptr:
+                                    ext = torch.cuda.ExternalStream(int(stream_ptr))
+                                    torch.cuda.current_stream(device=ext.device).wait_stream(ext)
+                            except Exception:
+                                pass
+                            t = t.cpu()
                         elif hasattr(t, "cpu"):
                             t = t.cpu()
                     except Exception:

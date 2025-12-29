@@ -295,7 +295,8 @@ body::before{
   overflow: hidden;
   min-height: 520px;
 }
-.neural-video{ width: 100%; height: 100%; min-height: 520px; display: block; }
+.neural-video{ width: 100%; height: 100%; min-height: 520px; display: block; object-fit: cover; background: #000; }
+.cctv-video{ width: 100%; height: 100%; display: block; object-fit: cover; background: #000; }
 .neural-overlay{
   position: absolute;
   inset: 0;

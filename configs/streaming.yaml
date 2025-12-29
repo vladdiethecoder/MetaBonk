@@ -30,25 +30,27 @@ profiles:
       require_zero_copy: false
 
   # Local app defaults (Tauri / Vite spectator):
-  # - MP4/MSE friendly output
-  # - no go2rtc dependency
-  # - allow pixel_obs fallback for fully headless stacks
-  # - reduce FPS to keep 1080p stable across multiple featured tiles
+  # Strict GPU-only output (no CPU/raw-frame fallback).
+  # Use go2rtc/WebRTC for viewing; MP4/MSE is not the default transport in strict mode.
   local:
     streaming:
-      backend: auto
-      container: mp4
+      backend: gst
+      container: mpegts
       bitrate: 10M
       fps: 30
       gop: 15
-      allow_gst_mp4: false
-      require_zero_copy: false
+      allow_gst_mp4: true
+      require_zero_copy: true
       max_clients: 3
       nvenc_max_sessions: 0
     fifo:
-      enabled: false
+      enabled: true
+      container: mpegts
+      dir: temp/streams
     go2rtc:
-      enabled: false
+      enabled: true
+      url: http://127.0.0.1:1984
+      mode: fifo
 
   # Production/training defaults:
   # - deterministic backend (GStreamer)

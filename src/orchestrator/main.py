@@ -454,6 +454,14 @@ def _derive_reason_code_backend(hb: Heartbeat) -> Optional[str]:
         if "offline" in status:
             return "WORKER_OFFLINE"
         return f"WORKER_{status.upper()}"
+    # Capture may be intentionally disabled for background workers (featured slots only).
+    # In that mode, missing stream URL / keyframes are expected and should not raise alerts.
+    try:
+        capture_enabled = bool(getattr(hb, "capture_enabled", True))
+    except Exception:
+        capture_enabled = True
+    if not capture_enabled:
+        return None
     require_pw = getattr(hb, "stream_require_pipewire", None)
     if require_pw is None:
         require_pw = True
@@ -5746,6 +5754,30 @@ def _featured_loop(stop_event: threading.Event, interval_s: float = 1.0):
         "yes",
         "on",
     )
+    # Featured spectator sizing (best-effort): let the UI view true-res frames without upscaling.
+    # Use `METABONK_FEATURED_SPECTATOR_SIZE=1920x1080` to override explicitly.
+    raw_featured_size = str(
+        os.environ.get("METABONK_FEATURED_SPECTATOR_SIZE")
+        or os.environ.get("METABONK_STREAM_NVENC_TARGET_SIZE")
+        or "1920x1080"
+    ).strip()
+    featured_w: Optional[int] = None
+    featured_h: Optional[int] = None
+    if "x" in raw_featured_size.lower():
+        try:
+            a, b = [p.strip() for p in raw_featured_size.lower().split("x", 1)]
+            featured_w = int(a)
+            featured_h = int(b)
+        except Exception:
+            featured_w, featured_h = None, None
+    if featured_w is not None and featured_h is not None:
+        if featured_w <= 0 or featured_h <= 0:
+            featured_w, featured_h = None, None
+        else:
+            if featured_w % 2:
+                featured_w += 1
+            if featured_h % 2:
+                featured_h += 1
     while not stop_event.is_set():
         now = time.time()
         try:
@@ -5788,6 +5820,12 @@ def _featured_loop(stop_event: threading.Event, interval_s: float = 1.0):
                 cfg.capture_enabled = True if capture_all else (bool(slot) or warm)
                 cfg.featured_slot = slot
                 cfg.featured_role = "featured" if slot else ("warming" if warm else "background")
+                if slot and (featured_w is not None and featured_h is not None):
+                    cfg.spectator_width = int(featured_w)
+                    cfg.spectator_height = int(featured_h)
+                else:
+                    cfg.spectator_width = None
+                    cfg.spectator_height = None
                 cfg.config_poll_s = float(poll_s)
                 configs[iid] = cfg
         except Exception:

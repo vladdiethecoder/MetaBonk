@@ -952,12 +952,27 @@ def main() -> int:
     env.setdefault("METABONK_USE_LEARNED_REWARD", "1")
     env.setdefault("METABONK_VIDEO_REWARD_CKPT", str(repo_root / "checkpoints" / "video_reward_model.pt"))
 
+    # Input + action space defaults:
+    # - ensure learner and workers agree on discrete branch sizing
+    # - keep menu progression learnable (no hardcoded bootstraps by default)
+    libxdo_ok = _libxdo_available()
+    env.setdefault("METABONK_INPUT_BACKEND", "libxdo" if libxdo_ok else "xdotool")
+    env.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
+    if not (
+        env.get("METABONK_INPUT_BUTTONS")
+        or env.get("METABONK_INPUT_KEYS")
+        or env.get("METABONK_BUTTON_KEYS")
+    ):
+        # Include a minimal mouse click so agents can learn UI interactions without scripts.
+        env["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN,MOUSE_LEFT"
+    # Encourage leaving menus without hardcoding which button to press.
+    if args.mode == "train":
+        env.setdefault("METABONK_MENU_PENALTY", "-0.001")
+        env.setdefault("METABONK_MENU_EXIT_BONUS", "0.05")
+
     # Streaming profile selection:
-    # - default to "local" when the local UI is enabled (no go2rtc/docker dependency)
-    # - default to "prod" for headless/service runs unless overridden
-    if not str(getattr(args, "stream_profile", "") or "").strip() and not str(env.get("METABONK_STREAM_PROFILE") or "").strip():
-        if bool(getattr(args, "ui", True)) and not bool(getattr(args, "enable_public_stream", False)) and args.mode in ("train", "play"):
-            env["METABONK_STREAM_PROFILE"] = "local"
+    # - default profiles are chosen inside apply_streaming_profile (train/play -> prod)
+    # - strict GPU-only runs should not silently opt into "local" fallbacks
 
     # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
     try:
@@ -977,11 +992,27 @@ def main() -> int:
     # This does not affect the agent's observation tensor.
     if bool(getattr(args, "ui", True)) and not _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0")):
         env.setdefault("METABONK_STREAM_NVENC_TARGET_SIZE", "1920x1080")
+        # Synthetic Eye spectator source resolution (human-facing). Keep this separate from agent obs.
+        # Default to match the stream target so local tiles are truly 720p/1080p and readable.
+        env.setdefault("METABONK_SPECTATOR_RES", str(env.get("METABONK_STREAM_NVENC_TARGET_SIZE") or "1920x1080"))
         env.setdefault("METABONK_STREAM_SCALE_MODE", "crop")
         env.setdefault("METABONK_STREAM_SCALE_FLAGS", "bicubic")
         # Give slow-starting game instances more time before declaring the stream dead.
         env.setdefault("METABONK_STREAM_STARTUP_TIMEOUT_S", "30")
         env.setdefault("METABONK_STREAM_STALL_TIMEOUT_S", "60")
+        # Match the game render size to the requested spectator stream target, unless the user
+        # explicitly provided gamescope dimensions (keep local UI feeds truly 1080p).
+        try:
+            if "--gamescope-width" not in sys.argv and "--gamescope-height" not in sys.argv:
+                # Respect explicit env overrides as well (common in scripts/CI).
+                if not str(os.environ.get("MEGABONK_WIDTH") or "").strip() and not str(os.environ.get("MEGABONK_HEIGHT") or "").strip():
+                    tgt = str(env.get("METABONK_STREAM_NVENC_TARGET_SIZE") or "").strip().lower()
+                    if "x" in tgt:
+                        tw, th = [p.strip() for p in tgt.split("x", 1)]
+                        args.gamescope_width = int(tw)
+                        args.gamescope_height = int(th)
+        except Exception:
+            pass
     if args.stream_backend:
         env["METABONK_STREAM_BACKEND"] = str(args.stream_backend)
     # Production/zero-copy guardrail: don't allow auto selection to drift into CPU paths.
@@ -1011,11 +1042,7 @@ def main() -> int:
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
     env.setdefault("METABONK_MENU_WEIGHTS", str(repo_root / "checkpoints" / "menu_classifier.pt"))
     env.setdefault("METABONK_MENU_THRESH", "0.5")
-    env.setdefault("METABONK_MENU_PENALTY", "-0.01")
-    env.setdefault("METABONK_MENU_EXIT_BONUS", "1.0")
     env.setdefault("METABONK_UI_GRID_FALLBACK", "1")
-    env.setdefault("METABONK_MENU_EPS", "0.2")
-    env.setdefault("METABONK_MENU_ALLOW_REPEAT_CLICK", "1")
     env.setdefault("METABONK_REPO_ROOT", str(repo_root))
     env.setdefault("METABONK_VISION_WEIGHTS", str(repo_root / "yolo11n.pt"))
     env.setdefault("MEGABONK_WIDTH", str(int(args.gamescope_width)))
@@ -1032,10 +1059,17 @@ def main() -> int:
         return any(f in argv for f in flags)
 
     use_synthetic_eye = bool(getattr(args, "synthetic_eye", False))
+    strict_zero_copy = _truthy(str(env.get("METABONK_STREAM_REQUIRE_ZERO_COPY") or "0"))
+    strict_streaming = strict_zero_copy and _truthy(str(env.get("METABONK_STREAM") or "1"))
     if _arg_specified("--enable-public-stream", "--no-enable-public-stream"):
         public_stream_requested = bool(getattr(args, "enable_public_stream", False))
     else:
         public_stream_requested = _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0"))
+    if strict_streaming and args.mode in ("train", "play") and not public_stream_requested:
+        raise SystemExit(
+            "[start_omega] ERROR: strict zero-copy streaming requires go2rtc/WebRTC distribution "
+            "(set METABONK_ENABLE_PUBLIC_STREAM=1 or pass --enable-public-stream)."
+        )
     public_stream = bool(public_stream_requested) and args.mode in ("train", "play")
     dash_stream = str(getattr(args, "dashboard_stream", "auto") or "auto").strip().lower()
     if dash_stream == "auto":
@@ -1045,7 +1079,13 @@ def main() -> int:
         env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
         env["METABONK_FRAME_SOURCE"] = "pipewire"
     elif use_synthetic_eye:
-        env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1" if public_stream else "0"
+        # Strict runs require DMA-BUF capture for streaming (no pixel_obs/rawvideo fallbacks).
+        # Synthetic Eye provides DMA-BUF frames but is currently a PipeWire-free compositor path,
+        # so we hard-fail if strict streaming is requested without a PipeWire capture source.
+        if strict_streaming:
+            env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
+        else:
+            env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1" if public_stream else "0"
     else:
         env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1"
     if public_stream:
@@ -1073,6 +1113,13 @@ def main() -> int:
         env.setdefault("METABONK_SYNTHETIC_EYE_COMPOSITOR", "1")
         # Smithay Eye hosts XWayland directly; avoid wrapping the game in gamescope unless explicitly requested.
         env.setdefault("MEGABONK_USE_GAMESCOPE", "0")
+        if strict_streaming and str(env.get("METABONK_SYNTHETIC_EYE_COMPOSITOR") or "0").strip() in ("1", "true", "True"):
+            raise SystemExit(
+                "[start_omega] ERROR: strict zero-copy streaming requires PipeWire DMA-BUF capture. "
+                "The Synthetic Eye compositor path is PipeWire-free and would force CPU/rawvideo fallbacks. "
+                "Disable the compositor (set METABONK_SYNTHETIC_EYE_COMPOSITOR=0 and use gamescope/pipewire) "
+                "or run with METABONK_STREAM_REQUIRE_ZERO_COPY=0 (not allowed for strict runs)."
+            )
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
     env.setdefault("METABONK_SUPERVISE_WORKERS", "1")
     if (
@@ -1668,7 +1715,6 @@ def main() -> int:
             preflight_err = _gpu_preflight(env)
             if preflight_err:
                 raise SystemExit(f"[start_omega] ERROR: {preflight_err}")
-        libxdo_ok = _libxdo_available()
         candidate_gpus: List[str] = []
         if not worker_gpu_map and gpu_auto:
             cvd_raw = env.get("CUDA_VISIBLE_DEVICES")
@@ -1781,7 +1827,9 @@ def main() -> int:
                 existing = _strip_shell_quotes(str(wenv.get("GAMESCOPE_XWAYLAND_ARGS") or "").strip())
                 if "XTEST" not in existing.upper():
                     wenv["GAMESCOPE_XWAYLAND_ARGS"] = (existing + " " + want).strip() if existing else want
-            wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "1")
+            # Do not hardcode menu progression: allow agents to discover routes via their own
+            # policy/exploration. (Bootstrap remains available via explicit env/CLI override.)
+            wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
             if not (
                 wenv.get("METABONK_INPUT_BUTTONS")
                 or wenv.get("METABONK_INPUT_KEYS")
@@ -1790,7 +1838,7 @@ def main() -> int:
                 if autonomous_mode and auto_seed_buttons:
                     wenv["METABONK_INPUT_BUTTONS"] = auto_seed_buttons
                 else:
-                    wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN"
+                    wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN,MOUSE_LEFT"
             if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                 wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
             worker_port = str(wenv.get("WORKER_PORT") or "")

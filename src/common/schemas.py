@@ -55,6 +55,9 @@ class InstanceConfig(MBBaseModel):
     hparams: Dict[str, Any] = Field(default_factory=lambda: TrainerConfig().model_dump())
     # Stream/spectator controls (best-effort; worker may ignore if unsupported).
     capture_enabled: Optional[bool] = None
+    # Optional: request spectator (human-view) frame size. This is distinct from agent obs size.
+    spectator_width: Optional[int] = None
+    spectator_height: Optional[int] = None
     featured_slot: Optional[str] = None  # "hype0"|"hype1"|"hype2"|"shame0"|"shame1"
     featured_role: Optional[str] = None  # "featured"|"warming"|"background"
     config_poll_s: Optional[float] = None

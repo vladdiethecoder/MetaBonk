@@ -32,6 +32,17 @@ fi
 export STEAM_MULTIPLE_XWAYLANDS=1
 export __EGL_VENDOR_LIBRARY_FILENAMES="${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}"
 
+# libxdo/xdotool require the XTEST extension. Some Xwayland builds/launch flags can
+# disable it; gamescope supports passing args through to the nested Xwayland via
+# this env var. Ensure XTEST is explicitly enabled unless the caller overrides it.
+backend="${METABONK_INPUT_BACKEND:-}"
+backend="$(echo "${backend}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+if [[ "${backend}" == "libxdo" || "${backend}" == "xdotool" || "${backend}" == "xdo" || -z "${backend}" ]]; then
+  if [[ -z "${GAMESCOPE_XWAYLAND_ARGS:-}" ]]; then
+    export GAMESCOPE_XWAYLAND_ARGS="+extension XTEST"
+  fi
+fi
+
 WIDTH="${MEGABONK_WIDTH:-1920}"
 HEIGHT="${MEGABONK_HEIGHT:-1080}"
 FPS="${MEGABONK_FPS:-60}"

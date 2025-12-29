@@ -42,6 +42,7 @@ export type Heartbeat = {
   stream_error?: string | null;
   streamer_last_error?: string | null;
   stream_backend?: string | null;
+  stream_epoch?: number | null;
   nvenc_sessions_used?: number | null;
   stream_active_clients?: number | null;
   stream_max_clients?: number | null;

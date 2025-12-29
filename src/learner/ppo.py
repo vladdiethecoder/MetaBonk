@@ -68,7 +68,8 @@ def apply_env_overrides(cfg: PPOConfig) -> PPOConfig:
             cfg.discrete_branches = tuple(vals)
         else:
             # Auto-configure binary discrete branches when using OS-level input injection.
-            if str(os.environ.get("METABONK_INPUT_BACKEND", "")).strip().lower() == "uinput":
+            backend = str(os.environ.get("METABONK_INPUT_BACKEND", "")).strip().lower()
+            if backend in ("uinput", "xdotool", "libxdo", "xdo"):
                 raw = (
                     os.environ.get("METABONK_INPUT_BUTTONS")
                     or os.environ.get("METABONK_INPUT_KEYS")

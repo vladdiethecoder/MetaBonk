@@ -423,11 +423,8 @@ def main() -> int:
     env["METABONK_VIDEO_REWARD_CKPT"] = args.reward_ckpt
 
     # Streaming profile selection:
-    # - default to "local" when the local UI is enabled (no go2rtc/docker dependency)
-    # - default to "prod" for headless/service runs unless overridden
-    if not str(getattr(args, "stream_profile", "") or "").strip() and not str(env.get("METABONK_STREAM_PROFILE") or "").strip():
-        if bool(getattr(args, "ui", True)) and not bool(getattr(args, "go2rtc", False)) and args.mode in ("train", "play"):
-            env["METABONK_STREAM_PROFILE"] = "local"
+    # Defaults are chosen in configs/streaming.yaml (train/play -> prod). We do not
+    # auto-select a permissive profile with CPU/rawvideo fallbacks when the UI is on.
 
     # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
     try:
@@ -458,6 +455,9 @@ def main() -> int:
     # This does not affect the agent's observation tensor.
     if bool(getattr(args, "ui", True)) and not bool(getattr(args, "go2rtc", False)):
         env.setdefault("METABONK_STREAM_NVENC_TARGET_SIZE", "1920x1080")
+        # Synthetic Eye spectator source resolution (human-facing). Keep this separate from agent obs.
+        # Default to match the stream target so local tiles are truly 720p/1080p and readable.
+        env.setdefault("METABONK_SPECTATOR_RES", str(env.get("METABONK_STREAM_NVENC_TARGET_SIZE") or "1920x1080"))
         # Default to "crop-to-fill" scaling so the Stream UI does not show huge black bars
         # when the source aspect ratio is slightly off.
         env.setdefault("METABONK_STREAM_SCALE_MODE", "crop")

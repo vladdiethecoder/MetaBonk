@@ -75,6 +75,8 @@ export default function MseMp4Video({
   className,
   fallbackUrl,
   exclusiveKey,
+  epoch,
+  metaUrl,
   onVideoReady,
   debug = false,
   debugHud = false,
@@ -83,6 +85,8 @@ export default function MseMp4Video({
   className?: string;
   fallbackUrl?: string;
   exclusiveKey?: string;
+  epoch?: number | null;
+  metaUrl?: string;
   onVideoReady?: (el: HTMLVideoElement | null) => void;
   debug?: boolean;
   debugHud?: boolean;
@@ -111,6 +115,12 @@ export default function MseMp4Video({
   const hudActiveRef = useRef(false);
   const rvfcIdRef = useRef<number | null>(null);
   const samplesRef = useRef<HudSample[]>([]);
+  const restartGateRef = useRef<{ lastTs: number; lastEpoch: number | null }>({ lastTs: 0, lastEpoch: null });
+  const playbackRef = useRef<{ startedTs: number; lastTime: number; lastProgressTs: number }>({
+    startedTs: 0,
+    lastTime: 0,
+    lastProgressTs: 0,
+  });
 
   useEffect(() => {
     if (!onVideoReady) return;
@@ -191,6 +201,17 @@ export default function MseMp4Video({
       try {
         URL.revokeObjectURL(objUrl);
       } catch {}
+    };
+
+    const restartNow = (msg: string) => {
+      setErrMsg(msg);
+      setStatus("error");
+      cleanup();
+      try {
+        el.removeAttribute("src");
+        el.load();
+      } catch {}
+      setRetryTick((t) => (t + 1) % 10_000);
     };
 
     const fallbackToSnapshot = (msg?: string) => {
@@ -296,8 +317,15 @@ export default function MseMp4Video({
                 initParts = [];
                 initReady = true;
                 pump();
-              }
+            }
               continue;
+            }
+
+            // If the encoder renegotiates mid-stream and emits a fresh init segment, the current
+            // SourceBuffer is no longer valid. Hard reset the whole MSE pipeline.
+            if (box.type === "ftyp" || box.type === "moov") {
+              restartNow("stream reinitialized; resetting MSE pipeline");
+              return;
             }
 
             if (!segParts.length) {
@@ -340,7 +368,92 @@ export default function MseMp4Video({
     ms.addEventListener("sourceopen", onOpen, { once: true });
     el.play().catch(() => {});
     return cleanup;
-  }, [url, exclusiveKey, retryTick]);
+  }, [url, exclusiveKey, retryTick, epoch]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !url) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+
+    const now = Date.now();
+    playbackRef.current.startedTs = now;
+    playbackRef.current.lastTime = 0;
+    playbackRef.current.lastProgressTs = now;
+
+    const startupTimeoutS = Number.isFinite(Number((window as any).__MB_MSE_STARTUP_TIMEOUT_S__))
+      ? Number((window as any).__MB_MSE_STARTUP_TIMEOUT_S__)
+      : 12.0;
+    const stallTimeoutS = Number.isFinite(Number((window as any).__MB_MSE_STALL_TIMEOUT_S__))
+      ? Number((window as any).__MB_MSE_STALL_TIMEOUT_S__)
+      : 4.0;
+    const minRestartGapMs = 1500;
+
+    const id = window.setInterval(() => {
+      const nowMs = Date.now();
+      if (typeof document !== "undefined" && document.hidden) return;
+
+      const gate = restartGateRef.current;
+      if (nowMs - gate.lastTs < minRestartGapMs) return;
+
+      let curTime = 0;
+      try {
+        curTime = Number(el.currentTime || 0);
+      } catch {
+        curTime = 0;
+      }
+
+      const pb = playbackRef.current;
+      if (curTime > pb.lastTime + 1e-3) {
+        pb.lastTime = curTime;
+        pb.lastProgressTs = nowMs;
+      }
+
+      const sinceStartS = (nowMs - pb.startedTs) / 1000;
+      const sinceProgressS = (nowMs - pb.lastProgressTs) / 1000;
+
+      const playing = status === "playing";
+      const shouldRestart = (playing && sinceProgressS >= stallTimeoutS) || (!playing && sinceStartS >= startupTimeoutS);
+      if (!shouldRestart) return;
+
+      gate.lastTs = nowMs;
+      gate.lastEpoch = epoch ?? null;
+      setErrMsg(playing ? "playback stalled; resetting MSE pipeline" : "startup timeout; resetting MSE pipeline");
+      setStatus("error");
+      setRetryTick((t) => (t + 1) % 10_000);
+    }, 1000);
+
+    return () => window.clearInterval(id);
+  }, [url, epoch, status]);
+
+  useEffect(() => {
+    if (!metaUrl) return;
+    const ac = new AbortController();
+    const id = window.setInterval(async () => {
+      try {
+        const r = await fetch(metaUrl, { signal: ac.signal, cache: "no-store" });
+        if (!r.ok) return;
+        const j = (await r.json()) as any;
+        const nextEpoch = Number(j?.epoch ?? NaN);
+        if (!Number.isFinite(nextEpoch)) return;
+        if (epoch != null && Number.isFinite(Number(epoch)) && Number(epoch) === nextEpoch) return;
+        const gate = restartGateRef.current;
+        if (gate.lastEpoch != null && gate.lastEpoch === nextEpoch) return;
+        gate.lastEpoch = nextEpoch;
+        gate.lastTs = Date.now();
+        setErrMsg(`stream epoch changed (${nextEpoch}); reinitializing`);
+        setStatus("error");
+        setRetryTick((t) => (t + 1) % 10_000);
+      } catch {
+        // ignore
+      }
+    }, 2000);
+    return () => {
+      try {
+        ac.abort();
+      } catch {}
+      window.clearInterval(id);
+    };
+  }, [metaUrl, epoch]);
 
   useEffect(() => {
     if (!fallbackUrl) return;

@@ -195,6 +195,37 @@ def _find_font_file(candidates: list[str]) -> Optional[str]:
             continue
     return None
 
+
+def _ffmpeg_force_key_frames_args(*, fps: int, gop: int, extra_out: str) -> list[str]:
+    """Best-effort keyframe forcing for live streaming.
+
+    Rationale: fragmented MP4/MSE clients often attach at t=0 but the first fragment
+    may still begin with non-keyframes. Forcing a keyframe at t=0 avoids "garbage
+    until next keyframe" decode behavior.
+    """
+    try:
+        if "-force_key_frames" in (extra_out.split() if extra_out else []):
+            return []
+    except Exception:
+        pass
+    fps_i = max(1, int(fps))
+    gop_i = max(1, int(gop))
+    raw_interval = str(os.environ.get("METABONK_STREAM_KEYFRAME_INTERVAL_S", "") or "").strip()
+    interval_s: Optional[float] = None
+    if raw_interval:
+        try:
+            interval_s = float(raw_interval)
+        except Exception:
+            interval_s = None
+    if interval_s is None:
+        interval_s = float(gop_i) / float(fps_i)
+    if interval_s <= 0:
+        return []
+    # Avoid pathological values (helps keep ffmpeg arg stable if env is mis-set).
+    interval_s = max(0.05, min(10.0, float(interval_s)))
+    expr = f"expr:gte(t,n_forced*{interval_s:.6g})"
+    return ["-force_key_frames", expr]
+
 def _pipewiresrc_selector(target: str) -> str:
     """Return the correct pipewiresrc selector assignment for a given target.
 
@@ -1115,7 +1146,7 @@ class NVENCStreamer:
             "no",
             "off",
         )
-        scale_mode = str(os.environ.get("METABONK_STREAM_SCALE_MODE", "pad") or "pad").strip().lower()
+        scale_mode = str(os.environ.get("METABONK_STREAM_SCALE_MODE", "") or "").strip().lower() or "crop"
         if scale_mode not in ("pad", "crop", "stretch"):
             scale_mode = "pad"
         scale_flags = str(os.environ.get("METABONK_STREAM_SCALE_FLAGS", "") or "").strip().lower()
@@ -1363,6 +1394,8 @@ class NVENCStreamer:
                 if enc == "libx264":
                     cmd += ["-preset", str(os.environ.get("METABONK_STREAM_X264_PRESET", "veryfast")), "-tune", "zerolatency"]
 
+            cmd += _ffmpeg_force_key_frames_args(fps=fps, gop=gop, extra_out=extra_out)
+
             if not has_out_pix_fmt:
                 cmd += ["-pix_fmt", "yuv420p"]
 
@@ -1504,6 +1537,21 @@ class NVENCStreamer:
         if container_name not in ("mp4", "mpegts", "h264"):
             container_name = "mp4"
         require_zero_copy = _env_truthy("METABONK_STREAM_REQUIRE_ZERO_COPY")
+        if require_zero_copy:
+            # Strict mode: never allow CPU/rawvideo fallbacks. We must have a PipeWire target
+            # and we must use the GStreamer pipewiresrc->GPU encoder path.
+            target = str(os.environ.get("PIPEWIRE_NODE") or self.cfg.pipewire_node or "").strip()
+            if not target:
+                self._record_error("strict stream: PIPEWIRE_NODE missing (DMA-BUF capture required)")
+                with self._lock:
+                    self._active_clients = max(0, int(self._active_clients) - 1)
+                return
+            requested = self._normalize_backend(os.environ.get("METABONK_STREAM_BACKEND", "auto"))
+            if requested not in ("gst", "gstreamer", "gst-launch", "auto", ""):
+                self._record_error(f"strict stream: backend '{requested}' not allowed (must be gst)")
+                with self._lock:
+                    self._active_clients = max(0, int(self._active_clients) - 1)
+                return
         if container_name == "h264":
             # Only valid for H.264. Avoid producing an undecodable elementary stream.
             codec = str(self.cfg.codec or "h264").strip().lower()
@@ -2374,6 +2422,8 @@ class NVENCStreamer:
             cmd += ["-c:v", enc, "-b:v", bitrate, "-maxrate", bitrate, "-g", str(gop)]
             if enc == "libx264":
                 cmd += ["-x264-params", "repeat-headers=1"]
+
+        cmd += _ffmpeg_force_key_frames_args(fps=fps, gop=gop, extra_out=extra_out)
 
         if extra_out:
             cmd += extra_out.split()

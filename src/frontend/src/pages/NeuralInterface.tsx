@@ -19,20 +19,6 @@ type OverlayEvent = {
   overlay_url?: string;
 };
 
-const fallbackGo2rtcBase = () => {
-  if (typeof window === "undefined") return "";
-  const g = window as any;
-  const explicit = typeof g.__MB_GO2RTC_URL__ === "string" ? String(g.__MB_GO2RTC_URL__) : "";
-  if (explicit) return explicit.replace(/\/+$/, "");
-  const envUrl = (import.meta as any)?.env?.VITE_GO2RTC_URL;
-  if (envUrl) return String(envUrl).replace(/\/+$/, "");
-  const qs = new URLSearchParams(window.location.search);
-  if (qs.get("go2rtc") !== "1") return "";
-  const host = window.location.hostname || "localhost";
-  const protocol = window.location.protocol.startsWith("http") ? window.location.protocol : "http:";
-  return `${protocol}//${host}:1984`;
-};
-
 export default function NeuralInterface() {
   const statusQ = useQuery({ queryKey: ["status"], queryFn: fetchStatus, refetchInterval: 2000 });
   const workersQ = useQuery({ queryKey: ["workers"], queryFn: fetchWorkers, refetchInterval: 1000 });
@@ -45,13 +31,17 @@ export default function NeuralInterface() {
   const instanceId = focused?.instance_id ?? null;
   const streamUrl = String((focused as any)?.stream_url ?? "").trim();
   const isVideo = String((focused as any)?.stream_type ?? "").toLowerCase() === "mp4";
-  const go2rtcBase = String((focused as any)?.go2rtc_base_url ?? "").trim() || fallbackGo2rtcBase();
+  const strictStreaming =
+    Boolean((focused as any)?.stream_require_zero_copy) || String((import.meta as any)?.env?.VITE_STRICT_STREAMING ?? "") === "1";
+  const go2rtcBase = String((focused as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((focused as any)?.go2rtc_stream_name ?? "").trim() || String(instanceId ?? "omega-0");
   const useGo2rtc = Boolean(go2rtcBase && go2rtcName);
   const debugOn =
     import.meta.env.DEV && typeof window !== "undefined" && new URLSearchParams(window.location.search).get("debug") === "1";
   const embedUrl = go2rtcBase ? `${go2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(go2rtcName)}` : "";
-  const fallbackJpegUrl = focused?.control_url ? `${String(focused.control_url).replace(/\/+$/, "")}/frame.jpg` : "";
+  const fallbackJpegUrl =
+    !strictStreaming && focused?.control_url ? `${String(focused.control_url).replace(/\/+$/, "")}/frame.jpg` : "";
+  const metaUrl = focused?.control_url ? `${String(focused.control_url).replace(/\/+$/, "")}/stream_meta.json` : "";
 
   const [showThoughts, setShowThoughts] = useState(true);
   const [showHUD, setShowHUD] = useState(true);
@@ -110,12 +100,19 @@ export default function NeuralInterface() {
               className="neural-video"
               fallbackJpegUrl={fallbackJpegUrl || undefined}
             />
-          ) : streamUrl && isVideo ? (
-            <MseMp4Video url={streamUrl} className="neural-video" fallbackUrl={fallbackJpegUrl || undefined} exclusiveKey={instanceId || streamUrl} />
-          ) : fallbackJpegUrl ? (
+          ) : !strictStreaming && streamUrl && isVideo ? (
+            <MseMp4Video
+              url={streamUrl}
+              className="neural-video"
+              fallbackUrl={fallbackJpegUrl || undefined}
+              exclusiveKey={instanceId || streamUrl}
+              epoch={(focused as any)?.stream_epoch ?? null}
+              metaUrl={metaUrl || undefined}
+            />
+          ) : !strictStreaming && fallbackJpegUrl ? (
             <img className="neural-video" src={fallbackJpegUrl} alt="neural fallback" />
           ) : (
-            <div className="neural-video muted">no stream</div>
+            <div className="neural-video muted">{strictStreaming ? "no WebRTC feed (strict)" : "no stream"}</div>
           )}
           {overlayMode !== "none" && overlayImage ? (
             <img className="neural-overlay" src={overlayImage} alt="world-model overlay" />

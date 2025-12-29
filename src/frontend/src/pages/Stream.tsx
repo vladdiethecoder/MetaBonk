@@ -617,24 +617,13 @@ function StreamTile({
   const isVideo = (w?.stream_type ?? "").toLowerCase() === "mp4";
   const controlUrl = String((w as any)?.control_url ?? "").trim();
   const frameUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/frame.jpg` : "";
+  const metaUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/stream_meta.json` : "";
   const go2rtcBase = String((w as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((w as any)?.go2rtc_stream_name ?? "").trim();
-  const fallbackGo2rtcBase = useMemo(() => {
-    if (typeof window === "undefined") return "";
-    const g = window as any;
-    const explicit = typeof g.__MB_GO2RTC_URL__ === "string" ? String(g.__MB_GO2RTC_URL__) : "";
-    if (explicit) return explicit.replace(/\/+$/, "");
-    const envUrl = (import.meta as any)?.env?.VITE_GO2RTC_URL;
-    if (envUrl) return String(envUrl).replace(/\/+$/, "");
-    const qs = new URLSearchParams(window.location.search);
-    if (qs.get("go2rtc") !== "1") return "";
-    const host = window.location.hostname || "localhost";
-    const protocol = window.location.protocol.startsWith("http") ? window.location.protocol : "http:";
-    return `${protocol}//${host}:1984`;
-  }, []);
-  const fallbackGo2rtcName = w?.instance_id || "omega-0";
-  const effectiveGo2rtcBase = go2rtcBase || (focused ? fallbackGo2rtcBase : "");
-  const effectiveGo2rtcName = go2rtcName || (focused ? fallbackGo2rtcName : "");
+  const strictStreaming =
+    Boolean((w as any)?.stream_require_zero_copy) || String((import.meta as any)?.env?.VITE_STRICT_STREAMING ?? "") === "1";
+  const effectiveGo2rtcBase = go2rtcBase;
+  const effectiveGo2rtcName = go2rtcName || w?.instance_id || "omega-0";
   const useGo2rtc = Boolean(effectiveGo2rtcBase && effectiveGo2rtcName);
   const go2rtcEmbedUrl = useGo2rtc
     ? `${effectiveGo2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(effectiveGo2rtcName)}`
@@ -647,7 +636,7 @@ function StreamTile({
   const hype = String((w as any)?.hype_label ?? "");
   const shame = String((w as any)?.shame_label ?? "");
   const showLabels = Boolean(focused);
-  const noFeed = !useGo2rtc && (!streamUrl || !isVideo);
+  const noFeed = !useGo2rtc && (strictStreaming || !streamUrl || !isVideo);
   let lastFrameAgeS: number | null = null;
   try {
     const raw = Number(w?.stream_last_frame_ts ?? 0);
@@ -661,6 +650,8 @@ function StreamTile({
   }
   const [standbyStable, setStandbyStable] = useState(true);
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [preferMp4Fallback, setPreferMp4Fallback] = useState(false);
+  const webrtcErrorTsRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (useGo2rtc) {
@@ -677,6 +668,12 @@ function StreamTile({
       if (lastFrameAgeS >= 6.0) setStandbyStable(true);
     }
   }, [useGo2rtc, noFeed, lastFrameAgeS, standbyStable]);
+
+  useEffect(() => {
+    // Reset fallback selection when the stream identity changes.
+    setPreferMp4Fallback(false);
+    webrtcErrorTsRef.current = null;
+  }, [effectiveGo2rtcBase, effectiveGo2rtcName, streamUrl, w?.stream_epoch]);
 
   const standby = standbyStable;
   const offlineDetail = (() => {
@@ -744,7 +741,12 @@ function StreamTile({
         ) : null}
         {fxOn && focused ? (
           <div className="holo-r3f">
-            <HoloStreamCanvas videoEl={videoEl} fallbackUrl={frameUrl || undefined} surprise={surprise} glitch={glitch} />
+            <HoloStreamCanvas
+              videoEl={videoEl}
+              fallbackUrl={!strictStreaming ? frameUrl || undefined : undefined}
+              surprise={surprise}
+              glitch={glitch}
+            />
           </div>
         ) : null}
         {fxOn ? (
@@ -764,23 +766,53 @@ function StreamTile({
             </div>
           </>
         ) : null}
-        {useGo2rtc ? (
+        {useGo2rtc && (!preferMp4Fallback || strictStreaming) ? (
           <Go2rtcWebRTC
             baseUrl={effectiveGo2rtcBase}
             streamName={effectiveGo2rtcName}
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
+            onStatus={(st) => {
+              if (strictStreaming) return;
+              if (st === "playing") {
+                webrtcErrorTsRef.current = null;
+                if (preferMp4Fallback) setPreferMp4Fallback(false);
+                return;
+              }
+              if (st !== "error") return;
+              const now = Date.now();
+              const since = webrtcErrorTsRef.current ?? now;
+              if (webrtcErrorTsRef.current == null) webrtcErrorTsRef.current = now;
+              // If WebRTC can't recover quickly, fall back to per-worker MSE MP4.
+              if (!preferMp4Fallback && now - since >= 4500) setPreferMp4Fallback(true);
+            }}
             debugHud={DEBUG_HUD}
             embedUrl={go2rtcEmbedUrl || undefined}
             embedOnError={DEBUG_ON}
-            fallbackJpegUrl={frameUrl || undefined}
+            fallbackJpegUrl={!strictStreaming ? frameUrl || undefined : undefined}
           />
-        ) : streamUrl && isVideo ? (
+        ) : null}
+        {!useGo2rtc && !strictStreaming && streamUrl && isVideo ? (
+          <MseMp4Video
+            className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
+            url={streamUrl}
+            fallbackUrl={!strictStreaming ? frameUrl || undefined : undefined}
+            exclusiveKey={String(w?.instance_id ?? streamUrl)}
+            epoch={w?.stream_epoch ?? null}
+            metaUrl={metaUrl || undefined}
+            onVideoReady={fxOn && focused ? setVideoEl : undefined}
+            debug={DEBUG_ON}
+            debugHud={DEBUG_HUD}
+          />
+        ) : null}
+        {useGo2rtc && !strictStreaming && preferMp4Fallback && streamUrl && isVideo ? (
           <MseMp4Video
             className={`stream-img ${fxOn && focused ? "holo-fallback" : ""}`}
             url={streamUrl}
             fallbackUrl={frameUrl || undefined}
             exclusiveKey={String(w?.instance_id ?? streamUrl)}
+            epoch={w?.stream_epoch ?? null}
+            metaUrl={metaUrl || undefined}
             onVideoReady={fxOn && focused ? setVideoEl : undefined}
             debug={DEBUG_ON}
             debugHud={DEBUG_HUD}
@@ -2204,7 +2236,7 @@ export default function Stream() {
                             const iid = String(s.hb.instance_id ?? "");
                             return (
                               <StreamTile
-                                key={`mosaic-${iid}`}
+                                key={`mosaic-${s.label}`}
                                 w={s.hb}
                                 slotLabel={s.label}
                                 cornerTag={s.label}

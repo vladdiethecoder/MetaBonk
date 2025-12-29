@@ -54,6 +54,7 @@ export default function Go2rtcWebRTC({
   streamName,
   className,
   onVideoReady,
+  onStatus,
   debugHud = false,
   embedUrl,
   embedOnError = false,
@@ -64,6 +65,7 @@ export default function Go2rtcWebRTC({
   streamName: string;
   className?: string;
   onVideoReady?: (el: HTMLVideoElement | null) => void;
+  onStatus?: (status: "loading" | "playing" | "error") => void;
   debugHud?: boolean;
   embedUrl?: string;
   embedOnError?: boolean;
@@ -103,6 +105,11 @@ export default function Go2rtcWebRTC({
     onVideoReady(videoRef.current);
     return () => onVideoReady(null);
   }, [onVideoReady]);
+
+  useEffect(() => {
+    if (!onStatus) return;
+    onStatus(status);
+  }, [onStatus, status]);
 
   useEffect(() => {
     if (!fallbackJpegUrl || status === "playing") return;
