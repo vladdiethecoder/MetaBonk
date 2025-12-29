@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import torch
@@ -25,6 +25,10 @@ class CrossGameTransferConfig:
     adapter_lr: float = 1e-3
     adapter_epochs: int = 10
     unfreeze_last_layers: int = 0
+    # Default, environment-agnostic trajectory collector settings. These are only used when
+    # `env_factory` is supplied and no explicit `collect_trajectory_fn` is provided.
+    trajectory_steps: int = 64
+    finetune_episodes: int = 10
 
 
 class CrossGameTransfer:
@@ -35,11 +39,139 @@ class CrossGameTransfer:
         load_encoder_fn: Optional[Callable[[], UniversalGameEncoder]] = None,
         collect_trajectory_fn: Optional[Callable[[str], List[Dict[str, Any]]]] = None,
         train_on_game_fn: Optional[Callable[[UniversalGameEncoder, GameAdapter, str], None]] = None,
+        env_factory: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self.cfg = cfg or CrossGameTransferConfig()
         self._load_encoder_fn = load_encoder_fn
+        self._env_factory = env_factory
         self._collect_trajectory_fn = collect_trajectory_fn
         self._train_on_game_fn = train_on_game_fn
+
+        # Observability hooks (useful for tests and debugging).
+        self.last_encoder: Optional[UniversalGameEncoder] = None
+        self.last_adapter: Optional[GameAdapter] = None
+
+        # If the caller provides an env_factory, we can offer usable defaults.
+        if self._collect_trajectory_fn is None and self._env_factory is not None:
+            self._collect_trajectory_fn = self._collect_trajectory_default
+        if self._train_on_game_fn is None and self._env_factory is not None:
+            self._train_on_game_fn = self._train_on_game_default
+
+    @staticmethod
+    def _reset_env(env: Any) -> Tuple[Any, Dict[str, Any]]:
+        out = env.reset()
+        if isinstance(out, tuple) and len(out) >= 2:
+            return out[0], dict(out[1] or {})
+        return out, {}
+
+    @staticmethod
+    def _step_env(env: Any, action: Any) -> Tuple[Any, float, bool, bool, Dict[str, Any]]:
+        out = env.step(action)
+        if isinstance(out, tuple) and len(out) == 5:
+            obs, reward, term, trunc, info = out
+            return obs, float(reward or 0.0), bool(term), bool(trunc), dict(info or {})
+        if isinstance(out, tuple) and len(out) == 4:
+            obs, reward, done, info = out
+            return obs, float(reward or 0.0), bool(done), False, dict(info or {})
+        raise ValueError("env.step(action) must return a 4- or 5-tuple")
+
+    @staticmethod
+    def _sample_action(env: Any) -> Any:
+        try:
+            space = getattr(env, "action_space", None)
+            if space is not None and hasattr(space, "sample"):
+                return space.sample()
+        except Exception:
+            pass
+        try:
+            if hasattr(env, "sample_action"):
+                return env.sample_action()
+        except Exception:
+            pass
+        raise RuntimeError("env must provide action_space.sample() or sample_action() for default transfer hooks")
+
+    @staticmethod
+    def _ensure_batched_chw(x: "torch.Tensor") -> "torch.Tensor":
+        # UniversalGameEncoder expects NCHW.
+        if x.ndim == 3:
+            return x.unsqueeze(0)
+        if x.ndim == 4:
+            return x
+        raise ValueError(f"expected obs tensor with ndim 3 or 4 (CHW or NCHW), got shape={tuple(x.shape)}")
+
+    @staticmethod
+    def _obs_to_tensor(obs: Any) -> "torch.Tensor":
+        if torch is None:  # pragma: no cover
+            raise ImportError("torch is required for CrossGameTransfer")
+        if isinstance(obs, torch.Tensor):
+            t = obs
+        else:
+            t = torch.as_tensor(obs)
+        # Common layouts: HWC (numpy/PIL) or CHW (torch). Convert HWC -> CHW.
+        if t.ndim == 3 and int(t.shape[-1]) == 3 and int(t.shape[0]) != 3:
+            t = t.permute(2, 0, 1).contiguous()
+        return t
+
+    def _collect_trajectory_default(self, game_id: str) -> List[Dict[str, Any]]:
+        if torch is None:  # pragma: no cover
+            raise ImportError("torch is required for CrossGameTransfer default trajectory collector")
+        if self._env_factory is None:
+            raise NotImplementedError("env_factory must be provided for default trajectory collection")
+        env = self._env_factory(str(game_id))
+        obs, _info = self._reset_env(env)
+        traj: List[Dict[str, Any]] = []
+        steps = max(1, int(self.cfg.trajectory_steps))
+        for _t in range(steps):
+            action = self._sample_action(env)
+            next_obs, reward, done, truncated, _info = self._step_env(env, action)
+            traj.append(
+                {
+                    "obs": self._ensure_batched_chw(self._obs_to_tensor(obs)),
+                    "next_obs": self._ensure_batched_chw(self._obs_to_tensor(next_obs)),
+                    "reward": float(reward),
+                    "done": bool(done or truncated),
+                    "action": action,
+                }
+            )
+            if done or truncated:
+                obs, _info = self._reset_env(env)
+            else:
+                obs = next_obs
+        return traj
+
+    def _train_on_game_default(self, encoder: UniversalGameEncoder, adapter: GameAdapter, game_id: str) -> None:
+        if torch is None or nn is None:  # pragma: no cover
+            raise ImportError("torch is required for CrossGameTransfer default trainer")
+        gid = str(game_id)
+        episodes = max(1, int(self.cfg.finetune_episodes))
+        data: List[Dict[str, Any]] = []
+        for _ in range(episodes):
+            data.extend(self.collect_trajectory(gid))
+
+        trainable: List["torch.nn.Parameter"] = list(adapter.parameters())
+        trainable += [p for p in encoder.parameters() if bool(getattr(p, "requires_grad", False))]
+        if not trainable:
+            return
+        opt = torch.optim.Adam(trainable, lr=float(self.cfg.adapter_lr))
+        adapter.train()
+        encoder.train()
+        for _ in range(max(1, int(self.cfg.adapter_epochs // 2))):
+            for batch in data:
+                obs = batch.get("obs")
+                next_obs = batch.get("next_obs")
+                if obs is None or next_obs is None:
+                    continue
+                obs_t = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs)
+                next_t = next_obs if isinstance(next_obs, torch.Tensor) else torch.as_tensor(next_obs)
+                obs_t = self._ensure_batched_chw(obs_t)
+                next_t = self._ensure_batched_chw(next_t)
+                with torch.no_grad():
+                    target = encoder(next_t, game_id=gid)
+                pred = adapter(encoder(obs_t, game_id=gid))
+                loss = nn.functional.mse_loss(pred, target)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
 
     def load_universal_encoder(self) -> UniversalGameEncoder:
         if self._load_encoder_fn is not None:
@@ -48,12 +180,12 @@ class CrossGameTransfer:
 
     def collect_trajectory(self, game_id: str) -> List[Dict[str, Any]]:
         if self._collect_trajectory_fn is None:
-            raise NotImplementedError("collect_trajectory_fn must be provided")
+            raise NotImplementedError("collect_trajectory_fn must be provided (or pass env_factory for defaults)")
         return self._collect_trajectory_fn(str(game_id))
 
     def train_on_game(self, encoder: UniversalGameEncoder, adapter: GameAdapter, game_id: str) -> None:
         if self._train_on_game_fn is None:
-            raise NotImplementedError("train_on_game_fn must be provided")
+            raise NotImplementedError("train_on_game_fn must be provided (or pass env_factory for defaults)")
         self._train_on_game_fn(encoder, adapter, str(game_id))
 
     def transfer_to_new_game(self, new_game_id: str, *, num_warmup_episodes: Optional[int] = None) -> None:
@@ -66,6 +198,8 @@ class CrossGameTransfer:
             p.requires_grad = False
 
         adapter = GameAdapter(input_dim=encoder.output_dim, output_dim=encoder.output_dim)
+        self.last_encoder = encoder
+        self.last_adapter = adapter
 
         warmup_n = int(num_warmup_episodes or self.cfg.warmup_episodes)
         warmup_data: List[Dict[str, Any]] = []
@@ -82,6 +216,8 @@ class CrossGameTransfer:
                     continue
                 obs_t = obs if isinstance(obs, torch.Tensor) else torch.as_tensor(obs)
                 next_t = next_obs if isinstance(next_obs, torch.Tensor) else torch.as_tensor(next_obs)
+                obs_t = self._ensure_batched_chw(obs_t)
+                next_t = self._ensure_batched_chw(next_t)
                 with torch.no_grad():
                     target = encoder(next_t, game_id=gid)
                 pred = adapter(encoder(obs_t, game_id=gid))
@@ -150,4 +286,3 @@ __all__ = [
     "CrossGameTransferConfig",
     "MetaLearningOptimizer",
 ]
-

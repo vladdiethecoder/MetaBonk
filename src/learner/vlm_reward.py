@@ -19,6 +19,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -437,12 +438,33 @@ class ZeroShotVLMReward:
         self,
         goal_prompt: str = "The player is safe and collecting XP gems",
         baseline_prompt: str = "A generic game scene with no notable events",
+        *,
+        backend: str = "auto",
+        embed_dim: int = 512,
+        embed_image_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        embed_text_fn: Optional[Callable[[str], np.ndarray]] = None,
     ):
         self.goal_prompt = goal_prompt
         self.baseline_prompt = baseline_prompt
+        self.backend = str(backend or "auto").strip().lower()
+        self.embed_dim = int(embed_dim)
+        if self.embed_dim <= 0:
+            raise ValueError("embed_dim must be > 0")
         
-        # CLIP model would be loaded here
+        # Optional injection (preferred for production deployments).
+        self._embed_image_fn = embed_image_fn
+        self._embed_text_fn = embed_text_fn
+
+        # Lazy init state for optional heavyweight backends.
         self.clip_model = None
+        self._clip_preprocess = None
+        self._clip_tokenize = None
+        self._clip_text_cache: Dict[str, np.ndarray] = {}
+
+        # "Toy" fallback: deterministic random projection so the pipeline is usable
+        # without downloading large VLM/CLIP weights.
+        self._toy_proj: Optional[np.ndarray] = None
+        self._toy_rng_seed = 0x6D657461  # "meta"
     
     def compute_reward(self, frame: np.ndarray) -> float:
         """Compute projected alignment reward.
@@ -452,9 +474,200 @@ class ZeroShotVLMReward:
         2. Encode goal + baseline prompts with CLIP text encoder
         3. Compute: reward = cos_sim(frame, goal) - cos_sim(frame, baseline)
         """
-        raise NotImplementedError(
-            "ZeroShotVLMReward requires a real CLIP-style projected-alignment implementation."
+        if frame is None:
+            return 0.0
+        img_emb = self._embed_image(frame)
+        goal_emb = self._embed_text(self.goal_prompt)
+        base_emb = self._embed_text(self.baseline_prompt)
+        # Projected alignment (VLM-RM style).
+        return float(self._cos(img_emb, goal_emb) - self._cos(img_emb, base_emb))
+
+    def _normalize(self, v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float32).reshape(-1)
+        n = float(np.linalg.norm(v))
+        if not np.isfinite(n) or n <= 1e-8:
+            return np.zeros_like(v, dtype=np.float32)
+        return (v / n).astype(np.float32, copy=False)
+
+    def _cos(self, a: np.ndarray, b: np.ndarray) -> float:
+        aa = self._normalize(a)
+        bb = self._normalize(b)
+        if aa.shape != bb.shape:
+            raise ValueError(f"embedding shape mismatch: {aa.shape} vs {bb.shape}")
+        return float(np.clip(float(np.dot(aa, bb)), -1.0, 1.0))
+
+    def _embed_text(self, text: str) -> np.ndarray:
+        t = str(text or "").strip()
+        if not t:
+            return np.zeros((self.embed_dim,), dtype=np.float32)
+        cached = self._clip_text_cache.get(t)
+        if cached is not None:
+            return cached
+
+        if self._embed_text_fn is not None:
+            out = self._embed_text_fn(t)
+            out = np.asarray(out, dtype=np.float32).reshape(-1)
+            if out.shape[0] != self.embed_dim:
+                raise ValueError(f"embed_text_fn must return shape ({self.embed_dim},), got {out.shape}")
+            self._clip_text_cache[t] = out
+            return out
+
+        backend = self._resolve_backend()
+        if backend in ("clip", "open_clip"):
+            self._init_clip_backend(backend)
+            assert self._clip_tokenize is not None and self.clip_model is not None and torch is not None
+            with torch.no_grad():
+                tok = self._clip_tokenize([t])
+                if hasattr(tok, "to"):
+                    tok = tok.to("cpu")
+                emb = self.clip_model.encode_text(tok)  # type: ignore[union-attr]
+                if hasattr(emb, "detach"):
+                    emb = emb.detach()
+                emb_np = np.asarray(emb.cpu().float().numpy().reshape(-1), dtype=np.float32)
+        else:
+            emb_np = self._toy_text_embed(t)
+
+        if emb_np.shape[0] != self.embed_dim:
+            emb_np = self._pad_or_truncate(emb_np, self.embed_dim)
+        self._clip_text_cache[t] = emb_np
+        return emb_np
+
+    def _embed_image(self, frame: np.ndarray) -> np.ndarray:
+        if self._embed_image_fn is not None:
+            out = self._embed_image_fn(frame)
+            out = np.asarray(out, dtype=np.float32).reshape(-1)
+            if out.shape[0] != self.embed_dim:
+                raise ValueError(f"embed_image_fn must return shape ({self.embed_dim},), got {out.shape}")
+            return out
+
+        backend = self._resolve_backend()
+        if backend in ("clip", "open_clip"):
+            self._init_clip_backend(backend)
+            if Image is None or torch is None:
+                raise RuntimeError("CLIP backend requires PIL and torch")
+            assert self._clip_preprocess is not None and self.clip_model is not None
+            img = frame
+            if not isinstance(img, np.ndarray):
+                img = np.asarray(img)
+            if img.ndim == 2:
+                img = np.repeat(img[:, :, None], 3, axis=2)
+            if img.ndim != 3 or img.shape[2] < 3:
+                raise ValueError(f"expected RGB frame HxWx3, got shape={img.shape}")
+            if img.shape[2] != 3:
+                img = img[:, :, :3]
+            pil = Image.fromarray(img.astype(np.uint8, copy=False), mode="RGB")
+            with torch.no_grad():
+                tens = self._clip_preprocess(pil).unsqueeze(0)
+                emb = self.clip_model.encode_image(tens)  # type: ignore[union-attr]
+                if hasattr(emb, "detach"):
+                    emb = emb.detach()
+                emb_np = np.asarray(emb.cpu().float().numpy().reshape(-1), dtype=np.float32)
+        else:
+            emb_np = self._toy_image_embed(frame)
+
+        if emb_np.shape[0] != self.embed_dim:
+            emb_np = self._pad_or_truncate(emb_np, self.embed_dim)
+        return emb_np
+
+    def _resolve_backend(self) -> str:
+        b = self.backend
+        if b in ("", "auto"):
+            # Default to the deterministic "toy" backend unless the user opts in.
+            b = str(os.environ.get("METABONK_VLM_BACKEND", "") or "").strip().lower() or "toy"
+        if b in ("openclip", "open-clip"):
+            b = "open_clip"
+        if b not in ("toy", "clip", "open_clip"):
+            raise ValueError(f"unsupported ZeroShotVLMReward backend: {b!r}")
+        return b
+
+    def _init_clip_backend(self, backend: str) -> None:
+        # Avoid accidental large model downloads unless explicitly allowed.
+        allow = str(os.environ.get("METABONK_VLM_ALLOW_DOWNLOAD", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if not allow:
+            raise RuntimeError(
+                "CLIP backend requires model weights. Set METABONK_VLM_ALLOW_DOWNLOAD=1 to allow downloads, "
+                "or pass embed_image_fn/embed_text_fn for a production embedding backend."
+            )
+        if self.clip_model is not None:
+            return
+        if torch is None:
+            raise RuntimeError("CLIP backend requires torch")
+        if backend == "open_clip":
+            try:
+                import open_clip  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("open_clip not available; install open_clip_torch") from e
+            model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+            tokenize = open_clip.get_tokenizer("ViT-B-32")
+            self.clip_model = model.eval()
+            self._clip_preprocess = preprocess
+            self._clip_tokenize = tokenize
+        else:
+            try:
+                import clip  # type: ignore
+            except Exception as e:  # pragma: no cover
+                raise RuntimeError("clip not available; install openai-clip") from e
+            model, preprocess = clip.load("ViT-B/32", device="cpu", jit=False)
+            self.clip_model = model.eval()
+            self._clip_preprocess = preprocess
+            self._clip_tokenize = clip.tokenize
+
+    def _toy_text_embed(self, text: str) -> np.ndarray:
+        h = hashlib.md5(text.encode("utf-8", "replace")).hexdigest()
+        seed = (int(h[:8], 16) ^ int(self._toy_rng_seed)) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(size=(self.embed_dim,), dtype=np.float32)
+        return v.astype(np.float32, copy=False)
+
+    def _toy_image_embed(self, frame: np.ndarray) -> np.ndarray:
+        img = np.asarray(frame)
+        if img.ndim == 2:
+            img = np.repeat(img[:, :, None], 3, axis=2)
+        if img.ndim != 3 or img.shape[2] < 3:
+            raise ValueError(f"expected RGB frame HxWx3, got shape={img.shape}")
+        if img.shape[2] != 3:
+            img = img[:, :, :3]
+        # Downsample deterministically (nearest neighbor) to keep projection small.
+        small = self._resize_nearest(img.astype(np.float32, copy=False), 32, 32)
+        flat = small.reshape(-1)
+        flat = flat - float(flat.mean() if flat.size else 0.0)
+        # Random projection matrix is generated once and reused.
+        proj = self._toy_get_proj(int(flat.shape[0]))
+        v = flat @ proj
+        return v.astype(np.float32, copy=False)
+
+    def _toy_get_proj(self, in_dim: int) -> np.ndarray:
+        if self._toy_proj is not None and self._toy_proj.shape[0] == int(in_dim):
+            return self._toy_proj
+        rng = np.random.default_rng(int(self._toy_rng_seed))
+        # Use a small stddev to keep activations stable.
+        self._toy_proj = (rng.standard_normal(size=(int(in_dim), int(self.embed_dim))).astype(np.float32) * 0.01)
+        return self._toy_proj
+
+    @staticmethod
+    def _resize_nearest(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        h, w = int(img.shape[0]), int(img.shape[1])
+        if h <= 0 or w <= 0:
+            return np.zeros((out_h, out_w, int(img.shape[2])), dtype=np.float32)
+        ys = (np.linspace(0, max(0, h - 1), out_h)).astype(np.int32)
+        xs = (np.linspace(0, max(0, w - 1), out_w)).astype(np.int32)
+        return img[ys][:, xs]
+
+    @staticmethod
+    def _pad_or_truncate(v: np.ndarray, dim: int) -> np.ndarray:
+        out = np.asarray(v, dtype=np.float32).reshape(-1)
+        d = int(dim)
+        if out.shape[0] == d:
+            return out
+        if out.shape[0] > d:
+            return out[:d]
+        pad = np.zeros((d - out.shape[0],), dtype=np.float32)
+        return np.concatenate([out, pad], axis=0)
 
 
 class HierarchicalVLMReward:
