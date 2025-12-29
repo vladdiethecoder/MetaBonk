@@ -22,6 +22,9 @@ ultralytics>=8.0.0  # YOLO
 opencv-python>=4.8.0
 Pillow>=10.0.0
 
+# System 2/3 centralized reasoning (optional)
+pyzmq>=25.1.2
+
 # AV-RL / CLIP (optional, for real visual anomaly rewards)
 # open_clip_torch>=2.24.0
 # transformers>=4.45.0

@@ -1,0 +1,39 @@
+services:
+  cognitive-server:
+    build:
+      context: ../docker/cognitive-server
+      dockerfile: Dockerfile
+    container_name: "${METABONK_COGNITIVE_CONTAINER:-metabonk-cognitive-server}"
+    restart: unless-stopped
+    network_mode: host
+
+    # Requires nvidia-container-toolkit.
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-0}
+      - TZ=UTC
+      - METABONK_RL_LOG_DIR=/app/logs/rl_training
+
+    volumes:
+      # Host model cache: expected to contain Phi-3 Vision AWQ repo folder.
+      - "${METABONK_COGNITIVE_MODELS_DIR:-../models}:/models:ro,z"
+      # RL logs and server logs.
+      - "${METABONK_COGNITIVE_LOG_DIR:-../logs}:/app/logs:rw,z"
+
+    command:
+      [
+        "python3",
+        "cognitive_server.py",
+        "--model-path",
+        "${METABONK_COGNITIVE_MODEL_PATH:-/models/Phi-3-vision-128k-instruct-awq-int4}",
+        "--tp-size",
+        "${METABONK_COGNITIVE_TP_SIZE:-1}",
+        "--quantization",
+        "${METABONK_COGNITIVE_QUANTIZATION:-awq}",
+        "--kv-cache-dtype",
+        "${METABONK_COGNITIVE_KV_CACHE_DTYPE:-fp8}",
+        "--max-running-requests",
+        "${METABONK_COGNITIVE_MAX_REQS:-64}",
+        "--zmq-port",
+        "${METABONK_COGNITIVE_ZMQ_PORT:-5555}"
+      ]
+

@@ -65,6 +65,15 @@ if TYPE_CHECKING:
     from src.control.menu_reasoner import MenuAction
 
 try:
+    from src.agent.cognitive_client import CognitiveClient  # type: ignore
+except Exception:  # pragma: no cover
+    CognitiveClient = None  # type: ignore
+try:
+    from src.agent.rl_integration import RLLogger  # type: ignore
+except Exception:  # pragma: no cover
+    RLLogger = None  # type: ignore
+
+try:
     from src.bridge.unity_bridge import UnityBridge, BridgeConfig, GameFrame
 except Exception:  # pragma: no cover
     UnityBridge = None  # type: ignore
@@ -238,6 +247,61 @@ class WorkerService:
         self.host = host
         self.port = port
         self.launcher = GameLauncher(instance_id=instance_id, display=display)
+
+        # Optional centralized VLM System 2/3 reasoning (ZeroMQ client).
+        self._system2_enabled = str(os.environ.get("METABONK_SYSTEM2_ENABLED", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._cognitive_client = None
+        self._system2_last_request: Optional[dict] = None
+        self._system2_rl_logger = None
+        self._system2_active_decision_id: Optional[str] = None
+        self._system2_active_started_ts: float = 0.0
+        self._system2_active_reward_sum: float = 0.0
+        try:
+            self._system2_blend = float(os.environ.get("METABONK_SYSTEM2_BLEND", "0.7"))
+        except Exception:
+            self._system2_blend = 0.7
+        self._system2_blend = max(0.0, min(1.0, float(self._system2_blend)))
+        self._system2_override_cont = str(os.environ.get("METABONK_SYSTEM2_OVERRIDE_CONT", "1") or "").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        if self._system2_enabled and CognitiveClient is not None:
+            try:
+                server_url = os.environ.get("METABONK_COGNITIVE_SERVER_URL", "tcp://127.0.0.1:5555")
+                freq_s = float(os.environ.get("METABONK_STRATEGY_FREQUENCY", "2.0"))
+                jpeg_q = int(os.environ.get("METABONK_SYSTEM2_JPEG_QUALITY", "85"))
+                max_edge = int(os.environ.get("METABONK_SYSTEM2_MAX_EDGE", "512"))
+                self._cognitive_client = CognitiveClient(
+                    agent_id=self.instance_id,
+                    server_url=server_url,
+                    request_frequency_s=freq_s,
+                    jpeg_quality=jpeg_q,
+                    max_edge=max_edge,
+                )
+                rl_on = str(os.environ.get("METABONK_RL_LOGGING", "0") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                if rl_on and RLLogger is not None:
+                    self._system2_rl_logger = RLLogger(os.environ.get("METABONK_RL_LOG_DIR"))
+                print(
+                    f"[worker:{self.instance_id}] System2 enabled "
+                    f"(server={server_url}, freq={freq_s:.2f}s)",
+                    flush=True,
+                )
+            except Exception as e:
+                self._cognitive_client = None
+                self._system2_enabled = False
+                print(f"[worker:{self.instance_id}] WARN: System2 disabled (init failed): {e}", flush=True)
 
         # Optional stream overlay text file (used by ffmpeg drawtext). We create it early so
         # the encoder can reference it even before the first thought packet arrives.
@@ -2184,6 +2248,15 @@ class WorkerService:
             self._stop_preview_jpeg()
         except Exception:
             pass
+        if self._cognitive_client is not None:
+            try:
+                self._system2_maybe_log_outcome(now=time.time(), reason="stop", done=False)
+            except Exception:
+                pass
+            try:
+                self._cognitive_client.cleanup()
+            except Exception:
+                pass
         if self.streamer:
             self.streamer.stop()
         # Best-effort release held keys (avoid leaving the game stuck moving).
@@ -4260,6 +4333,128 @@ class WorkerService:
                 pass
         self._input_held_mouse = desired_mouse
 
+    def _system2_build_agent_state(
+        self,
+        *,
+        game_state: dict,
+        detections: List[dict],
+        frame_size: Optional[tuple[int, int]],
+        now: float,
+    ) -> dict:
+        try:
+            health = float(game_state.get("playerHealth") or 0.0)
+        except Exception:
+            health = 0.0
+        try:
+            max_health = float(game_state.get("playerMaxHealth") or 1.0)
+        except Exception:
+            max_health = 1.0
+        health_ratio = float(health / max(max_health, 1e-6))
+        try:
+            gtime = float(game_state.get("gameTime") or float(getattr(self.trainer, "step_count", 0) or 0))
+        except Exception:
+            gtime = float(getattr(self.trainer, "step_count", 0) or 0)
+        w, h = frame_size if frame_size else (0, 0)
+        return {
+            "instance_id": self.instance_id,
+            "ts": float(now),
+            "game_time": gtime,
+            "health": float(health),
+            "max_health": float(max_health),
+            "health_ratio": float(health_ratio),
+            "enemies_nearby": int(len(detections or [])),
+            "frame_w": int(w),
+            "frame_h": int(h),
+        }
+
+    def _system2_on_strategy_response(self, response: dict, *, now: float) -> None:
+        # Close out previous directive if it was active.
+        self._system2_maybe_log_outcome(now=now, reason="replaced", done=False)
+
+        self._system2_active_reward_sum = 0.0
+        self._system2_active_started_ts = float(now)
+
+        if self._system2_rl_logger is not None and self._system2_last_request is not None:
+            try:
+                decision_id = self._system2_rl_logger.log_decision(
+                    agent_id=self.instance_id,
+                    request_data=self._system2_last_request,
+                    response_data=response,
+                )
+                self._system2_active_decision_id = str(decision_id)
+            except Exception:
+                self._system2_active_decision_id = None
+        else:
+            self._system2_active_decision_id = None
+
+    def _system2_maybe_log_outcome(self, *, now: float, reason: str, done: bool) -> None:
+        if self._system2_rl_logger is None:
+            return
+        if self._system2_active_decision_id is None:
+            return
+
+        outcome = {
+            "reason": str(reason),
+            "done": bool(done),
+            "reward_sum": float(self._system2_active_reward_sum),
+            "duration_s": float(max(0.0, float(now) - float(self._system2_active_started_ts or now))),
+        }
+        try:
+            self._system2_rl_logger.log_outcome(
+                agent_id=self.instance_id,
+                decision_id=str(self._system2_active_decision_id),
+                outcome=outcome,
+            )
+        except Exception:
+            pass
+
+        self._system2_active_decision_id = None
+        self._system2_active_reward_sum = 0.0
+        self._system2_active_started_ts = 0.0
+
+    def _system2_apply_continuous_directive(
+        self,
+        *,
+        a_cont: List[float],
+        directive: dict,
+        frame_size: tuple[int, int],
+    ) -> List[float]:
+        try:
+            data = directive.get("directive") or {}
+            action = str(data.get("action") or "").strip().lower()
+            target = data.get("target")
+            if not (isinstance(target, (list, tuple)) and len(target) >= 2):
+                return a_cont
+            tx = float(target[0])
+            ty = float(target[1])
+        except Exception:
+            return a_cont
+
+        w, h = frame_size
+        if 0.0 <= tx <= 1.0 and 0.0 <= ty <= 1.0 and w > 0 and h > 0:
+            tx *= float(w)
+            ty *= float(h)
+
+        cx = float(w) / 2.0
+        cy = float(h) / 2.0
+        dx = float(tx - cx)
+        dy = float(ty - cy)
+        denom = max(1.0, max(abs(dx), abs(dy)))
+        vx = dx / denom
+        vy = dy / denom
+
+        if action == "retreat":
+            vx = -vx
+            vy = -vy
+
+        base = [float(x) for x in (a_cont or [])]
+        while len(base) < 2:
+            base.append(0.0)
+        alpha = float(self._system2_blend)
+        base[0] = (1.0 - alpha) * base[0] + alpha * float(vx)
+        base[1] = (1.0 - alpha) * base[1] + alpha * float(vy)
+        return base
+
     def _bridge_read_frame(self) -> Optional["GameFrame"]:
         if not self.bridge or not self._bridge_loop:
             return None
@@ -5689,6 +5884,40 @@ class WorkerService:
                     self._stop.wait(0.01)
                     continue
 
+            # Optional System 2/3 centralized VLM loop (non-blocking).
+            if self._cognitive_client is not None:
+                try:
+                    if reward_frame_hwc is not None:
+                        self._cognitive_client.add_frame(reward_frame_hwc)
+                    elif latest_image_bytes is not None:
+                        import io
+                        import numpy as np  # type: ignore
+                        from PIL import Image
+
+                        img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
+                        self._cognitive_client.add_frame(np.asarray(img, dtype=np.uint8))
+                except Exception:
+                    pass
+                try:
+                    resp = self._cognitive_client.poll_response()
+                    if resp is not None:
+                        self._system2_on_strategy_response(resp, now=now)
+                except Exception:
+                    pass
+                try:
+                    if self._cognitive_client.should_request_strategy():
+                        agent_state = self._system2_build_agent_state(
+                            game_state=game_state,
+                            detections=detections,
+                            frame_size=frame_size,
+                            now=now,
+                        )
+                        req = self._cognitive_client.request_strategy(agent_state=agent_state)
+                        if req is not None:
+                            self._system2_last_request = req
+                except Exception:
+                    pass
+
             ui_elements_cache = None
             action_mask_cache = None
             try:
@@ -5959,6 +6188,25 @@ class WorkerService:
                                 forced_ui_click = None
                     except Exception:
                         forced_ui_click = None
+
+            # Optional System 2 (centralized VLM) directive -> continuous control hint.
+            if (
+                self._cognitive_client is not None
+                and self._system2_override_cont
+                and frame_size is not None
+                and not menu_hint
+            ):
+                try:
+                    directive = self._cognitive_client.get_current_directive()
+                    if directive is not None:
+                        a_cont = self._system2_apply_continuous_directive(
+                            a_cont=a_cont,
+                            directive=directive,
+                            frame_size=frame_size,
+                        )
+                        action_source = f"{action_source}+system2" if action_source else "system2"
+                except Exception:
+                    pass
 
             if self._action_clip_enabled and a_cont:
                 raw_cont = [float(x) for x in (a_cont or [])]
@@ -6816,6 +7064,23 @@ class WorkerService:
                 except Exception:
                     pass
             done = bool(done_from_game)
+            # System 2 RL outcome tracking (append-only JSONL).
+            if self._cognitive_client is not None and self._system2_active_decision_id is not None:
+                try:
+                    self._system2_active_reward_sum += float(reward)
+                except Exception:
+                    pass
+                expired = False
+                try:
+                    expired = self._cognitive_client.get_current_directive() is None
+                except Exception:
+                    expired = False
+                if done or expired:
+                    self._system2_maybe_log_outcome(
+                        now=now,
+                        reason="done" if done else "expired",
+                        done=bool(done),
+                    )
             if done:
                 try:
                     self.trainer.reset_state()
