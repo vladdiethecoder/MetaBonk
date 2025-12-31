@@ -66,9 +66,22 @@ import urllib.request
 import os
 try:
     # Prefer orchestrator /workers (single heartbeat payloads with featured_slot annotations).
-    data = json.load(urllib.request.urlopen("http://127.0.0.1:8040/workers", timeout=2))
+    payload = json.load(urllib.request.urlopen("http://127.0.0.1:8040/workers", timeout=2))
 except Exception:
     sys.exit(1)
+
+data = payload
+if isinstance(payload, dict) and isinstance(payload.get("workers_by_id"), dict):
+    data = payload.get("workers_by_id") or {}
+elif isinstance(payload, dict) and isinstance(payload.get("workers"), list):
+    mapped = {}
+    for row in payload.get("workers") or []:
+        if not isinstance(row, dict):
+            continue
+        iid = str(row.get("instance_id") or "")
+        if iid:
+            mapped[iid] = row
+    data = mapped
 
 def okish(hb: dict) -> bool:
     # stream_ok may be False until the first client connects; pipewire_node_ok indicates capture ready.

@@ -56,6 +56,22 @@ def _get_json(url: str, timeout: float = 2.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+def _workers_map(payload):
+    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if isinstance(payload.get("workers"), list):
+        out = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
 deadline = time.time() + wait_s
 last_err = None
 while time.time() < deadline:
@@ -72,7 +88,8 @@ deadline = time.time() + wait_s
 last = None
 while time.time() < deadline:
     try:
-        last = _get_json(f"{orch}/workers", timeout=2.0)
+        payload = _get_json(f"{orch}/workers", timeout=2.0)
+        last = _workers_map(payload)
         if isinstance(last, dict) and len(last) >= workers_expected:
             break
     except Exception:
@@ -116,6 +133,21 @@ def _get_json(url: str, timeout: float = 2.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+def _get_workers(timeout: float = 2.0):
+    payload = _get_json(f"{orch}/workers", timeout=timeout)
+    if isinstance(payload, dict) and isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if isinstance(payload, dict) and isinstance(payload.get("workers"), list):
+        out = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload if isinstance(payload, dict) else {}
+
 def _worker_base_url(hb: dict) -> str | None:
     cu = (hb.get("control_url") or "").strip()
     if cu:
@@ -129,7 +161,7 @@ def _worker_base_url(hb: dict) -> str | None:
         return su.rsplit("/", 1)[0].rstrip("/")
     return su.rstrip("/")
 
-workers = _get_json(f"{orch}/workers", timeout=2.0)
+workers = _get_workers(timeout=2.0)
 target = None
 for hb in workers.values():
     base = _worker_base_url(hb or {})
@@ -278,7 +310,23 @@ def _get_json(url: str, timeout: float = 2.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-workers = _get_json(f"{orch}/workers", timeout=2.0)
+def _workers_map(payload):
+    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if isinstance(payload.get("workers"), list):
+        out = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
+workers = _workers_map(_get_json(f"{orch}/workers", timeout=2.0))
 target = None
 for hb in workers.values():
     pid = hb.get("worker_pid")
@@ -296,7 +344,7 @@ os.kill(pid, signal.SIGTERM)
 deadline = time.time() + 60
 new_pid = None
 while time.time() < deadline:
-    workers = _get_json(f"{orch}/workers", timeout=2.0)
+    workers = _workers_map(_get_json(f"{orch}/workers", timeout=2.0))
     hb = workers.get(iid)
     if hb:
         cur = hb.get("worker_pid")
@@ -326,7 +374,23 @@ def _get_json(url: str, timeout: float = 2.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-workers = _get_json(f"{orch}/workers", timeout=2.0)
+def _workers_map(payload):
+    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if isinstance(payload.get("workers"), list):
+        out = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
+workers = _workers_map(_get_json(f"{orch}/workers", timeout=2.0))
 target = None
 for hb in workers.values():
     cu = (hb.get("control_url") or "").rstrip("/")

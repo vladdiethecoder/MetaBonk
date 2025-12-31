@@ -73,10 +73,10 @@ class MockGameEnv:
         return self.get_obs()
 
     # InteractionEnv methods.
-    def press_key(self, key: str) -> None:
+    def key_down(self, key: str) -> None:
         self._pressed.add(str(key).upper())
 
-    def release_key(self, key: str) -> None:
+    def key_up(self, key: str) -> None:
         self._pressed.discard(str(key).upper())
 
     def move_mouse(self, dx: int, dy: int) -> None:
@@ -95,7 +95,7 @@ class MockGameEnv:
             # For now, treat mouse actions as camera.
             self._pressed.add("CAMERA")
         elif input_id:
-            self.press_key(input_id)
+            self.key_down(input_id)
 
 
 class MockRLEnv:

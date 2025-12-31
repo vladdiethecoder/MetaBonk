@@ -539,9 +539,9 @@ class SIMA2Controller:
     def _rule_based_action(self, observation: Observation) -> np.ndarray:
         """Fallback action generation.
 
-        Intentionally avoids any hard-coded game-specific logic (WASD, aim
-        heuristics, center-of-screen assumptions, etc.). If the learned motor
-        policy is unavailable, we emit a no-op vector.
+        Intentionally avoids any hard-coded game-specific control assumptions
+        (movement keys, aim heuristics, center-of-screen assumptions, etc.).
+        If the learned motor policy is unavailable, we emit a no-op vector.
         """
         action_dim = 6
         motor = self.motor

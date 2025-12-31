@@ -234,10 +234,17 @@ def main() -> int:
     parser.add_argument("--vision-port", type=int, default=8050)
     parser.add_argument("--learner-port", type=int, default=8061)
     parser.add_argument("--worker-base-port", type=int, default=5000)
+    parser.add_argument("--gamescope-width", type=int, default=int(os.environ.get("MEGABONK_WIDTH", "1280")))
+    parser.add_argument("--gamescope-height", type=int, default=int(os.environ.get("MEGABONK_HEIGHT", "720")))
 
     # BonkLink (no memory access)
     parser.add_argument("--bonklink-host", default=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"))
-    parser.add_argument("--bonklink-port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")))
+    parser.add_argument(
+        "--bonklink-port",
+        type=int,
+        default=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")),
+        help="BonkLink base TCP port (per-worker ports increment from this). Avoid 5555 (used by the cognitive server ZMQ by default).",
+    )
     parser.add_argument("--reward-ckpt", default=os.environ.get("METABONK_VIDEO_REWARD_CKPT", "checkpoints/video_reward_model.pt"))
     parser.add_argument("--game-dir", default=os.environ.get("MEGABONK_GAME_DIR", ""), help="Path to Megabonk install dir (contains Megabonk.exe)")
     parser.add_argument("--appid", type=int, default=int(os.environ.get("MEGABONK_APPID", "3405340")))
@@ -420,6 +427,9 @@ def main() -> int:
     env["METABONK_BONKLINK_PORT"] = str(args.bonklink_port)
     env["METABONK_BONKLINK_USE_PIPE"] = "0"
     env["METABONK_USE_LEARNED_REWARD"] = "1"
+    if str(env.get("METABONK_PURE_VISION_MODE", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        # Pure-vision validation forbids any external/shaped reward sources.
+        env["METABONK_USE_LEARNED_REWARD"] = "0"
     env["METABONK_VIDEO_REWARD_CKPT"] = args.reward_ckpt
 
     # Streaming profile selection:
@@ -444,7 +454,12 @@ def main() -> int:
     # due to a slow/half-closed client. The UI still enforces a per-worker lock to avoid
     # intentional multi-client contention.
     env.setdefault("METABONK_STREAM_MAX_CLIENTS", "3")
-    env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
+    # Synthetic Eye runs without PipeWire (DMA-BUF comes from Smithay/Vulkan export). Do not
+    # gate startup on PIPEWIRE_NODE in that mode.
+    if bool(getattr(args, "synthetic_eye", False)):
+        env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "0")
+    else:
+        env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
     env.setdefault("METABONK_CAPTURE_DISABLED", "0")
     # Only capture/stream featured slots by default to avoid saturating GPU encoders.
     env.setdefault("METABONK_CAPTURE_ALL", "0")
@@ -622,6 +637,10 @@ def main() -> int:
             str(args.learner_port),
             "--worker-base-port",
             str(args.worker_base_port),
+            "--gamescope-width",
+            str(int(args.gamescope_width)),
+            "--gamescope-height",
+            str(int(args.gamescope_height)),
             "--policy-name",
             args.policy_name,
             "--bonklink-host",
@@ -656,6 +675,13 @@ def main() -> int:
             ]
         if args.mode == "train":
             omega_cmd += ["--workers", str(int(args.workers))]
+            # Avoid synchronized System2/VLM request bursts: stagger request schedule across
+            # workers when using a centralized cognitive server.
+            try:
+                workers_n = max(1, int(args.workers))
+                env.setdefault("METABONK_SYSTEM2_JITTER_BUCKETS", str(int(workers_n)))
+            except Exception:
+                pass
         elif args.mode == "watch":
             omega_cmd += ["--workers", "0"]
         if args.mode == "dream":

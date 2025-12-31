@@ -4,6 +4,7 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     os::unix::prelude::AsRawFd,
     path::Path,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -118,22 +119,56 @@ impl FrameServer {
         .encode(&mut buf);
         buf.extend_from_slice(payload);
 
-        let iov = [IoSlice::new(&buf)];
-        let cmsg = if fds.is_empty() {
-            vec![]
-        } else {
-            vec![ControlMessage::ScmRights(fds)]
-        };
-
         let raw_fd = stream.as_raw_fd();
-        match sendmsg::<()>(raw_fd, &iov, &cmsg, MsgFlags::MSG_NOSIGNAL, None) {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                warn!("sendmsg failed: {err}");
-                self.stream = None;
-                Err(anyhow::anyhow!("sendmsg failed: {err}"))
+        let started = Instant::now();
+        let mut offset: usize = 0;
+        let mut first = true;
+        while offset < buf.len() {
+            let iov = [IoSlice::new(&buf[offset..])];
+            let cmsg_holder = if first && !fds.is_empty() {
+                Some(ControlMessage::ScmRights(fds))
+            } else {
+                None
+            };
+            let cmsg: &[ControlMessage] = match cmsg_holder.as_ref() {
+                Some(msg) => std::slice::from_ref(msg),
+                None => &[],
+            };
+            match sendmsg::<()>(raw_fd, &iov, cmsg, MsgFlags::MSG_NOSIGNAL, None) {
+                Ok(n) => {
+                    if n == 0 {
+                        warn!("sendmsg returned 0 bytes sent (msg_type={msg_type:?}, len={})", buf.len());
+                        self.stream = None;
+                        return Err(anyhow::anyhow!("sendmsg returned 0 bytes sent"));
+                    }
+                    if first && n < buf.len() {
+                        warn!(
+                            "sendmsg partial write (msg_type={msg_type:?}): sent={} total={} fds={}",
+                            n,
+                            buf.len(),
+                            fds.len()
+                        );
+                    }
+                    offset = offset.saturating_add(n);
+                    first = false;
+                }
+                Err(err) => {
+                    warn!("sendmsg failed: {err}");
+                    self.stream = None;
+                    return Err(anyhow::anyhow!("sendmsg failed: {err}"));
+                }
             }
         }
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_millis(50) {
+            warn!(
+                "sendmsg slow (msg_type={msg_type:?}): elapsed_ms={:.1} len={} fds={}",
+                elapsed.as_secs_f64() * 1000.0,
+                buf.len(),
+                fds.len()
+            );
+        }
+        Ok(())
     }
 
     pub fn recv_message_type(&mut self) -> anyhow::Result<MsgType> {

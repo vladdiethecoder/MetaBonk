@@ -164,8 +164,12 @@ struct Slot {
     // Internal semaphore used to chain submissions when we need a second "signal SYNC_FD" submit.
     copy_done: vk::Semaphore,
     fence: vk::Fence,
-    prev_acquire: Option<vk::Semaphore>,
-    prev_release: Option<vk::Semaphore>,
+    // External semaphores used for CUDA interop (OPAQUE_FD). Reused per slot to avoid per-frame
+    // create/destroy overhead which can dominate multi-worker throughput.
+    acquire: vk::Semaphore,
+    release: vk::Semaphore,
+    // Whether to wait on the consumer release semaphore before reusing this slot.
+    wait_on_release: bool,
     to_destroy_sems: Vec<vk::Semaphore>,
     to_destroy: Vec<(vk::Semaphore, vk::Semaphore)>,
     to_destroy_imported: Vec<ImportedResource>,
@@ -362,6 +366,8 @@ impl VulkanProducer {
                 )
             }
             .context("create fence")?;
+            let acquire = self.create_exportable_opaque_semaphore().context("create exportable acquire semaphore")?;
+            let release = self.create_exportable_opaque_semaphore().context("create exportable release semaphore")?;
             self.slots.push(Slot {
                 image,
                 memory,
@@ -376,8 +382,9 @@ impl VulkanProducer {
                 cmd: cmds[idx],
                 copy_done,
                 fence,
-                prev_acquire: None,
-                prev_release: None,
+                acquire,
+                release,
+                wait_on_release: false,
                 to_destroy_sems: Vec::new(),
                 to_destroy: Vec::new(),
                 to_destroy_imported: Vec::new(),
@@ -520,16 +527,18 @@ impl VulkanProducer {
             slot.to_release_buffers.clear();
         }
 
-        let (acquire, acquire_fd) = self.create_exportable_semaphore()?;
-        let (release, release_fd) = self.create_exportable_semaphore()?;
+        let (acquire, release, wait_on_release) = {
+            let slot = &mut self.slots[slot_idx];
+            (slot.acquire, slot.release, slot.wait_on_release)
+        };
+        let acquire_fd = self.export_semaphore_opaque_fd(acquire)?;
+        let release_fd = self.export_semaphore_opaque_fd(release)?;
 
         // Record: clear image to a varying color (keeps MVP visually obvious for debugging).
         let (
             image,
             cmd,
             fence,
-            prev_acquire,
-            prev_release,
             modifier,
             stride,
             offset,
@@ -545,8 +554,6 @@ impl VulkanProducer {
                 slot.image,
                 slot.cmd,
                 slot.fence,
-                slot.prev_acquire,
-                slot.prev_release,
                 slot.modifier,
                 slot.stride,
                 slot.offset,
@@ -668,9 +675,9 @@ impl VulkanProducer {
         // Submit with explicit wait on previous consumer release.
         let mut wait_sems: Vec<vk::Semaphore> = Vec::new();
         let mut wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
-        if let Some(prev_rel) = prev_release {
+        if wait_on_release {
             if !self.ignore_consumer_release_wait {
-                wait_sems.push(prev_rel);
+                wait_sems.push(release);
                 wait_stages.push(vk::PipelineStageFlags::TRANSFER);
             }
         }
@@ -719,11 +726,7 @@ impl VulkanProducer {
         self.frame_id += 1;
         {
             let slot = &mut self.slots[slot_idx];
-            if let (Some(pa), Some(pr)) = (prev_acquire, prev_release) {
-                slot.to_destroy.push((pa, pr));
-            }
-            slot.prev_acquire = Some(acquire);
-            slot.prev_release = Some(release);
+            slot.wait_on_release = true;
         }
 
         Ok(RenderedFrame {
@@ -809,8 +812,12 @@ impl VulkanProducer {
             slot.to_release_buffers.clear();
         }
 
-        let (acquire, acquire_fd) = self.create_exportable_semaphore()?;
-        let (release, release_fd) = self.create_exportable_semaphore()?;
+        let (acquire, release, wait_on_release) = {
+            let slot = &mut self.slots[slot_idx];
+            (slot.acquire, slot.release, slot.wait_on_release)
+        };
+        let acquire_fd = self.export_semaphore_opaque_fd(acquire)?;
+        let release_fd = self.export_semaphore_opaque_fd(release)?;
 
         // Import the source DMA-BUF as a Vulkan image for GPU-to-GPU copy into our exportable slot image.
         //
@@ -995,8 +1002,6 @@ impl VulkanProducer {
             dst_image,
             cmd,
             fence,
-            prev_acquire,
-            prev_release,
             modifier,
             stride,
             offset,
@@ -1012,8 +1017,6 @@ impl VulkanProducer {
                 slot.image,
                 slot.cmd,
                 slot.fence,
-                slot.prev_acquire,
-                slot.prev_release,
                 slot.modifier,
                 slot.stride,
                 slot.offset,
@@ -1465,9 +1468,9 @@ impl VulkanProducer {
         // Submit with explicit wait on previous consumer release.
         let mut wait_sems: Vec<vk::Semaphore> = Vec::new();
         let mut wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
-        if let Some(prev_rel) = prev_release {
+        if wait_on_release {
             if !self.ignore_consumer_release_wait {
-                wait_sems.push(prev_rel);
+                wait_sems.push(release);
                 // Previous consumer operations may touch the image in any stage. Waiting at
                 // TOP_OF_PIPE prevents us from starting acquisition/layout transitions early.
                 wait_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE);
@@ -1622,11 +1625,7 @@ impl VulkanProducer {
         self.frame_id += 1;
         {
             let slot = &mut self.slots[slot_idx];
-            if let (Some(pa), Some(pr)) = (prev_acquire, prev_release) {
-                slot.to_destroy.push((pa, pr));
-            }
-            slot.prev_acquire = Some(acquire);
-            slot.prev_release = Some(release);
+            slot.wait_on_release = true;
         }
 
         Ok(RenderedFrame {
@@ -1739,8 +1738,12 @@ impl VulkanProducer {
             size_bytes
         );
 
-        let (acquire, acquire_fd) = self.create_exportable_semaphore()?;
-        let (release, release_fd) = self.create_exportable_semaphore()?;
+        let (acquire, release, wait_on_release) = {
+            let slot = &mut self.slots[slot_idx];
+            (slot.acquire, slot.release, slot.wait_on_release)
+        };
+        let acquire_fd = self.export_semaphore_opaque_fd(acquire)?;
+        let release_fd = self.export_semaphore_opaque_fd(release)?;
 
         let mut imported_wait_sem: Option<vk::Semaphore> = None;
         if let Some(fd) = wait_fd.0.take() {
@@ -1764,6 +1767,12 @@ impl VulkanProducer {
         // Keep the producer running and rely on the fixed-FPS pacing + slot fences for backpressure.
         let mut wait_sems: Vec<vk::Semaphore> = Vec::new();
         let mut wait_stages: Vec<vk::PipelineStageFlags> = Vec::new();
+        if wait_on_release {
+            if !self.ignore_consumer_release_wait {
+                wait_sems.push(release);
+                wait_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE);
+            }
+        }
         if let Some(wait_sem) = imported_wait_sem {
             wait_sems.push(wait_sem);
             wait_stages.push(vk::PipelineStageFlags::TRANSFER);
@@ -1798,11 +1807,7 @@ impl VulkanProducer {
         self.frame_id += 1;
         {
             let slot = &mut self.slots[slot_idx];
-            if let (Some(pa), Some(pr)) = (slot.prev_acquire.take(), slot.prev_release.take()) {
-                slot.to_destroy.push((pa, pr));
-            }
-            slot.prev_acquire = Some(acquire);
-            slot.prev_release = Some(release);
+            slot.wait_on_release = true;
         }
 
         Ok(RenderedFrame {
@@ -2415,12 +2420,27 @@ impl VulkanProducer {
     }
 
     pub fn on_consumer_disconnect(&mut self) {
-        for slot in &mut self.slots {
-            if let (Some(pa), Some(pr)) = (slot.prev_acquire.take(), slot.prev_release.take()) {
-                slot.to_destroy.push((pa, pr));
+        for slot_idx in 0..self.slots.len() {
+            let (old_acquire, old_release) = {
+                let slot = &mut self.slots[slot_idx];
+                slot.wait_on_release = false;
+                (slot.acquire, slot.release)
+            };
+
+            let new_acquire = self.create_exportable_opaque_semaphore();
+            let new_release = self.create_exportable_opaque_semaphore();
+
+            match (new_acquire, new_release) {
+                (Ok(new_acquire), Ok(new_release)) => {
+                    let slot = &mut self.slots[slot_idx];
+                    slot.acquire = new_acquire;
+                    slot.release = new_release;
+                    slot.to_destroy.push((old_acquire, old_release));
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!("failed to reset exportable semaphores on consumer disconnect: {e}");
+                }
             }
-            slot.prev_acquire = None;
-            slot.prev_release = None;
         }
     }
 
@@ -2602,15 +2622,24 @@ impl VulkanProducer {
         Ok(fd)
     }
 
-    fn create_exportable_semaphore(&self) -> anyhow::Result<(vk::Semaphore, RawFd)> {
+    fn create_exportable_opaque_semaphore(&self) -> anyhow::Result<vk::Semaphore> {
         let mut export =
             vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
-        let sem = unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None) }
-        .context("create_semaphore")?;
+        unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None) }
+            .context("create exportable semaphore")
+    }
+
+    fn export_semaphore_opaque_fd(&self, sem: vk::Semaphore) -> anyhow::Result<RawFd> {
         let fd_info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(sem)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
         let fd = unsafe { self.khr_sema_fd.get_semaphore_fd(&fd_info) }.context("vkGetSemaphoreFdKHR")?;
+        Ok(fd)
+    }
+
+    fn create_exportable_semaphore(&self) -> anyhow::Result<(vk::Semaphore, RawFd)> {
+        let sem = self.create_exportable_opaque_semaphore()?;
+        let fd = self.export_semaphore_opaque_fd(sem)?;
         Ok((sem, fd))
     }
 
@@ -2692,12 +2721,8 @@ impl Drop for VulkanProducer {
                     self.device.destroy_semaphore(sem, None);
                 }
                 self.device.destroy_semaphore(slot.copy_done, None);
-                if let Some(a) = slot.prev_acquire {
-                    self.device.destroy_semaphore(a, None);
-                }
-                if let Some(r) = slot.prev_release {
-                    self.device.destroy_semaphore(r, None);
-                }
+                self.device.destroy_semaphore(slot.acquire, None);
+                self.device.destroy_semaphore(slot.release, None);
                 self.device.destroy_fence(slot.fence, None);
                 if let Some(buf) = slot.linear_buffer {
                     self.device.destroy_buffer(buf, None);

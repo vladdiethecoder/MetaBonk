@@ -14,7 +14,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import re
 import time
+import zlib
 from collections import deque
 from io import BytesIO
 from typing import Any, Deque, Dict, List, Optional
@@ -68,6 +71,18 @@ class CognitiveClient:
         self.request_frequency_s = float(request_frequency_s)
         self.jpeg_quality = int(max(1, min(95, jpeg_quality)))
         self.max_edge = int(max(0, max_edge))
+        try:
+            self.frames_per_request = int(os.environ.get("METABONK_SYSTEM2_FRAMES", "9") or 9)
+        except Exception:
+            self.frames_per_request = 9
+        self.frames_per_request = max(1, min(9, int(self.frames_per_request)))
+        try:
+            self.menu_frames_per_request = int(
+                os.environ.get("METABONK_SYSTEM2_MENU_FRAMES", str(self.frames_per_request)) or self.frames_per_request
+            )
+        except Exception:
+            self.menu_frames_per_request = int(self.frames_per_request)
+        self.menu_frames_per_request = max(1, min(9, int(self.menu_frames_per_request)))
 
         self.context = zmq.Context.instance()
         self.socket = self.context.socket(zmq.DEALER)
@@ -81,7 +96,37 @@ class CognitiveClient:
         self.current_directive: Optional[Dict[str, Any]] = None
         self.directive_timestamp: float = 0.0
         self.pending_request = False
+        # Stagger requests across workers to avoid synchronized bursts that create
+        # artificial queueing latency on the centralized VLM server.
+        now = time.time()
         self.last_request_time = 0.0
+        try:
+            freq = float(self.request_frequency_s or 0.0)
+        except Exception:
+            freq = 0.0
+        if freq > 0.0:
+            try:
+                buckets = int(os.environ.get("METABONK_SYSTEM2_JITTER_BUCKETS", "0") or 0)
+            except Exception:
+                buckets = 0
+            phase = 0.0
+            if buckets > 0:
+                m = re.search(r"(\d+)\s*$", str(self.agent_id))
+                if m:
+                    try:
+                        slot = int(m.group(1)) % int(buckets)
+                        phase = float(slot) / float(max(1, int(buckets)))
+                    except Exception:
+                        phase = 0.0
+                else:
+                    phase = 0.0
+            else:
+                try:
+                    phase = float(zlib.adler32(self.agent_id.encode("utf-8")) % 1000) / 1000.0
+                except Exception:
+                    phase = 0.0
+            # If phase=0 -> wait ~freq; if phase~1 -> send almost immediately.
+            self.last_request_time = float(now) - float(phase) * float(freq)
 
         logger.info("%s: CognitiveClient connected to %s", self.agent_id, self.server_url)
 
@@ -97,6 +142,13 @@ class CognitiveClient:
         self.frame_buffer.append(arr)
 
     def should_request_strategy(self) -> bool:
+        if self.pending_request:
+            # Avoid deadlocking the client if a response is lost (e.g. server restart).
+            # Let callers send a fresh request after a conservative timeout.
+            pending_age = float(time.time() - float(self.last_request_time or 0.0))
+            stale_after = max(10.0, float(self.request_frequency_s) * 4.0)
+            if pending_age >= stale_after:
+                self.pending_request = False
         if (time.time() - self.last_request_time) < self.request_frequency_s:
             return False
         if self.pending_request:
@@ -110,7 +162,12 @@ class CognitiveClient:
         if not self.should_request_strategy():
             return None
 
-        frames = self._build_temporal_strip()
+        state = dict(agent_state or {})
+        menu_hint = state.get("menu_hint")
+        if isinstance(menu_hint, str):
+            menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
+        frames_to_send = self.menu_frames_per_request if bool(menu_hint) else self.frames_per_request
+        frames = self._build_temporal_strip(total_frames=int(frames_to_send))
         if frames is None:
             return None
 
@@ -124,7 +181,7 @@ class CognitiveClient:
             request = {
                 "agent_id": self.agent_id,
                 "frames": frames_b64,
-                "state": dict(agent_state or {}),
+                "state": state,
                 "timestamp": time.time(),
             }
             self.socket.send(json.dumps(request).encode("utf-8"), flags=zmq.NOBLOCK)
@@ -165,21 +222,27 @@ class CognitiveClient:
         except Exception:
             pass
 
-    def _build_temporal_strip(self) -> Optional[List[Image.Image]]:
-        """Build 9-frame strip: past (<=5) + predicted future (3) + padding to 9."""
+    def _build_temporal_strip(self, *, total_frames: int = 9) -> Optional[List[Image.Image]]:
+        """Build a temporal strip: past (<=5) + predicted future (<=3) + padding.
+
+        The server accepts 1..9 frames. Default remains 9 for maximum temporal context.
+        """
         if len(self.frame_buffer) < 2:
             return None
+        total_frames = max(1, min(9, int(total_frames)))
 
         past = list(self.frame_buffer)
         current = past[-1]
-        future = self.future_predictor.predict(current, past[-2])
-        all_frames: List[np.ndarray] = past + future
+        all_frames: List[np.ndarray] = list(past)
+        if len(all_frames) < total_frames:
+            future = self.future_predictor.predict(current, past[-2])
+            all_frames.extend(future)
 
-        # Pad/clip to 9 frames.
-        while len(all_frames) < 9:
+        # Pad/clip to requested frame count.
+        while len(all_frames) < total_frames:
             all_frames.append(current)
-        if len(all_frames) > 9:
-            all_frames = all_frames[-9:]
+        if len(all_frames) > total_frames:
+            all_frames = all_frames[-total_frames:]
 
         pil_frames: List[Image.Image] = []
         for arr in all_frames:
@@ -198,4 +261,3 @@ class CognitiveClient:
 
 
 __all__ = ["CognitiveClient"]
-

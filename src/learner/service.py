@@ -5,8 +5,10 @@ learners and serves weights.
 
 SinZero integration:
   - Policy names matching a Sin receive default bias knobs.
-  - Lust gets Random Network Distillation (RND) intrinsic reward.
-  - Other sins currently use lightweight heuristics (see `_intrinsic_reward`).
+  - Random Network Distillation (RND) intrinsic reward is available:
+      - by default for Lust
+      - for all sins when `METABONK_PURE_VISION_MODE=1` (pure vision forbids extrinsic rewards)
+  - Other intrinsic heuristics may be added in `_intrinsic_reward`.
 
 This keeps the distributed recovery system runnable while leaving room
 for research‑grade upgrades (OPPO, alpha‑divergence, CVaR, MoE).
@@ -452,7 +454,15 @@ def _get_or_create(policy_name: str, obs_dim: int) -> PolicyLearner:
     # Best-effort warm-start from saved PPO weights or from a shared init ckpt.
     _try_load_ppo_weights(learner, policy_name=policy_name, obs_dim=obs_dim)
 
-    if sin == Sin.LUST:
+    pure_vision_mode = str(os.environ.get("METABONK_PURE_VISION_MODE", "0") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    exploration_on = os.environ.get("METABONK_EXPLORATION_REWARDS", "1") in ("1", "true", "True")
+    want_rnd = exploration_on and (sin == Sin.LUST or pure_vision_mode)
+    if want_rnd and policy_name not in _rnd:
         _rnd[policy_name] = RNDModule(RNDConfig(obs_dim=obs_dim), device=str(learner.device))
 
     return learner
@@ -619,8 +629,9 @@ def _intrinsic_reward(
     if sin is None:
         return torch.zeros(obs_t.shape[0], device=obs_t.device)
 
-    if sin == Sin.LUST and policy_name in _rnd:
-        return _rnd[policy_name].intrinsic_reward(obs_t)
+    rnd = _rnd.get(policy_name)
+    if rnd is not None:
+        return rnd.intrinsic_reward(obs_t)
 
     return torch.zeros(obs_t.shape[0], device=obs_t.device)
 
@@ -753,7 +764,10 @@ async def push_rollout(batch: RolloutBatch):
     actions_flat = torch.cat([actions_cont_t, actions_disc_t.float()], dim=-1)
 
     # Add intrinsic reward if applicable.
-    intr = _intrinsic_reward(batch.policy_name, obs_t, actions_cont_t)
+    exploration_on = os.environ.get("METABONK_EXPLORATION_REWARDS", "1") in ("1", "true", "True")
+    intr = _intrinsic_reward(batch.policy_name, obs_t, actions_cont_t) if exploration_on else torch.zeros(
+        obs_t.shape[0], device=obs_t.device
+    )
     coef = 0.0
     # Prefer curiosity_beta from hparams if present (matches YAML presets).
     if batch.hparams and isinstance(batch.hparams.get("reward_shaping"), dict):
@@ -768,8 +782,8 @@ async def push_rollout(batch: RolloutBatch):
         coef = bias.intrinsic_coef if bias else 0.0
     rewards_t = rewards_t + coef * intr
 
-    # Update RND online for Lust.
-    if batch.policy_name in _rnd:
+    # Update RND online (if enabled for this policy).
+    if exploration_on and batch.policy_name in _rnd:
         try:
             _rnd[batch.policy_name].update(obs_t)
         except Exception:

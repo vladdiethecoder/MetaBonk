@@ -26,8 +26,8 @@ class InteractionEnv(Protocol):
     def get_obs(self) -> Any: ...
     def step(self, n: int = 1) -> Any: ...
 
-    def press_key(self, key: Union[int, str]) -> None: ...
-    def release_key(self, key: Union[int, str]) -> None: ...
+    def key_down(self, key: Union[int, str]) -> None: ...
+    def key_up(self, key: Union[int, str]) -> None: ...
 
     def move_mouse(self, dx: int, dy: int) -> None: ...
     def click_button(self, button: Union[int, str]) -> None: ...
@@ -179,9 +179,9 @@ class InputExplorer:
                 effect: Optional[Dict[str, Any]] = None
                 success = True
                 try:
-                    env.press_key(key)
+                    env.key_down(key)
                     self._step(env, int(duration))
-                    env.release_key(key)
+                    env.key_up(key)
                     obs_after = env.get_obs()
                     effect = self.effect_detector.detect_effect(obs_before, obs_after)
                     effects.append((test_type, dict(effect)))
@@ -191,7 +191,7 @@ class InputExplorer:
                 finally:
                     # Best-effort release in case of exceptions (avoid stuck keys).
                     try:
-                        env.release_key(key)
+                        env.key_up(key)
                     except Exception:
                         pass
 

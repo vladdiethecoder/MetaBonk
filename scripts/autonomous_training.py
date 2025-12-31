@@ -63,10 +63,10 @@ class ToyVisualEnv:
             self._t += 1
         return self.get_obs()
 
-    def press_key(self, key: str) -> None:
+    def key_down(self, key: str) -> None:
         self._pressed.add(str(key).upper())
 
-    def release_key(self, key: str) -> None:
+    def key_up(self, key: str) -> None:
         self._pressed.discard(str(key).upper())
 
     def move_mouse(self, dx: int, dy: int) -> None:

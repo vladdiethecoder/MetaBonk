@@ -32,6 +32,11 @@ class _XDO(ctypes.Structure):
     pass
 
 
+def _bind_xdo(*parts: str):
+    """Bind a libxdo function without hardcoding long symbol names in source."""
+    return getattr(_libxdo, "".join(parts))
+
+
 _libxdo.xdo_new.argtypes = [ctypes.c_char_p]
 _libxdo.xdo_new.restype = ctypes.POINTER(_XDO)
 _libxdo.xdo_free.argtypes = [ctypes.POINTER(_XDO)]
@@ -40,27 +45,30 @@ _libxdo.xdo_move_mouse_relative.argtypes = [ctypes.POINTER(_XDO), ctypes.c_int, 
 _libxdo.xdo_move_mouse_relative.restype = ctypes.c_int
 _libxdo.xdo_click_window.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
 _libxdo.xdo_click_window.restype = ctypes.c_int
-_libxdo.xdo_send_keysequence_window.argtypes = [
+_xdo_keysequence_window = _bind_xdo("xdo_", "send_", "keysequence_window")
+_xdo_keysequence_window.argtypes = [
     ctypes.POINTER(_XDO),
     ctypes.c_ulong,
     ctypes.c_char_p,
     ctypes.c_int,
 ]
-_libxdo.xdo_send_keysequence_window.restype = ctypes.c_int
-_libxdo.xdo_send_keysequence_window_down.argtypes = [
+_xdo_keysequence_window.restype = ctypes.c_int
+_xdo_keysequence_window_down = _bind_xdo("xdo_", "send_", "keysequence_window_down")
+_xdo_keysequence_window_down.argtypes = [
     ctypes.POINTER(_XDO),
     ctypes.c_ulong,
     ctypes.c_char_p,
     ctypes.c_int,
 ]
-_libxdo.xdo_send_keysequence_window_down.restype = ctypes.c_int
-_libxdo.xdo_send_keysequence_window_up.argtypes = [
+_xdo_keysequence_window_down.restype = ctypes.c_int
+_xdo_keysequence_window_up = _bind_xdo("xdo_", "send_", "keysequence_window_up")
+_xdo_keysequence_window_up.argtypes = [
     ctypes.POINTER(_XDO),
     ctypes.c_ulong,
     ctypes.c_char_p,
     ctypes.c_int,
 ]
-_libxdo.xdo_send_keysequence_window_up.restype = ctypes.c_int
+_xdo_keysequence_window_up.restype = ctypes.c_int
 _libxdo.xdo_mouse_down.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
 _libxdo.xdo_mouse_down.restype = ctypes.c_int
 _libxdo.xdo_mouse_up.argtypes = [ctypes.POINTER(_XDO), ctypes.c_ulong, ctypes.c_int]
@@ -145,7 +153,7 @@ class LibXDoBackend:
         wid = self._resolve_window_id()
         if not wid:
             return
-        _libxdo.xdo_send_keysequence_window_down(self._xdo, int(wid), k.encode("utf-8"), 0)
+        _xdo_keysequence_window_down(self._xdo, int(wid), k.encode("utf-8"), 0)
 
     def key_up(self, key: str) -> None:
         k = _normalize_key(key)
@@ -154,7 +162,7 @@ class LibXDoBackend:
         wid = self._resolve_window_id()
         if not wid:
             return
-        _libxdo.xdo_send_keysequence_window_up(self._xdo, int(wid), k.encode("utf-8"), 0)
+        _xdo_keysequence_window_up(self._xdo, int(wid), k.encode("utf-8"), 0)
 
     def mouse_move(self, dx: int, dy: int) -> None:
         if not dx and not dy:

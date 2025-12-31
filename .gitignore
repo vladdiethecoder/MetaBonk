@@ -49,6 +49,7 @@ test_report.json
 # === Logs ===
 *.log
 *.log.*
+/logs/
 
 # === Large data / artifacts ===
 /checkpoints/

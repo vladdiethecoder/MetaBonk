@@ -88,7 +88,7 @@ if HAS_GYM:
                 dtype=np.uint8,
             )
 
-            # Action: generic primitives only (no built-in "WASD"/aim semantics).
+            # Action: generic primitives only (no built-in movement/aim semantics).
             self.action_space = spaces.Dict(
                 {
                     "buttons": spaces.MultiBinary(len(self.cfg.button_keys)),
@@ -296,7 +296,7 @@ if HAS_GYM:
                     prev = bool(self._key_state.get(key, False))
                     if want != prev:
                         try:
-                            self._bridge_loop.run_until_complete(self.bridge.send_key(str(key), pressed=want))
+                            self._bridge_loop.run_until_complete(self.bridge.send_button(str(key), pressed=want))
                         except Exception:
                             pass
                         self._key_state[key] = want

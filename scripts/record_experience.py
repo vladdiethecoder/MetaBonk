@@ -133,7 +133,7 @@ def _save_episode(
 def main() -> int:
     ap = argparse.ArgumentParser(description="Record (frames, real inputs) to .npz via BonkLink")
     ap.add_argument("--host", default=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"))
-    ap.add_argument("--port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")))
     ap.add_argument("--out-dir", default=os.environ.get("METABONK_RECORD_DIR", "rollouts/onpolicy_npz"))
     ap.add_argument("--prefix", default="onpolicy")
     ap.add_argument("--hz", type=float, default=float(os.environ.get("METABONK_RECORD_HZ", "10")))

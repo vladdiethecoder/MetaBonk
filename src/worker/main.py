@@ -32,12 +32,13 @@ except Exception:  # pragma: no cover
     requests = None  # type: ignore
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
 except Exception as e:  # pragma: no cover
     FastAPI = None  # type: ignore
     HTTPException = Exception  # type: ignore
+    Request = None  # type: ignore
     uvicorn = None  # type: ignore
     _import_error = e
 else:
@@ -248,6 +249,29 @@ class WorkerService:
         self.port = port
         self.launcher = GameLauncher(instance_id=instance_id, display=display)
 
+        # GStreamer plugin registry is global per-user by default. When launching many workers,
+        # concurrent `Gst.init()` calls can contend on the shared registry lock and stall stream
+        # startup. Use a per-worker registry file to keep initialization independent.
+        if "GST_REGISTRY_1_0" not in os.environ:
+            try:
+                repo_root = Path(os.environ.get("METABONK_REPO_ROOT", "") or ".").expanduser()
+                if not repo_root.is_absolute():
+                    repo_root = (Path.cwd() / repo_root).resolve()
+                reg_dir = repo_root / "temp" / "gst_registry"
+                reg_dir.mkdir(parents=True, exist_ok=True)
+                os.environ["GST_REGISTRY_1_0"] = str(reg_dir / f"registry.{self.instance_id}.bin")
+            except Exception:
+                pass
+        try:
+            # Best-effort warmup so the first HTTP stream request doesn't do a slow init from
+            # a threadpool worker (which can hang on some stacks).
+            from src.worker.nvenc_streamer import Gst as _Gst  # type: ignore
+
+            if _Gst is not None:
+                _Gst.init(None)
+        except Exception:
+            pass
+
         # Optional centralized VLM System 2/3 reasoning (ZeroMQ client).
         self._system2_enabled = str(os.environ.get("METABONK_SYSTEM2_ENABLED", "0") or "").strip().lower() in (
             "1",
@@ -257,15 +281,29 @@ class WorkerService:
         )
         self._cognitive_client = None
         self._system2_last_request: Optional[dict] = None
+        self._system2_last_response: Optional[dict] = None
+        self._system2_last_response_ts: float = 0.0
+        try:
+            trace_max = int(os.environ.get("METABONK_SYSTEM2_TRACE_MAX", "20"))
+        except Exception:
+            trace_max = 20
+        self._system2_reasoning_trace: Deque[str] = deque(maxlen=max(1, int(trace_max)))
         self._system2_rl_logger = None
         self._system2_active_decision_id: Optional[str] = None
         self._system2_active_started_ts: float = 0.0
         self._system2_active_reward_sum: float = 0.0
+        self._system2_last_frame_add_ts: float = 0.0
         try:
             self._system2_blend = float(os.environ.get("METABONK_SYSTEM2_BLEND", "0.7"))
         except Exception:
             self._system2_blend = 0.7
         self._system2_blend = max(0.0, min(1.0, float(self._system2_blend)))
+        try:
+            self._system2_menu_click_cooldown_s = float(os.environ.get("METABONK_SYSTEM2_MENU_CLICK_COOLDOWN_S", "1.0"))
+        except Exception:
+            self._system2_menu_click_cooldown_s = 1.0
+        self._system2_last_menu_click_ts = 0.0
+        self._system2_last_menu_click_resp_ts = 0.0
         self._system2_override_cont = str(os.environ.get("METABONK_SYSTEM2_OVERRIDE_CONT", "1") or "").strip().lower() not in (
             "0",
             "false",
@@ -443,6 +481,13 @@ class WorkerService:
         if self._obs_backend not in ("detections", "pixels", "hybrid"):
             raise ValueError(f"invalid METABONK_OBS_BACKEND={self._obs_backend!r}")
         self._pixel_obs_enabled = self._obs_backend in ("pixels", "hybrid")
+        # Pixel observation refresh rate. When using Synthetic Eye, the drain loop can easily
+        # become compute-bound if we normalize pixels for *every* compositor frame. Throttle
+        # pixel obs refresh to a reasonable rate while still servicing fences at full speed.
+        #
+        # Note: this affects agent obs updates only (not the compositor/frame ingest rate).
+        self._pixel_obs_last_emit_ts: float = 0.0
+        self._pixel_obs_interval_s: float = 0.0
         self._pixel_obs_w = 0
         self._pixel_obs_h = 0
         self._pixel_ui_grid = str(os.environ.get("METABONK_PIXEL_UI_GRID", "") or "").strip().lower()
@@ -496,6 +541,32 @@ class WorkerService:
                 self._pixel_obs_h = 128
             if self._pixel_obs_w <= 0 or self._pixel_obs_h <= 0:
                 raise ValueError("METABONK_PIXEL_OBS_W/H must be positive")
+            # VisionActorCritic uses a 3x stride-2 CNN stem (downscale factor 8) before the
+            # ViT-style patch embedding conv. If the patch size is too large relative to the
+            # post-stem spatial size, Torch will raise:
+            #   "Kernel size can't be greater than actual input size"
+            #
+            # Keep the default experience robust by choosing a safe patch size when the user
+            # did not explicitly set one. For example, 96x96 obs -> 12x12 after stem, so a
+            # patch size of 16 would crash; use 8 instead.
+            if not str(os.environ.get("METABONK_VISION_PATCH", "") or "").strip():
+                try:
+                    min_hw = int(min(int(self._pixel_obs_w), int(self._pixel_obs_h)))
+                    stem_hw = max(1, int(min_hw) // 8)
+                    patch = 1
+                    for cand in (16, 8, 4, 2, 1):
+                        if int(cand) <= int(stem_hw):
+                            patch = int(cand)
+                            break
+                    os.environ["METABONK_VISION_PATCH"] = str(int(patch))
+                except Exception:
+                    pass
+            try:
+                pix_fps = float(os.environ.get("METABONK_PIXEL_OBS_FPS", "20") or 0.0)
+            except Exception:
+                pix_fps = 20.0
+            if pix_fps > 0:
+                self._pixel_obs_interval_s = 1.0 / max(1.0, float(pix_fps))
         # Spectator frames are produced when Synthetic Eye is active and streaming is enabled.
         # Default the spectator source size to half of the target encode size (reduces pipe bandwidth)
         # while keeping enough detail for human viewing.
@@ -633,10 +704,10 @@ class WorkerService:
         ).strip().lower() in ("1", "true", "yes", "on")
         try:
             self._synthetic_eye_stall_restart_s = float(
-                os.environ.get("METABONK_SYNTHETIC_EYE_STALL_RESTART_S", "15.0")
+                os.environ.get("METABONK_SYNTHETIC_EYE_STALL_RESTART_S", "60.0")
             )
         except Exception:
-            self._synthetic_eye_stall_restart_s = 15.0
+            self._synthetic_eye_stall_restart_s = 60.0
         self._synthetic_eye_drain_enabled: bool = False
         self._synthetic_eye_drain_last_error_ts: float = 0.0
         self._menu_doom_score: float = 0.0
@@ -868,20 +939,22 @@ class WorkerService:
         self._action_guard_enabled = os.environ.get("METABONK_ACTION_GUARD", "0") in ("1", "true", "True")
         self._action_guard_path = os.environ.get("METABONK_ACTION_GUARD_PATH", "")
         self._action_guard_violation: Optional[str] = None
+        self._pure_vision_mode = str(os.environ.get("METABONK_PURE_VISION_MODE", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
         # Optional UnityBridge embodiment (BepInEx plugin).
         self._use_bridge = os.environ.get("METABONK_USE_UNITY_BRIDGE", "0") in ("1", "true", "True")
         self.bridge: Optional["UnityBridge"] = None
         self._bridge_loop: Optional[asyncio.AbstractEventLoop] = None
         self._last_disc_action: Optional[int] = None
-        # When using UnityBridge, optionally map continuous PPO actions to keyboard movement.
-        # This is disabled by default to avoid hard-coded input assumptions, but can be
-        # enabled for practical end-to-end control testing.
         self._bridge_action_map = str(os.environ.get("METABONK_BRIDGE_ACTION_MAP", "") or "").strip().lower()
-        if self._use_bridge and not self._bridge_action_map:
-            # Practical default: if UnityBridge is enabled, map PPO continuous actions to WASD so the
-            # agent can actually move without requiring extra glue code.
-            self._bridge_action_map = "wasd"
+        if self._pure_vision_mode:
+            # Disallow action-map shortcuts in pure-vision runs.
+            self._bridge_action_map = ""
         self._bridge_held_keys: set[str] = set()
         # Optional OS-level input backend (uinput) for real keyboard/mouse injection.
         self._input_backend_name = str(os.environ.get("METABONK_INPUT_BACKEND", "") or "").strip().lower()
@@ -902,11 +975,15 @@ class WorkerService:
             self._menu_bias_min = 0.05
         self._menu_bias_successes = 0
         self._menu_bias_indices: List[int] = []
+        if self._pure_vision_mode:
+            self._menu_bias_enabled = False
         menu_teacher_env = str(os.environ.get("METABONK_MENU_TEACHER", "") or "").strip().lower()
         if not menu_teacher_env:
             self._menu_teacher_enabled = bool(self._menu_bias_enabled)
         else:
             self._menu_teacher_enabled = menu_teacher_env in ("1", "true", "yes", "on")
+        if self._pure_vision_mode:
+            self._menu_teacher_enabled = False
         self._menu_teacher = AdaptiveTeacher.from_env() if self._menu_teacher_enabled else None
         try:
             self._menu_teacher_window_s = float(os.environ.get("METABONK_MENU_TEACHER_WINDOW_S", "2.0"))
@@ -1018,6 +1095,8 @@ class WorkerService:
         # Menu bootstrapping is an explicit opt-in. Agents must learn navigation via their
         # action space + reward shaping rather than hardcoded input scripts.
         self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "0") in ("1", "true", "True")
+        if self._pure_vision_mode:
+            self._input_menu_bootstrap = False
         self._menu_bootstrap_step = 0
         self._menu_bootstrap_next_ts = 0.0
         self._menu_bootstrap_last_menu: Optional[str] = None
@@ -1025,13 +1104,16 @@ class WorkerService:
         # Optional BonkLink bridge (BepInEx 6 IL2CPP).
         self._use_bonklink = os.environ.get("METABONK_USE_BONKLINK", "0") in ("1", "true", "True")
         self._bonklink = None
+        self._bonklink_capture_size: Optional[tuple[int, int]] = None
         try:
             self._bonklink_retry_s = float(os.environ.get("METABONK_BONKLINK_RETRY_S", "5.0"))
         except Exception:
             self._bonklink_retry_s = 5.0
         self._bonklink_last_attempt = 0.0
         # Optional VLM-driven menu navigation (Lobby Agent).
-        self._use_vlm_menu = os.environ.get("METABONK_USE_VLM_MENU", "0") in ("1", "true", "True")
+        self._use_vlm_menu = (not self._pure_vision_mode) and (
+            os.environ.get("METABONK_USE_VLM_MENU", "0") in ("1", "true", "True")
+        )
         self._vlm_menu_goal = os.environ.get("METABONK_MENU_GOAL", "Start Run")
         self._vlm_menu = None
         if self._use_vlm_menu:
@@ -1045,10 +1127,10 @@ class WorkerService:
                 self._vlm_menu = None
                 self._use_vlm_menu = False
         # Optional switching controller (System-2 menu override).
-        self._use_switching_controller = os.environ.get("METABONK_USE_SWITCHING_CONTROLLER", "0") in (
-            "1",
-            "true",
-            "True",
+        # Pure-vision runs forbid any scripted/menu-teacher overrides; System-2 should act
+        # only via the VLM strategy loop.
+        self._use_switching_controller = (not self._pure_vision_mode) and (
+            os.environ.get("METABONK_USE_SWITCHING_CONTROLLER", "0") in ("1", "true", "True")
         )
         self._switching_controller = None
         if self._use_switching_controller:
@@ -1226,8 +1308,11 @@ class WorkerService:
         self._last_biome: Optional[str] = None
         self._last_end_reason: Optional[str] = None
 
-        # Learned reward-from-video (optional but preferred; avoids hand-authored shaping).
+        # Learned reward-from-video (optional; avoids hand-authored shaping).
         self._use_learned_reward = os.environ.get("METABONK_USE_LEARNED_REWARD", "1") in ("1", "true", "True")
+        if self._pure_vision_mode:
+            # Pure-vision validation forbids any external/shaped reward sources.
+            self._use_learned_reward = False
         self._reward_model = None
         self._reward_device = None
         self._reward_frame_size = (224, 224)
@@ -1782,7 +1867,24 @@ class WorkerService:
             disp = str(self.display)
             os.environ["DISPLAY"] = disp
             os.environ["METABONK_INPUT_DISPLAY"] = disp
+            # XWayland under Synthetic Eye can restart during early boot (or after compositor resets).
+            # Wait briefly for the X server to become responsive before failing hard.
+            try:
+                xtest_wait_s = float(
+                    os.environ.get(
+                        "METABONK_XTEST_WAIT_S",
+                        os.environ.get("METABONK_INPUT_XTEST_WAIT_S", "20"),
+                    )
+                )
+            except Exception:
+                xtest_wait_s = 20.0
+            xtest_wait_s = max(0.0, float(xtest_wait_s))
             xtest_ok, xtest_diag = self._check_xtest(display=disp)
+            if not xtest_ok and xtest_wait_s > 0.0:
+                deadline = time.time() + xtest_wait_s
+                while time.time() < deadline and not xtest_ok:
+                    time.sleep(0.25)
+                    xtest_ok, xtest_diag = self._check_xtest(display=disp)
             if not xtest_ok:
                 diag = (xtest_diag or "").strip()
                 if len(diag) > 800:
@@ -1948,6 +2050,10 @@ class WorkerService:
             if not frames:
                 time.sleep(0.005)
                 continue
+            # Drain loop policy: always service fences for every queued frame, but only perform
+            # expensive CUDA import/normalization on the *newest* frame. This prevents the drain
+            # thread from becoming compute-bound when the compositor outpaces the agent obs rate.
+            primary = frames[-1]
             for frame in frames:
                 try:
                     if (
@@ -1955,6 +2061,17 @@ class WorkerService:
                         and isinstance(frame, SyntheticEyeFrame)
                         and self._synthetic_eye_ingestor is not None
                     ):
+                        # Fast path for backlog: keep the compositor buffer pool flowing by servicing
+                        # acquire/release fences without importing payloads for all but the newest frame.
+                        if frame is not primary:
+                            self._synthetic_eye_ingestor.handshake_only(frame)
+                            try:
+                                ts = float(getattr(frame, "timestamp", 0.0) or 0.0) or time.time()
+                                self._latest_frame_ts = ts
+                                self._record_obs_frame_ts(ts)
+                            except Exception:
+                                pass
+                            continue
                         try:
                             # Important distinction:
                             # - `_capture_disabled` is a runtime toggle used by the orchestrator to stop
@@ -1970,18 +2087,73 @@ class WorkerService:
                             # For soak runs we may "hard" disable capture/inference entirely. In that
                             # mode we still must service fences, but we skip expensive CUDA imports.
                             want_pixels = (not hard_disabled) and bool(getattr(self, "_pixel_obs_enabled", False))
-                            # Spectator frames are only needed when streaming is enabled for this worker.
-                            want_spectator = (
+                            want_pixels_update = want_pixels
+                            if want_pixels:
+                                try:
+                                    interval = float(getattr(self, "_pixel_obs_interval_s", 0.0) or 0.0)
+                                    last_emit = float(getattr(self, "_pixel_obs_last_emit_ts", 0.0) or 0.0)
+                                    now_ts = time.time()
+                                    want_pixels_update = interval <= 0.0 or (now_ts - last_emit) >= float(interval) - 1e-4
+                                except Exception:
+                                    want_pixels_update = True
+                            # Spectator frames are primarily used for human streaming/preview, but System2
+                            # (centralized VLM) also needs readable frames to navigate menus. Historically
+                            # we avoided generating spectator frames unless there was an active stream
+                            # client, which meant System2 silently fell back to 128x128 pixel obs and could
+                            # not localize UI buttons.
+                            spectator_ok = (
                                 (not hard_disabled)
-                                and (not capture_disabled)
                                 and bool(getattr(self, "_spectator_enabled", False))
                                 and int(getattr(self, "_spectator_w", 0) or 0) > 0
                                 and int(getattr(self, "_spectator_h", 0) or 0) > 0
                             )
+                            want_spectator_stream = spectator_ok and (not capture_disabled)
+                            want_spectator_system2 = False
+                            if spectator_ok and getattr(self, "_cognitive_client", None) is not None:
+                                want_spectator_system2 = str(
+                                    os.environ.get("METABONK_SYSTEM2_FORCE_SPECTATOR", "1") or "1"
+                                ).strip().lower() in ("1", "true", "yes", "on")
+
+                            stream_has_consumer = False
+                            if want_spectator_stream:
+                                if bool(getattr(self, "_fifo_stream_enabled", False)):
+                                    # FIFO demand-paged streaming should only request expensive spectator frames
+                                    # when a reader is connected (go2rtc exec:cat). Otherwise keep the Synthetic
+                                    # Eye ingest loop cheap so it can service fences at full rate.
+                                    try:
+                                        pub = getattr(self, "_fifo_publisher", None)
+                                        if pub is not None and hasattr(pub, "has_reader"):
+                                            stream_has_consumer = bool(pub.has_reader())
+                                        else:
+                                            stream_has_consumer = False
+                                    except Exception:
+                                        stream_has_consumer = False
+                                    if not stream_has_consumer:
+                                        want_spectator_stream = False
+                                else:
+                                    try:
+                                        s = getattr(self, "streamer", None)
+                                        active = (
+                                            int(s.active_clients() or 0)
+                                            if (s is not None and hasattr(s, "active_clients"))
+                                            else 0
+                                        )
+                                    except Exception:
+                                        active = 0
+                                    stream_has_consumer = active > 0
+                                    if not stream_has_consumer:
+                                        want_spectator_stream = False
+
+                            want_spectator = bool(want_spectator_stream or want_spectator_system2)
                             want_spectator_update = False
                             if want_spectator:
                                 try:
-                                    interval = float(getattr(self, "_spectator_interval_s", 0.0) or 0.0)
+                                    if stream_has_consumer:
+                                        interval = float(getattr(self, "_spectator_interval_s", 0.0) or 0.0)
+                                    else:
+                                        interval = float(
+                                            os.environ.get("METABONK_SYSTEM2_FRAME_INTERVAL_S", "0.5") or "0.5"
+                                        )
                                     last_emit = float(getattr(self, "_spectator_last_emit_ts", 0.0) or 0.0)
                                     now_ts = time.time()
                                     want_spectator_update = interval <= 0.0 or (now_ts - last_emit) >= float(interval) - 1e-4
@@ -1992,7 +2164,7 @@ class WorkerService:
                                 and os.environ.get("METABONK_VISION_AUDIT", "0") == "1"
                                 and int(frame.frame_id) % 60 == 0
                             )
-                            if want_pixels or want_audit or want_spectator_update:
+                            if want_pixels_update or want_audit or want_spectator_update:
                                     h = None
                                     try:
                                         h = self._synthetic_eye_ingestor.begin(frame)
@@ -2025,33 +2197,25 @@ class WorkerService:
                                                 ext_stream = None
 
                                             if ext_stream is not None:
-                                                with torch.cuda.stream(ext_stream):
-                                                    raw_tensor = tensor_from_external_frame(
-                                                        h.ext_frame,
-                                                        width=frame.width,
-                                                        height=frame.height,
-                                                        stride_bytes=frame.stride,
-                                                        offset_bytes=offset_bytes,
-                                                        stream=h.stream,
-                                                        sync=False,
-                                                        pack=True,
-                                                    )
-                                                    raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
-                                                    if bool(getattr(self, "_synthetic_eye_vflip", False)):
-                                                        try:
-                                                            raw_tensor = raw_tensor.flip(0)
-                                                        except Exception:
-                                                            pass
-                                                    raw_tensor_for_stream = None
-                                                    if want_spectator_update and self._should_cache_synthetic_eye_cuda_stream_frame():
-                                                        raw_tensor_for_stream = raw_tensor
-                                                        try:
-                                                            if hasattr(raw_tensor_for_stream, "is_contiguous") and not raw_tensor_for_stream.is_contiguous():
-                                                                raw_tensor_for_stream = raw_tensor_for_stream.contiguous()
-                                                        except Exception:
-                                                            pass
-                                                    obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
+                                                raw_tensor = tensor_from_external_frame(
+                                                    h.ext_frame,
+                                                    width=frame.width,
+                                                    height=frame.height,
+                                                    stride_bytes=frame.stride,
+                                                    offset_bytes=offset_bytes,
+                                                    stream=h.stream,
+                                                    sync=False,
+                                                    pack=True,
+                                                )
+                                                # Ensure downstream work on the current torch stream waits for the
+                                                # external CUstream copy to complete. This keeps the fence stream
+                                                # free from heavy normalization ops while preserving correctness.
+                                                try:
+                                                    torch.cuda.current_stream(device=ext_stream.device).wait_stream(ext_stream)
+                                                except Exception:
+                                                    pass
                                             else:
+                                                # Fallback: synchronize inside tensor_from_external_frame.
                                                 raw_tensor = tensor_from_external_frame(
                                                     h.ext_frame,
                                                     width=frame.width,
@@ -2061,21 +2225,33 @@ class WorkerService:
                                                     stream=h.stream,
                                                     pack=True,
                                                 )
-                                                raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
-                                                if bool(getattr(self, "_synthetic_eye_vflip", False)):
-                                                    try:
-                                                        raw_tensor = raw_tensor.flip(0)
-                                                    except Exception:
-                                                        pass
-                                                raw_tensor_for_stream = None
-                                                if want_spectator_update and self._should_cache_synthetic_eye_cuda_stream_frame():
-                                                    raw_tensor_for_stream = raw_tensor
-                                                    try:
-                                                        if hasattr(raw_tensor_for_stream, "is_contiguous") and not raw_tensor_for_stream.is_contiguous():
-                                                            raw_tensor_for_stream = raw_tensor_for_stream.contiguous()
-                                                    except Exception:
-                                                        pass
-                                                obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
+
+                                            # Signal the producer release fence as soon as the packed copy is queued.
+                                            # Subsequent ops only touch our private tensor, not the DMA-BUF backing
+                                            # store, so keeping the release semaphore gated behind normalization would
+                                            # unnecessarily throttle the compositor.
+                                            try:
+                                                self._synthetic_eye_ingestor.end(h)
+                                                h = None
+                                            except Exception:
+                                                # Keep `h` so the outer finally can retry (best-effort).
+                                                pass
+
+                                            raw_tensor = self._maybe_swizzle_channels(raw_tensor, frame.drm_fourcc)
+                                            if bool(getattr(self, "_synthetic_eye_vflip", False)):
+                                                try:
+                                                    raw_tensor = raw_tensor.flip(0)
+                                                except Exception:
+                                                    pass
+                                            raw_tensor_for_stream = None
+                                            if want_spectator_update and self._should_cache_synthetic_eye_cuda_stream_frame():
+                                                raw_tensor_for_stream = raw_tensor
+                                                try:
+                                                    if hasattr(raw_tensor_for_stream, "is_contiguous") and not raw_tensor_for_stream.is_contiguous():
+                                                        raw_tensor_for_stream = raw_tensor_for_stream.contiguous()
+                                                except Exception:
+                                                    pass
+                                            obs_u8 = raw_tensor.permute(2, 0, 1)[:3]
 
                                             # QUALITY: always record source frame timestamp for diagnostics.
                                             try:
@@ -2092,22 +2268,18 @@ class WorkerService:
                                                 def _compute_norm() -> tuple[object, object]:
                                                     o = None
                                                     s = None
-                                                    if want_pixels:
+                                                    if want_pixels_update:
                                                         o = normalize_obs_u8_chw(
                                                             obs_u8,
                                                             out_h=int(self._pixel_obs_h),
                                                             out_w=int(self._pixel_obs_w),
                                                         )
-                                                    if want_spectator:
-                                                        # Throttle spectator normalization to the configured stream FPS.
-                                                        interval = float(getattr(self, "_spectator_interval_s", 0.0) or 0.0)
-                                                        last_emit = float(getattr(self, "_spectator_last_emit_ts", 0.0) or 0.0)
-                                                        if interval <= 0.0 or (float(ts) - float(last_emit)) >= float(interval) - 1e-4:
-                                                            s = normalize_spectator_u8_chw(
-                                                                obs_u8,
-                                                                out_h=int(getattr(self, "_spectator_h", 540) or 540),
-                                                                out_w=int(getattr(self, "_spectator_w", 960) or 960),
-                                                            )
+                                                    if want_spectator_update:
+                                                        s = normalize_spectator_u8_chw(
+                                                            obs_u8,
+                                                            out_h=int(getattr(self, "_spectator_h", 540) or 540),
+                                                            out_w=int(getattr(self, "_spectator_w", 960) or 960),
+                                                        )
                                                     return o, s
 
                                                 if ext_stream is not None:
@@ -2130,6 +2302,7 @@ class WorkerService:
                                                         except Exception:
                                                             self._latest_pixel_frame_id = None
                                                         self._latest_pixel_ts = float(ts)
+                                                        self._pixel_obs_last_emit_ts = float(ts)
                                                         try:
                                                             self._latest_pixel_src_size = (
                                                                 int(frame.width),
@@ -2179,35 +2352,18 @@ class WorkerService:
 
                                             if want_audit:
                                                 try:
-                                                    if ext_stream is not None:
-                                                        import torch  # type: ignore
-
-                                                        with torch.cuda.stream(ext_stream):
-                                                            obs_f32 = obs_u8.float().div(255.0)
-                                                            mean_val = float(obs_f32.mean().item())
-                                                            std_val = float(obs_f32.std().item())
-                                                            self._dump_frame_to_png(
-                                                                obs_f32, int(frame.frame_id), mean_val, std_val
-                                                            )
-                                                            print(
-                                                                f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
-                                                                f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
-                                                                f"device={obs_f32.device}",
-                                                                flush=True,
-                                                            )
-                                                    else:
-                                                        obs_f32 = obs_u8.float().div(255.0)
-                                                        mean_val = float(obs_f32.mean().item())
-                                                        std_val = float(obs_f32.std().item())
-                                                        self._dump_frame_to_png(
-                                                            obs_f32, int(frame.frame_id), mean_val, std_val
-                                                        )
-                                                        print(
-                                                            f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
-                                                            f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
-                                                            f"device={obs_f32.device}",
-                                                            flush=True,
-                                                        )
+                                                    obs_f32 = obs_u8.float().div(255.0)
+                                                    mean_val = float(obs_f32.mean().item())
+                                                    std_val = float(obs_f32.std().item())
+                                                    self._dump_frame_to_png(
+                                                        obs_f32, int(frame.frame_id), mean_val, std_val
+                                                    )
+                                                    print(
+                                                        f"[VISION] worker={self.instance_id} frame={int(frame.frame_id)} "
+                                                        f"shape={tuple(obs_f32.shape)} mean={mean_val:.4f} std={std_val:.4f} "
+                                                        f"device={obs_f32.device}",
+                                                        flush=True,
+                                                    )
                                                 except Exception:
                                                     pass
                                         except Exception as e:
@@ -2264,7 +2420,7 @@ class WorkerService:
             try:
                 for k in list(self._bridge_held_keys):
                     try:
-                        self._bridge_loop.run_until_complete(self.bridge.send_key(str(k), False))
+                        self._bridge_loop.run_until_complete(self.bridge.send_button(str(k), False))
                     except Exception:
                         pass
             except Exception:
@@ -3350,6 +3506,52 @@ class WorkerService:
         except Exception:
             return False
 
+    def _detect_hud_minimap_array(self, frame_rgb: "Any") -> bool:
+        """Detect HUD/minimap using an RGB ndarray (HWC) instead of JPEG bytes."""
+        if not self._hud_enabled:
+            return False
+        try:
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+
+            if frame_rgb is None:
+                return False
+            arr = frame_rgb if isinstance(frame_rgb, np.ndarray) else np.asarray(frame_rgb)
+            if arr.ndim != 3 or int(arr.shape[2]) < 3:
+                return False
+            roi = self._hud_roi_from_frame(arr)
+            if roi is None:
+                return False
+            if roi.dtype != np.uint8:
+                roi = np.clip(roi, 0, 255).astype(np.uint8)
+            if int(roi.shape[2]) != 3:
+                roi = roi[:, :, :3]
+            hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            mean_s = float(hsv[:, :, 1].mean())
+            if mean_s < float(self._hud_sat_min):
+                return False
+            gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 1.0)
+            h, w = gray.shape[:2]
+            min_dist = max(6, int(min(h, w) * float(self._hud_min_dist_frac)))
+            min_radius = max(4, int(min(h, w) * float(self._hud_min_radius_frac)))
+            max_radius = max(min_radius + 2, int(min(h, w) * float(self._hud_max_radius_frac)))
+            circles = cv2.HoughCircles(
+                gray,
+                cv2.HOUGH_GRADIENT,
+                float(self._hud_hough_dp),
+                float(min_dist),
+                param1=float(self._hud_hough_param1),
+                param2=float(self._hud_hough_param2),
+                minRadius=min_radius,
+                maxRadius=max_radius,
+            )
+            if circles is None:
+                return False
+            return len(circles[0]) > 0
+        except Exception:
+            return False
+
     def _update_hud_state(self, hud_present: bool) -> None:
         if hud_present:
             self._hud_on_count += 1
@@ -4339,32 +4541,211 @@ class WorkerService:
         game_state: dict,
         detections: List[dict],
         frame_size: Optional[tuple[int, int]],
+        menu_hint: Optional[bool],
         now: float,
     ) -> dict:
-        try:
-            health = float(game_state.get("playerHealth") or 0.0)
-        except Exception:
-            health = 0.0
-        try:
-            max_health = float(game_state.get("playerMaxHealth") or 1.0)
-        except Exception:
-            max_health = 1.0
-        health_ratio = float(health / max(max_health, 1e-6))
+        health: Optional[float] = None
+        max_health: Optional[float] = None
+        health_ratio: Optional[float] = None
+        if isinstance(game_state, dict):
+            if game_state.get("playerHealth") is not None:
+                try:
+                    health = float(game_state.get("playerHealth"))
+                except Exception:
+                    health = None
+            if game_state.get("playerMaxHealth") is not None:
+                try:
+                    max_health = float(game_state.get("playerMaxHealth"))
+                except Exception:
+                    max_health = None
+        if health is not None and max_health is not None:
+            try:
+                denom = float(max_health)
+                if denom > 0:
+                    health_ratio = float(health / denom)
+            except Exception:
+                health_ratio = None
         try:
             gtime = float(game_state.get("gameTime") or float(getattr(self.trainer, "step_count", 0) or 0))
         except Exception:
             gtime = float(getattr(self.trainer, "step_count", 0) or 0)
         w, h = frame_size if frame_size else (0, 0)
+
+        # Provide System2 with a lightweight, vision-derived UI summary so it can
+        # reliably choose `interact` targets even when button text is hard to read
+        # in the 3x3 temporal grid.
+        ui_elements: list[dict[str, float | str]] = []
+        try:
+            from .perception import parse_detections, build_ui_elements, CLASS_NAMES
+
+            if frame_size is not None:
+                dets_parsed = parse_detections(detections or [])
+                ui, mask, _ = build_ui_elements(dets_parsed, frame_size=frame_size)
+                # Keep only interactables; preserve priority order.
+                for i, row in enumerate(ui):
+                    if i >= len(mask) or mask[i] != 1:
+                        continue
+                    try:
+                        cls = int(row[4])
+                    except Exception:
+                        cls = -1
+                    name = CLASS_NAMES.get(cls, f"cls_{cls}")
+                    ui_elements.append(
+                        {
+                            "name": str(name),
+                            "cx": float(row[0]),
+                            "cy": float(row[1]),
+                            "w": float(row[2]),
+                            "h": float(row[3]),
+                            "conf": float(row[5]),
+                        }
+                    )
+                    if len(ui_elements) >= 8:
+                        break
+        except Exception:
+            ui_elements = []
+
+        # If we have no UI detections (common in early boot / menu screens), optionally
+        # attach OCR-derived UI candidates from the most recent full-res spectator frame.
+        #
+        # This remains vision-only (text is read from pixels) while avoiding hardcoded
+        # menu scripts in the worker. System2 decides what to click based on the list.
+        if (not ui_elements) and bool(menu_hint):
+            try:
+                ocr_enabled = str(
+                    os.environ.get("METABONK_SYSTEM2_OCR_UI_ELEMENTS", "1" if self._pure_vision_mode else "0")
+                    or ""
+                ).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                ocr_enabled = False
+            if ocr_enabled:
+                try:
+                    interval_s = float(os.environ.get("METABONK_SYSTEM2_OCR_UI_INTERVAL_S", "1.0") or 1.0)
+                except Exception:
+                    interval_s = 1.0
+                interval_s = max(0.0, float(interval_s))
+                try:
+                    last_ocr_ts = float(getattr(self, "_system2_ocr_ui_ts", 0.0) or 0.0)
+                except Exception:
+                    last_ocr_ts = 0.0
+                cached = None
+                try:
+                    cached = getattr(self, "_system2_ocr_ui_elements", None)
+                except Exception:
+                    cached = None
+                if cached and interval_s > 0.0 and (float(now) - float(last_ocr_ts)) < interval_s:
+                    try:
+                        ui_elements = list(cached)
+                    except Exception:
+                        ui_elements = []
+                else:
+                    try:
+                        import numpy as np  # type: ignore
+                        from PIL import Image
+
+                        from src.worker.ocr import ocr_boxes
+
+                        frame_hwc = getattr(self, "_system2_last_full_frame_hwc", None)
+                        ts_f = float(getattr(self, "_system2_last_full_frame_ts", 0.0) or 0.0)
+                        if frame_hwc is not None and ts_f > 0 and (float(now) - ts_f) <= 2.0:
+                            arr = np.asarray(frame_hwc)
+                            if arr.ndim == 3 and int(arr.shape[2]) >= 3:
+                                o_w = int(arr.shape[1])
+                                o_h = int(arr.shape[0])
+                                if o_w > 0 and o_h > 0:
+                                    # OCR is unreliable on tiny UI text. Focus on the bottom portion
+                                    # of the frame (where primary buttons often live) and upscale.
+                                    y0 = int(max(0, min(o_h - 1, int(round(float(o_h) * 0.35)))))
+                                    roi = arr[y0:o_h, :, :3]
+                                    roi_img = Image.fromarray(roi.astype("uint8"))
+                                    scale = 3
+                                    try:
+                                        up_w = int(roi_img.size[0] * scale)
+                                        up_h = int(roi_img.size[1] * scale)
+                                        roi_img = roi_img.resize((up_w, up_h), resample=Image.BICUBIC)
+                                    except Exception:
+                                        scale = 1
+                                    boxes = ocr_boxes(roi_img, min_conf=10, min_len=2, psm=6)
+                                    # Prefer boxes lower in the ROI (likely buttons), then confidence.
+                                    def _score(b: dict) -> tuple[float, float]:
+                                        bbox = b.get("bbox") or (0, 0, 0, 0)
+                                        try:
+                                            _y2 = float(bbox[3])
+                                        except Exception:
+                                            _y2 = 0.0
+                                        try:
+                                            _conf = float(b.get("conf", 0.0) or 0.0)
+                                        except Exception:
+                                            _conf = 0.0
+                                        return (_y2, _conf)
+
+                                    boxes = sorted(boxes, key=_score, reverse=True)
+                                    out_boxes: list[dict[str, float | str]] = []
+                                    for b in boxes:
+                                        txt = " ".join(str(b.get("text") or "").split())
+                                        if not txt:
+                                            continue
+                                        # Keep the System2 prompt small: OCR on splash screens can emit
+                                        # long paragraphs, which bloats token counts and can exceed the
+                                        # VLM context length. The model still has access to pixels; the
+                                        # text field is only a hint.
+                                        if len(txt) > 48:
+                                            txt = txt[:48]
+                                        bbox = b.get("bbox")
+                                        if not bbox or len(bbox) != 4:
+                                            continue
+                                        x1, y1, x2, y2 = bbox
+                                        try:
+                                            conf = float(b.get("conf", 0.0) or 0.0)
+                                        except Exception:
+                                            conf = 0.0
+                                        # Map ROI (possibly upscaled) coords -> original frame.
+                                        denom = float(scale) if scale > 0 else 1.0
+                                        ox1 = float(x1) / denom
+                                        oy1 = float(y1) / denom + float(y0)
+                                        ox2 = float(x2) / denom
+                                        oy2 = float(y2) / denom + float(y0)
+                                        cx = (ox1 + ox2) * 0.5 / float(o_w)
+                                        cy = (oy1 + oy2) * 0.5 / float(o_h)
+                                        ww = max(0.0, ox2 - ox1) / float(o_w)
+                                        hh = max(0.0, oy2 - oy1) / float(o_h)
+                                        if ww <= 0.005 or hh <= 0.005:
+                                            continue
+                                        cx = max(0.0, min(1.0, float(cx)))
+                                        cy = max(0.0, min(1.0, float(cy)))
+                                        out_boxes.append(
+                                            {
+                                                "name": txt,
+                                                "cx": float(cx),
+                                                "cy": float(cy),
+                                                "w": float(ww),
+                                                "h": float(hh),
+                                                "conf": float(conf) / 100.0,
+                                            }
+                                        )
+                                        if len(out_boxes) >= 12:
+                                            break
+                                    ui_elements = out_boxes
+                                    try:
+                                        setattr(self, "_system2_ocr_ui_ts", float(now))
+                                        setattr(self, "_system2_ocr_ui_elements", list(ui_elements))
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        ui_elements = ui_elements
+
         return {
             "instance_id": self.instance_id,
             "ts": float(now),
             "game_time": gtime,
-            "health": float(health),
-            "max_health": float(max_health),
-            "health_ratio": float(health_ratio),
+            "health": float(health) if health is not None else None,
+            "max_health": float(max_health) if max_health is not None else None,
+            "health_ratio": float(health_ratio) if health_ratio is not None else None,
             "enemies_nearby": int(len(detections or [])),
             "frame_w": int(w),
             "frame_h": int(h),
+            "menu_hint": bool(menu_hint) if menu_hint is not None else None,
+            "ui_elements": ui_elements,
         }
 
     def _system2_on_strategy_response(self, response: dict, *, now: float) -> None:
@@ -4373,6 +4754,26 @@ class WorkerService:
 
         self._system2_active_reward_sum = 0.0
         self._system2_active_started_ts = float(now)
+        try:
+            self._system2_last_response = dict(response or {})
+            self._system2_last_response_ts = float(now)
+        except Exception:
+            self._system2_last_response = None
+            self._system2_last_response_ts = 0.0
+        try:
+            goal = str((response or {}).get("goal") or "").strip()
+            reasoning = str((response or {}).get("reasoning") or "").strip()
+            conf = (response or {}).get("confidence")
+            conf_f = float(conf) if isinstance(conf, (int, float)) else None
+            if reasoning:
+                msg = f"{goal}: {reasoning}" if goal else reasoning
+            else:
+                msg = goal or "directive"
+            if conf_f is not None:
+                msg = f"{msg} (conf={conf_f:.2f})"
+            self._system2_reasoning_trace.append(msg[:300])
+        except Exception:
+            pass
 
         if self._system2_rl_logger is not None and self._system2_last_request is not None:
             try:
@@ -4473,47 +4874,6 @@ class WorkerService:
     ):
         if not self.bridge or not self._bridge_loop:
             return
-        # Optional conservative mapping for end-to-end control bring-up:
-        # - a_cont[0] = strafe (-1..1): A/D
-        # - a_cont[1] = forward (-1..1): W/S
-        #
-        # Enable with: METABONK_BRIDGE_ACTION_MAP=wasd
-        # Tuning: METABONK_BRIDGE_WASD_THRESH=0.25 (press), METABONK_BRIDGE_WASD_RELEASE=0.15 (release)
-        if self._bridge_action_map in ("wasd", "wasd2d", "kbd_wasd"):
-            try:
-                thresh = float(os.environ.get("METABONK_BRIDGE_WASD_THRESH", "0.25"))
-            except Exception:
-                thresh = 0.25
-            try:
-                rel = float(os.environ.get("METABONK_BRIDGE_WASD_RELEASE", str(max(0.05, thresh * 0.6))))
-            except Exception:
-                rel = max(0.05, thresh * 0.6)
-            x = float(a_cont[0]) if len(a_cont) > 0 else 0.0
-            y = float(a_cont[1]) if len(a_cont) > 1 else 0.0
-            desired: set[str] = set()
-            if x >= thresh:
-                desired.add("D")
-            elif x <= -thresh:
-                desired.add("A")
-            if y >= thresh:
-                desired.add("W")
-            elif y <= -thresh:
-                desired.add("S")
-            # Add light hysteresis to reduce key spam when hovering near zero.
-            if abs(x) <= rel:
-                desired.discard("A")
-                desired.discard("D")
-            if abs(y) <= rel:
-                desired.discard("W")
-                desired.discard("S")
-            try:
-                for k in sorted(desired - self._bridge_held_keys):
-                    self._bridge_loop.run_until_complete(self.bridge.send_key(str(k), True))
-                for k in sorted(self._bridge_held_keys - desired):
-                    self._bridge_loop.run_until_complete(self.bridge.send_key(str(k), False))
-                self._bridge_held_keys = desired
-            except Exception:
-                pass
 
         # Discrete UI click on rising edge.
         if (
@@ -4583,7 +4943,7 @@ class WorkerService:
                         self.launcher.shutdown()
                     except Exception:
                         pass
-                    raise SystemExit(3)
+                    os._exit(3)
 
             # Synthetic Eye stall detector: if frames stop advancing, restart worker (GPU-only policy).
             if (
@@ -4601,7 +4961,7 @@ class WorkerService:
                         self.launcher.shutdown()
                     except Exception:
                         pass
-                    raise SystemExit(4)
+                    os._exit(4)
             if (now - float(self._pipewire_health_ts or 0.0)) >= 5.0:
                 try:
                     self._pipewire_daemon_ok = bool(GameLauncher.pipewire_daemon_ok(timeout_s=0.4))
@@ -4891,6 +5251,7 @@ class WorkerService:
                 schema_version=int(HEARTBEAT_SCHEMA_VERSION),
                 run_id=os.environ.get("METABONK_RUN_ID"),
                 instance_id=self.instance_id,
+                port=int(self.port),
                 policy_name=self.policy_name,
                 policy_version=self._policy_version,
                 step=step_now,
@@ -5006,7 +5367,7 @@ class WorkerService:
 
                 self._bonklink = BonkLinkClient(
                     host=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"),
-                    port=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")),
+                    port=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")),
                     use_named_pipe=os.environ.get("METABONK_BONKLINK_USE_PIPE", "0")
                     in ("1", "true", "True"),
                     pipe_name=os.environ.get("METABONK_BONKLINK_PIPE_NAME", "BonkLink"),
@@ -5041,7 +5402,7 @@ class WorkerService:
                         self._bonklink_last_attempt = now
                         self._bonklink = BonkLinkClient(
                             host=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"),
-                            port=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")),
+                            port=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")),
                             use_named_pipe=os.environ.get("METABONK_BONKLINK_USE_PIPE", "0")
                             in ("1", "true", "True"),
                             pipe_name=os.environ.get("METABONK_BONKLINK_PIPE_NAME", "BonkLink"),
@@ -5207,6 +5568,19 @@ class WorkerService:
                     pkt = None
                 if pkt is not None:
                     state_obj, jpeg_bytes = pkt
+                    # BonkLink UI click coords are expressed in the capture (frame) coordinate space.
+                    # Cache the capture resolution so we can map other vision-derived coordinates
+                    # (e.g., Synthetic Eye 640x360) into the expected click space.
+                    if jpeg_bytes:
+                        try:
+                            import struct
+
+                            if len(jpeg_bytes) >= 16 and jpeg_bytes[:4] == b"MBRF":
+                                w_cap, h_cap, _c = struct.unpack_from("<3i", jpeg_bytes, 4)
+                                if int(w_cap) > 0 and int(h_cap) > 0:
+                                    self._bonklink_capture_size = (int(w_cap), int(h_cap))
+                        except Exception:
+                            pass
                     if not self._visual_only:
                         game_state.update(state_obj.to_dict())
                         self._last_state_ts = now
@@ -5605,6 +5979,20 @@ class WorkerService:
                     hud_present = self._detect_hud_minimap(latest_image_bytes)
                 except Exception:
                     hud_present = False
+            if (not hud_present) and str(getattr(self, "_frame_source", "") or "") in (
+                "synthetic_eye",
+                "smithay",
+                "smithay_dmabuf",
+            ):
+                # Synthetic Eye runs often lack high-res JPEG snapshots (frame.jpg can be tiny).
+                # Prefer the most recent full-res spectator frame we already copied for System2.
+                try:
+                    ts_full = float(getattr(self, "_system2_last_full_frame_ts", 0.0) or 0.0)
+                    frame_full = getattr(self, "_system2_last_full_frame_hwc", None)
+                    if frame_full is not None and ts_full > 0 and (now - ts_full) <= 1.5:
+                        hud_present = bool(self._detect_hud_minimap_array(frame_full))
+                except Exception:
+                    pass
                 self._update_hud_state(bool(hud_present))
                 hud_rise = (not prev_hud) and bool(self._hud_present)
                 phase = "gameplay" if self._hud_present else "lobby"
@@ -5668,7 +6056,7 @@ class WorkerService:
                         menu_hint = True
                     elif game_state.get("isPlaying") is True:
                         menu_hint = False
-                    elif cm in ("none", "combat", ""):
+                    elif cm in ("none", "combat"):
                         menu_hint = False
                 except Exception:
                     pass
@@ -5887,15 +6275,140 @@ class WorkerService:
             # Optional System 2/3 centralized VLM loop (non-blocking).
             if self._cognitive_client is not None:
                 try:
-                    if reward_frame_hwc is not None:
-                        self._cognitive_client.add_frame(reward_frame_hwc)
-                    elif latest_image_bytes is not None:
-                        import io
-                        import numpy as np  # type: ignore
-                        from PIL import Image
+                    # System2/VLM needs readable frames for menus. BonkLink/PipeWire snapshots
+                    # can be low-res (and Synthetic Eye often has higher-res spectator frames).
+                    #
+                    # Throttle frame ingestion to avoid 60Hz CPU encode/decode overhead.
+                    last_add = float(self._system2_last_frame_add_ts or 0.0)
+                    try:
+                        system2_frame_interval_s = float(os.environ.get("METABONK_SYSTEM2_FRAME_INTERVAL_S", "0.5") or "0.5")
+                    except Exception:
+                        system2_frame_interval_s = 0.5
+                    system2_frame_interval_s = max(0.0, float(system2_frame_interval_s))
 
-                        img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
-                        self._cognitive_client.add_frame(np.asarray(img, dtype=np.uint8))
+                    fed = False
+                    spectator_fed = False
+                    if system2_frame_interval_s <= 0.0 or (float(now) - last_add) >= system2_frame_interval_s:
+                        # Prefer Synthetic Eye spectator frames when available: they're derived
+                        # from the GPU-only path and preserve UI readability.
+                        prefer_spectator = (
+                            str(getattr(self, "_frame_source", "") or "") in ("synthetic_eye", "smithay", "smithay_dmabuf")
+                            and bool(getattr(self, "_spectator_enabled", False))
+                        )
+                        if prefer_spectator:
+                            try:
+                                import numpy as np  # type: ignore
+                                obs_t, _fid, _ts, _src_size = self._get_latest_spectator_obs()
+                                if obs_t is not None:
+                                    t = obs_t
+                                    try:
+                                        if hasattr(t, "detach"):
+                                            t = t.detach()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if hasattr(t, "device") and str(getattr(t, "device", "")).startswith("cuda"):
+                                            try:
+                                                import torch  # type: ignore
+
+                                                stream_ptr = int(getattr(self, "_synthetic_eye_cu_stream_ptr", 0) or 0)
+                                                if stream_ptr:
+                                                    ext = torch.cuda.ExternalStream(int(stream_ptr))
+                                                    torch.cuda.current_stream(device=ext.device).wait_stream(ext)
+                                            except Exception:
+                                                pass
+                                            t = t.cpu()
+                                        elif hasattr(t, "cpu"):
+                                            t = t.cpu()
+                                    except Exception:
+                                        if hasattr(t, "cpu"):
+                                            t = t.cpu()
+                                    # Expect CHW uint8 (3xHxW).
+                                    try:
+                                        if hasattr(t, "ndim") and int(getattr(t, "ndim", 0) or 0) == 3:
+                                            t = t[:3].permute(1, 2, 0).contiguous()
+                                    except Exception:
+                                        pass
+                                    arr = t.numpy() if hasattr(t, "numpy") else None
+                                    if arr is not None and getattr(arr, "ndim", 0) == 3:
+                                        if int(arr.shape[2]) != 3:
+                                            arr = arr[:, :, :3]
+                                        arr_u8 = np.asarray(arr, dtype=np.uint8)
+                                        self._cognitive_client.add_frame(arr_u8)
+                                        fed = True
+                                        spectator_fed = True
+                            except Exception:
+                                fed = False
+                                spectator_fed = False
+
+                        # Fallback to whatever snapshot bytes we have (PipeWire/BonkLink).
+                        if (not fed) and latest_image_bytes is not None:
+                            try:
+                                import io
+                                import numpy as np  # type: ignore
+                                from PIL import Image
+
+                                img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
+                                self._cognitive_client.add_frame(np.asarray(img, dtype=np.uint8))
+                                fed = True
+                            except Exception:
+                                fed = False
+
+                        # Last resort: use a reward frame if provided.
+                        if (not fed) and reward_frame_hwc is not None:
+                            try:
+                                self._cognitive_client.add_frame(reward_frame_hwc)
+                                fed = True
+                            except Exception:
+                                fed = False
+
+                        if fed:
+                            self._system2_last_frame_add_ts = float(now)
+                        if spectator_fed:
+                            try:
+                                setattr(self, "_system2_spectator_ready", True)
+                            except Exception:
+                                pass
+                            try:
+                                setattr(self, "_system2_last_full_frame_hwc", arr_u8)
+                                setattr(self, "_system2_last_full_frame_ts", float(now))
+                            except Exception:
+                                pass
+
+                    # Fallback: some paths may not produce spectator/snapshots early. Feed System2
+                    # from pixel observations (small CHW tensor) with separate throttling to avoid
+                    # a 60Hz GPU->CPU copy.
+                    if (not fed) and pixel_tensor is not None and not bool(getattr(self, "_system2_spectator_ready", False)):
+                        if (float(now) - float(self._system2_last_frame_add_ts or 0.0)) >= 0.2:
+                            import numpy as np  # type: ignore
+
+                            arr = pixel_tensor
+                            try:
+                                if hasattr(arr, "detach"):
+                                    arr = arr.detach()
+                                if hasattr(arr, "to"):
+                                    arr = arr.to(device="cpu", non_blocking=False)
+                                if hasattr(arr, "contiguous"):
+                                    arr = arr.contiguous()
+                                if hasattr(arr, "numpy"):
+                                    arr = arr.numpy()
+                            except Exception:
+                                arr = arr
+                            try:
+                                arr = np.asarray(arr)
+                                if arr.ndim == 3:
+                                    # Normalize to HWC RGB uint8.
+                                    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+                                        arr = np.transpose(arr, (1, 2, 0))
+                                    if arr.shape[-1] == 4:
+                                        arr = arr[..., :3]
+                                    elif arr.shape[-1] == 1:
+                                        arr = np.repeat(arr, 3, axis=-1)
+                                    arr_u8 = np.asarray(arr, dtype=np.uint8)
+                                    self._cognitive_client.add_frame(arr_u8)
+                                    self._system2_last_frame_add_ts = float(now)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
                 try:
@@ -5910,6 +6423,7 @@ class WorkerService:
                             game_state=game_state,
                             detections=detections,
                             frame_size=frame_size,
+                            menu_hint=menu_hint,
                             now=now,
                         )
                         req = self._cognitive_client.request_strategy(agent_state=agent_state)
@@ -6188,6 +6702,123 @@ class WorkerService:
                                 forced_ui_click = None
                     except Exception:
                         forced_ui_click = None
+
+            # Optional System 2 (centralized VLM) menu directive -> UI click via BonkLink/UnityBridge.
+            # This keeps menu progression vision-only (no game state) while allowing the agent to
+            # use the VLM to target visible buttons (Confirm/Continue/etc.).
+            if (
+                forced_ui_click is None
+                and self._cognitive_client is not None
+                and frame_size is not None
+                and self._input_backend is None
+                and (menu_hint or not self._gameplay_started)
+            ):
+                try:
+                    directive = getattr(self, "_system2_last_response", None)
+                    if isinstance(directive, dict) and directive:
+                        data = directive.get("directive") or {}
+                        act = str(data.get("action") or "").strip().lower()
+                        if act in ("interact", "click", "confirm", "select"):
+                            target = data.get("target")
+                            if isinstance(target, (list, tuple)) and len(target) >= 2:
+                                try:
+                                    tx = float(target[0])
+                                    ty = float(target[1])
+                                except Exception:
+                                    tx = None
+                                    ty = None
+                                if tx is not None and ty is not None:
+                                    w, h = frame_size
+                                    if 0.0 <= tx <= 1.0 and 0.0 <= ty <= 1.0 and w > 0 and h > 0:
+                                        x = int(tx * float(w))
+                                        y = int(ty * float(h))
+                                    else:
+                                        x = int(tx)
+                                        y = int(ty)
+                                    if w > 0:
+                                        x = max(0, min(int(w - 1), int(x)))
+                                    if h > 0:
+                                        y = max(0, min(int(h - 1), int(y)))
+                                    # If System2 requests an interaction but provides a generic
+                                    # center target (common when the VLM can't localize buttons),
+                                    # try a vision-only OCR fallback to click the primary button.
+                                    ocr_fallback = False
+                                    try:
+                                        ocr_fallback = str(
+                                            os.environ.get("METABONK_SYSTEM2_OCR_CLICK_FALLBACK", "0") or "0"
+                                        ).strip().lower() in ("1", "true", "yes", "on")
+                                    except Exception:
+                                        ocr_fallback = False
+                                    if (
+                                        ocr_fallback
+                                        and menu_hint
+                                        and (abs(float(tx) - 0.5) <= 0.12)
+                                        and (abs(float(ty) - 0.5) <= 0.12)
+                                    ):
+                                        try:
+                                            import numpy as np  # type: ignore
+                                            from PIL import Image
+
+                                            from src.worker.ocr import ocr_boxes
+
+                                            frame_hwc = getattr(self, "_system2_last_full_frame_hwc", None)
+                                            ts_f = float(getattr(self, "_system2_last_full_frame_ts", 0.0) or 0.0)
+                                            if frame_hwc is not None and (now - ts_f) <= 2.0:
+                                                arr = np.asarray(frame_hwc)
+                                                if arr.ndim == 3 and int(arr.shape[2]) >= 3:
+                                                    img = Image.fromarray(arr[:, :, :3].astype("uint8"))
+                                                    boxes = ocr_boxes(img, min_conf=30, min_len=2, psm=6)
+                                                    if boxes:
+                                                        best = None
+                                                        best_score = -1.0
+                                                        import re
+
+                                                        for b in boxes:
+                                                            txt = str(b.get("text") or "").strip().lower()
+                                                            if not txt:
+                                                                continue
+                                                            conf = float(b.get("conf", 0) or 0)
+                                                            # Prefer higher OCR confidence (kept as an opt-in debug fallback).
+                                                            tokens = re.findall(r"[a-z0-9]+", txt)
+                                                            if not tokens:
+                                                                continue
+                                                            score = conf
+                                                            if score > best_score:
+                                                                best_score = score
+                                                                best = b
+                                                        if best and best.get("bbox"):
+                                                            x1, y1, x2, y2 = best["bbox"]
+                                                            ox = int((int(x1) + int(x2)) / 2)
+                                                            oy = int((int(y1) + int(y2)) / 2)
+                                                            # Map OCR-frame coords -> current frame_size coords.
+                                                            try:
+                                                                o_w = int(arr.shape[1])
+                                                                o_h = int(arr.shape[0])
+                                                            except Exception:
+                                                                o_w = 0
+                                                                o_h = 0
+                                                            if o_w > 0 and o_h > 0:
+                                                                x = int((float(ox) / float(o_w)) * float(w))
+                                                                y = int((float(oy) / float(o_h)) * float(h))
+                                                                x = max(0, min(int(w - 1), int(x)))
+                                                                y = max(0, min(int(h - 1), int(y)))
+                                                                action_source = (
+                                                                    f"{action_source}+system2_ocr" if action_source else "system2_ocr"
+                                                                )
+                                        except Exception:
+                                            pass
+                                    last_resp_ts = float(getattr(self, "_system2_last_response_ts", 0.0) or 0.0)
+                                    last_click_resp = float(getattr(self, "_system2_last_menu_click_resp_ts", 0.0) or 0.0)
+                                    last_click_ts = float(getattr(self, "_system2_last_menu_click_ts", 0.0) or 0.0)
+                                    cooldown_s = float(getattr(self, "_system2_menu_click_cooldown_s", 1.0) or 1.0)
+                                    if last_resp_ts > 0 and last_resp_ts > last_click_resp and (now - last_click_ts) >= cooldown_s:
+                                        forced_ui_click = (int(x), int(y))
+                                        suppress_policy_clicks = True
+                                        self._system2_last_menu_click_ts = float(now)
+                                        self._system2_last_menu_click_resp_ts = float(last_resp_ts)
+                                        action_source = f"{action_source}+system2_click" if action_source else "system2_click"
+                except Exception:
+                    pass
 
             # Optional System 2 (centralized VLM) directive -> continuous control hint.
             if (
@@ -6681,8 +7312,24 @@ class WorkerService:
 
                     if forced_ui_click is not None:
                         action.ui_click = True
-                        action.click_x = int(forced_ui_click[0])
-                        action.click_y = int(forced_ui_click[1])
+                        click_x = int(forced_ui_click[0])
+                        click_y = int(forced_ui_click[1])
+                        try:
+                            cap = getattr(self, "_bonklink_capture_size", None)
+                        except Exception:
+                            cap = None
+                        if cap and frame_size and frame_size[0] > 0 and frame_size[1] > 0:
+                            try:
+                                click_x = int((float(click_x) / float(frame_size[0])) * float(cap[0]))
+                                click_y = int((float(click_y) / float(frame_size[1])) * float(cap[1]))
+                                # BonkLink ClickAtPosition uses Unity screen coordinates (origin bottom-left).
+                                # Our vision/UI coordinates use image coordinates (origin top-left), so flip Y.
+                                click_y = max(0, min(int(cap[1] - 1), int(int(cap[1] - 1) - int(click_y))))
+                            except Exception:
+                                click_x = int(forced_ui_click[0])
+                                click_y = int(forced_ui_click[1])
+                        action.click_x = int(click_x)
+                        action.click_y = int(click_y)
                         if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
                             print(
                                 f"[worker:{self.instance_id}] ui_click forced x={action.click_x} y={action.click_y}"
@@ -6711,8 +7358,24 @@ class WorkerService:
                             w, h = frame_size
                             cx, cy = ui_elements[idx][0], ui_elements[idx][1]
                             action.ui_click = True
-                            action.click_x = int(cx * w)
-                            action.click_y = int(cy * h)
+                            click_x = int(cx * w)
+                            click_y = int(cy * h)
+                            try:
+                                cap = getattr(self, "_bonklink_capture_size", None)
+                            except Exception:
+                                cap = None
+                            if cap and w > 0 and h > 0:
+                                try:
+                                    click_x = int((float(click_x) / float(w)) * float(cap[0]))
+                                    click_y = int((float(click_y) / float(h)) * float(cap[1]))
+                                    # BonkLink ClickAtPosition uses Unity screen coordinates (origin bottom-left).
+                                    # Our vision/UI coordinates use image coordinates (origin top-left), so flip Y.
+                                    click_y = max(0, min(int(cap[1] - 1), int(int(cap[1] - 1) - int(click_y))))
+                                except Exception:
+                                    click_x = int(cx * w)
+                                    click_y = int(cy * h)
+                            action.click_x = int(click_x)
+                            action.click_y = int(click_y)
                             if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
                                 print(
                                     f"[worker:{self.instance_id}] ui_click idx={idx} x={action.click_x} y={action.click_y}"
@@ -6747,8 +7410,12 @@ class WorkerService:
                     frame_size,
                 )
 
-            # Reward: prefer learned reward-from-video (progress score delta). No placeholder shaping.
-            if self._use_learned_reward:
+            # Reward: prefer learned reward-from-video (progress score delta).
+            # In pure-vision mode we explicitly disable all extrinsic reward sources
+            # and rely on intrinsic reward shaping in the learner.
+            if self._pure_vision_mode:
+                reward = 0.0
+            elif self._use_learned_reward:
                 if reward_frame_hwc is None:
                     # Grace window to allow the game bridge / capture pipeline to warm up.
                     # Without this, the worker can crash before the first JPEG/capture arrives.
@@ -6776,22 +7443,27 @@ class WorkerService:
                     "Enable learned reward (METABONK_USE_LEARNED_REWARD=1) or provide a reward-capable bridge."
                 )
             # Optional menu shaping: discourage menu stalls, reward exiting menus.
+            # Forced off in pure-vision mode.
             if menu_hint is not None:
-                try:
-                    menu_penalty = float(os.environ.get("METABONK_MENU_PENALTY", "0") or 0.0)
-                except Exception:
+                if self._pure_vision_mode:
                     menu_penalty = 0.0
-                try:
-                    menu_exit_bonus = float(os.environ.get("METABONK_MENU_EXIT_BONUS", "0") or 0.0)
-                except Exception:
                     menu_exit_bonus = 0.0
+                else:
+                    try:
+                        menu_penalty = float(os.environ.get("METABONK_MENU_PENALTY", "0") or 0.0)
+                    except Exception:
+                        menu_penalty = 0.0
+                    try:
+                        menu_exit_bonus = float(os.environ.get("METABONK_MENU_EXIT_BONUS", "0") or 0.0)
+                    except Exception:
+                        menu_exit_bonus = 0.0
                 if menu_hint and menu_penalty:
                     reward += menu_penalty
                 if (not menu_hint) and (self._last_menu_mode is True) and menu_exit_bonus:
                     reward += menu_exit_bonus
                 self._last_menu_mode = bool(menu_hint)
             # Optional menu transition bonus (e.g., MainMenu -> GeneratedMap).
-            menu_start_bonus = float(self._menu_start_bonus or 0.0)
+            menu_start_bonus = 0.0 if self._pure_vision_mode else float(self._menu_start_bonus or 0.0)
             try:
                 cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
             except Exception:
@@ -7999,6 +8671,10 @@ class WorkerService:
         out.setdefault("stream_max_clients", None)
         out.setdefault("stream_busy", None)
         out.setdefault("nvenc_sessions_used", None)
+        # Optional diagnostic FPS fields (these are also used by validation harnesses).
+        out.setdefault("stream_fps", None)
+        out.setdefault("stream_target_fps", None)
+        out.setdefault("obs_fps", None)
         if self.streamer is not None:
             try:
                 out["stream_backend"] = getattr(self.streamer, "backend", None)
@@ -8030,6 +8706,11 @@ class WorkerService:
                 )
             except Exception:
                 pass
+            try:
+                sfps = getattr(self.streamer, "stream_fps", None)
+                out["stream_fps"] = float(sfps) if sfps is not None else None
+            except Exception:
+                out["stream_fps"] = None
         elif bool(getattr(self, "_stream_enabled", False)) and not bool(getattr(self, "_capture_disabled", False)):
             # If capture is enabled but the streamer isn't initialized yet, return stable defaults.
             try:
@@ -8041,6 +8722,105 @@ class WorkerService:
             out["stream_active_clients"] = 0
             out["stream_max_clients"] = int(max_clients)
             out["stream_busy"] = False
+        try:
+            out["obs_fps"] = float(getattr(self, "_obs_fps", 0.0) or 0.0) if getattr(self, "_obs_fps", None) is not None else None
+        except Exception:
+            out["obs_fps"] = None
+        try:
+            tfps = int(os.environ.get("METABONK_STREAM_FPS", "0") or 0)
+            out["stream_target_fps"] = int(tfps) if int(tfps) > 0 else None
+        except Exception:
+            out["stream_target_fps"] = None
+        out.setdefault("frames_fps", 0.0)
+        # Preserve the original computed FPS (often capture/obs cadence) so diagnostics can
+        # compare it against stream output/target FPS.
+        try:
+            out.setdefault("capture_fps", float(out.get("frames_fps") or 0.0))
+        except Exception:
+            out.setdefault("capture_fps", None)
+        # Prefer stream FPS when available; otherwise fall back to target stream FPS and then obs FPS.
+        try:
+            sfps = out.get("stream_fps")
+            if sfps is not None and float(sfps or 0.0) > 0.0:
+                out["frames_fps"] = float(sfps)
+            else:
+                tfps = out.get("stream_target_fps")
+                if tfps is not None and float(tfps or 0.0) > 0.0 and bool(out.get("stream_enabled", False)):
+                    out["frames_fps"] = float(tfps)
+                else:
+                    ofps = out.get("obs_fps")
+                    if ofps is not None and float(ofps or 0.0) > 0.0:
+                        out["frames_fps"] = float(ofps)
+        except Exception:
+            pass
+        # Expose whether the worker believes the capture/stream pipeline is GPU zero-copy.
+        try:
+            backend = str(out.get("stream_backend") or "")
+            backend_l = backend.lower()
+            zero_copy = False
+            if bool(out.get("synthetic_eye")):
+                zero_copy = True
+            elif bool(out.get("stream_require_zero_copy")):
+                zero_copy = True
+            elif backend_l and ("cuda" in backend_l or "dmabuf" in backend_l):
+                zero_copy = True
+            out["zero_copy"] = bool(zero_copy)
+        except Exception:
+            out["zero_copy"] = False
+        # System2/3 compatibility payload for validation harnesses.
+        try:
+            resp = getattr(self, "_system2_last_response", None)
+            if isinstance(resp, dict) and resp:
+                phase = str(out.get("phase_effective") or out.get("phase_label") or "").strip().lower()
+                hud_phase = str(out.get("hud_phase") or "").strip().lower()
+                scene_type = "unknown"
+                if out.get("gameplay_started"):
+                    scene_type = "gameplay"
+                elif out.get("phase_gameplay") or ("game" in phase) or ("combat" in phase):
+                    scene_type = "gameplay"
+                elif phase in ("lobby", "menu", "main_menu"):
+                    scene_type = "menu"
+                elif phase:
+                    scene_type = phase
+                elif hud_phase:
+                    if hud_phase in ("lobby", "menu", "main_menu", "character_select"):
+                        scene_type = "menu"
+                    elif hud_phase in ("gameplay", "in_game", "combat") or ("game" in hud_phase):
+                        scene_type = "gameplay"
+                    else:
+                        scene_type = hud_phase
+                req_ts = None
+                try:
+                    req_ts = float((self._system2_last_request or {}).get("timestamp") or 0.0)
+                except Exception:
+                    req_ts = None
+                out["system2_reasoning"] = {
+                    "scene_type": scene_type,
+                    "scene_confidence": float(out.get("phase_conf") or 0.0),
+                    "goal": str(resp.get("goal") or ""),
+                    "confidence": float(resp.get("confidence") or 0.0),
+                    "reasoning": str(resp.get("reasoning") or ""),
+                    "directive": resp.get("directive") if isinstance(resp.get("directive"), dict) else {},
+                    "inference_time_ms": resp.get("inference_time_ms"),
+                    "last_request_ts": req_ts,
+                    "last_response_ts": float(getattr(self, "_system2_last_response_ts", 0.0) or 0.0),
+                    "reasoning_trace": list(getattr(self, "_system2_reasoning_trace", []) or []),
+                }
+            else:
+                out["system2_reasoning"] = None
+        except Exception:
+            out["system2_reasoning"] = None
+        # Action-discovery telemetry (best-effort).
+        try:
+            buttons = list(getattr(self, "_input_buttons", []) or [])
+            out["discovery_stats"] = {
+                "actions_discovered": int(len(buttons)),
+                "input_backend": str(getattr(self, "_input_backend_name", "") or ""),
+                "pure_vision_mode": bool(getattr(self, "_pure_vision_mode", False)),
+                "most_rewarding": "none",
+            }
+        except Exception:
+            out["discovery_stats"] = {"actions_discovered": 0, "most_rewarding": "none"}
         if self._use_sima2 and self._sima2_controller is not None:
             try:
                 out["sima2"] = self._sima2_controller.get_status()
@@ -8157,7 +8937,7 @@ if app:
         return service.status()
 
     @app.get("/stream")
-    def stream_video():
+    async def stream_video(request: Request):
         """NVENC MPEG-TS stream (read-only)."""
         if not service:
             raise HTTPException(status_code=404, detail="streaming disabled")
@@ -8171,6 +8951,7 @@ if app:
         if getattr(service.streamer, "is_busy", None) and service.streamer.is_busy():
             raise HTTPException(status_code=429, detail="stream busy")
         from fastapi.responses import StreamingResponse
+        from starlette.concurrency import iterate_in_threadpool
         from src.worker.nvenc_session_manager import try_acquire_nvenc_slot
 
         allow_cpu = str(os.environ.get("METABONK_STREAM_ALLOW_CPU_FALLBACK", "") or "").strip().lower() in (
@@ -8187,22 +8968,55 @@ if app:
         ):
             raise HTTPException(status_code=503, detail="NVENC session limit reached")
 
+        import threading
+
+        stop_ev = threading.Event()
+
         def _gen():
             try:
-                yield from service.streamer.iter_chunks(container="mpegts")
+                yield from service.streamer.iter_chunks(container="mpegts", stop_event=stop_ev)
             finally:
                 if lease is not None:
                     lease.release()
 
         gen = _gen()
+
+        async def _agen():  # type: ignore[no-untyped-def]
+            async def _watch_disconnect() -> None:
+                try:
+                    while not stop_ev.is_set():
+                        if await request.is_disconnected():
+                            stop_ev.set()
+                            break
+                        await asyncio.sleep(0.25)
+                except Exception:
+                    stop_ev.set()
+
+            watch_task = asyncio.create_task(_watch_disconnect())
+            try:
+                async for chunk in iterate_in_threadpool(gen):
+                    if stop_ev.is_set():
+                        break
+                    yield chunk
+            except asyncio.CancelledError:
+                stop_ev.set()
+                return
+            finally:
+                stop_ev.set()
+                try:
+                    watch_task.cancel()
+                    await watch_task
+                except BaseException:
+                    pass
+
         return StreamingResponse(
-            gen,
+            _agen(),
             media_type="video/MP2T",
             headers={"Cache-Control": "no-store"},
         )
 
     @app.get("/stream.mp4")
-    def stream_mp4():
+    async def stream_mp4(request: Request):
         """GPU NVENC fragmented MP4 stream (browser-friendly)."""
         if not service:
             raise HTTPException(status_code=404, detail="streaming disabled")
@@ -8216,6 +9030,7 @@ if app:
         if getattr(service.streamer, "is_busy", None) and service.streamer.is_busy():
             raise HTTPException(status_code=429, detail="stream busy")
         from fastapi.responses import StreamingResponse
+        from starlette.concurrency import iterate_in_threadpool
         from src.worker.nvenc_session_manager import try_acquire_nvenc_slot
 
         allow_cpu = str(os.environ.get("METABONK_STREAM_ALLOW_CPU_FALLBACK", "") or "").strip().lower() in (
@@ -8232,16 +9047,49 @@ if app:
         ):
             raise HTTPException(status_code=503, detail="NVENC session limit reached")
 
+        import threading
+
+        stop_ev = threading.Event()
+
         def _gen():
             try:
-                yield from service.streamer.iter_chunks(container="mp4")
+                yield from service.streamer.iter_chunks(container="mp4", stop_event=stop_ev)
             finally:
                 if lease is not None:
                     lease.release()
 
         gen = _gen()
+
+        async def _agen():  # type: ignore[no-untyped-def]
+            async def _watch_disconnect() -> None:
+                try:
+                    while not stop_ev.is_set():
+                        if await request.is_disconnected():
+                            stop_ev.set()
+                            break
+                        await asyncio.sleep(0.25)
+                except Exception:
+                    stop_ev.set()
+
+            watch_task = asyncio.create_task(_watch_disconnect())
+            try:
+                async for chunk in iterate_in_threadpool(gen):
+                    if stop_ev.is_set():
+                        break
+                    yield chunk
+            except asyncio.CancelledError:
+                stop_ev.set()
+                return
+            finally:
+                stop_ev.set()
+                try:
+                    watch_task.cancel()
+                    await watch_task
+                except BaseException:
+                    pass
+
         return StreamingResponse(
-            gen,
+            _agen(),
             media_type="video/mp4",
             headers={"Cache-Control": "no-store"},
         )

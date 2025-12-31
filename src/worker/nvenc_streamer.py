@@ -416,29 +416,28 @@ def _gst_element_available(name: str) -> bool:
     cached = _GST_ELEMENT_CACHE.get(n)
     if cached is True:
         return True
+    # Prefer in-process inspection. Spawning `gst-inspect-1.0` on first stream connect can
+    # be slow (plugin registry scan) and can stall multi-worker startup. Workers warm
+    # `Gst.init()` at boot, so this path should be fast for the hot streaming path.
+    if Gst is not None:
+        try:
+            Gst.init(None)
+            ok = Gst.ElementFactory.find(n) is not None
+        except Exception:
+            ok = False
+        if ok:
+            _GST_ELEMENT_CACHE[n] = True
+            return True
+
+    # Fallback: shell out to gst-inspect for environments without Python bindings.
     gst_inspect = shutil.which("gst-inspect-1.0")
     if not gst_inspect:
-        if Gst is not None:
-            try:
-                Gst.init(None)
-                ok = Gst.ElementFactory.find(n) is not None
-                if ok:
-                    _GST_ELEMENT_CACHE[n] = True
-                return ok
-            except Exception:
-                return False
         return False
     try:
-        out = subprocess.check_output([gst_inspect, n], stderr=subprocess.STDOUT, timeout=5.0)
+        # Cold starts can rebuild the registry and take several seconds; avoid false negatives.
+        out = subprocess.check_output([gst_inspect, n], stderr=subprocess.STDOUT, timeout=20.0)
         txt = out.decode("utf-8", "replace").lower()
-        if "no such element" in txt or "not found" in txt:
-            ok = False
-        else:
-            # If gst-inspect succeeds (exit 0), the element is considered available.
-            # Some platforms print CUDA/NVENC warnings to stdout/stderr even when the
-            # element can still be instantiated at runtime, so do not treat warnings
-            # as fatal here.
-            ok = True
+        ok = not ("no such element" in txt or "not found" in txt)
     except subprocess.CalledProcessError as e:
         txt = (e.output or b"").decode("utf-8", "replace").lower()
         ok = not ("no such element" in txt or "not found" in txt)
@@ -735,6 +734,15 @@ class NVENCStreamer:
                 return "ffmpeg"
             return f"ffmpeg:{enc}"
         if requested in ("gst", "gstreamer", "gst-launch"):
+            # If Synthetic Eye can supply CUDA frames and there's no PipeWire node,
+            # the actual encode path will be the CUDA appsrc backend even when the user
+            # asked for "gst". Advertise that up-front so /status reflects GPU-only capture.
+            try:
+                target = str(os.environ.get("PIPEWIRE_NODE") or self.cfg.pipewire_node or "").strip()
+            except Exception:
+                target = ""
+            if self.cfg.cuda_frame_provider is not None and (_env_truthy("METABONK_STREAM_REQUIRE_ZERO_COPY") or not target):
+                return "gst:cuda_appsrc"
             return "gst"
         if requested in ("auto", ""):
             if self.cfg.cuda_frame_provider is not None:
@@ -1770,7 +1778,12 @@ class NVENCStreamer:
         #
         # This keeps `/stream.mp4` usable for smoke tests and the dev UI even when gamescope
         # doesn't expose a PipeWire node in the current environment.
-        if not require_zero_copy and requested_backend in ("", "auto") and backend != "x11grab":
+        if (
+            not require_zero_copy
+            and requested_backend in ("", "auto")
+            and backend != "x11grab"
+            and self.cfg.cuda_frame_provider is None
+        ):
             target = str(os.environ.get("PIPEWIRE_NODE") or self.cfg.pipewire_node or "").strip()
             if not target:
                 if self.cfg.pixel_frame_provider is not None:
@@ -1994,6 +2007,7 @@ class NVENCStreamer:
             return None
 
         try:
+            last_output_ts = 0.0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -2009,14 +2023,13 @@ class NVENCStreamer:
                     if chunk_q:
                         data = chunk_q.popleft()
                 if data:
+                    last_output_ts = now
                     yield data
                     continue
-                with self._lock:
-                    last = float(self.last_chunk_ts or 0.0)
-                if (now - start_ts) >= startup_timeout_s and last <= 0.0:
+                if (now - start_ts) >= startup_timeout_s and last_output_ts <= 0.0:
                     self._record_error("stream startup timeout (no output from encoder)")
                     break
-                if last > 0.0 and (now - last) >= stall_timeout_s:
+                if last_output_ts > 0.0 and (now - last_output_ts) >= stall_timeout_s:
                     self._record_error("stream stalled (no buffers)")
                     break
         finally:
@@ -2047,21 +2060,32 @@ class NVENCStreamer:
         is unavailable or undesirable. Frames are provided as CUDA tensors via
         `cfg.cuda_frame_provider` and wrapped into GstCudaMemory without staging on CPU.
         """
+        def _drop_client() -> None:
+            try:
+                with self._lock:
+                    self._active_clients = max(0, int(self._active_clients) - 1)
+                    active = int(self._active_clients)
+                _log_stream_event("client_disconnected", active_clients=active, container=container)
+            except Exception:
+                return
+
         if Gst is None or GstApp is None or GstVideo is None:
             self._record_error("cuda_appsrc requires GStreamer Python bindings")
+            _drop_client()
             return
         if GstCuda is None:
             self._record_error("cuda_appsrc requires GstCuda (gst-plugins-bad) Python typelibs")
+            _drop_client()
             return
         if self.cfg.cuda_frame_provider is None:
             self._record_error("cuda_appsrc requires a CUDA frame provider")
+            _drop_client()
             return
         if not _gst_element_available("appsrc") or not _gst_element_available("appsink"):
             self._record_error("cuda_appsrc requires appsrc/appsink elements")
+            _drop_client()
             return
-        if not _gst_element_available("cudaconvert"):
-            self._record_error("cuda_appsrc requires cudaconvert (gst-plugins-bad)")
-            return
+        have_cudaconvert = _gst_element_available("cudaconvert")
 
         Gst.init(None)
 
@@ -2070,6 +2094,7 @@ class NVENCStreamer:
             codec = "h264"
         if codec not in ("h264", "hevc", "av1"):
             self._record_error(f"cuda_appsrc unsupported codec '{codec}'")
+            _drop_client()
             return
 
         container = str(container or "mp4").lower().strip()
@@ -2085,6 +2110,7 @@ class NVENCStreamer:
         first = None
         while first is None:
             if stop_event is not None and stop_event.is_set():
+                _drop_client()
                 return
             try:
                 first = self.cfg.cuda_frame_provider()
@@ -2094,6 +2120,7 @@ class NVENCStreamer:
                 break
             if (time.time() - start_wait) > 10.0:
                 self._record_error("cuda_appsrc startup timeout (no CUDA frames available)")
+                _drop_client()
                 return
             time.sleep(0.05)
 
@@ -2123,6 +2150,7 @@ class NVENCStreamer:
         coerced = _coerce(first)
         if coerced is None:
             self._record_error("cuda_appsrc received invalid CUDA frame payload")
+            _drop_client()
             return
         tensor, width, height, _fid0, _ts0 = coerced
 
@@ -2142,12 +2170,14 @@ class NVENCStreamer:
                 cuda_ctx = GstCuda.CudaContext.new(int(device_id))
         except Exception as e:
             self._record_error(f"cuda_appsrc failed to create GstCudaContext: {e}")
+            _drop_client()
             return
 
         try:
             cuda_stream = GstCuda.CudaStream.new(cuda_ctx)
         except Exception as e:
             self._record_error(f"cuda_appsrc failed to create GstCudaStream: {e}")
+            _drop_client()
             return
 
         # Describe the wrapped CUDA memory layout to GstCudaAllocator.
@@ -2158,22 +2188,24 @@ class NVENCStreamer:
             ok = False
         if not ok:
             self._record_error("cuda_appsrc failed to configure GstVideoInfo for RGBA")
+            _drop_client()
             return
 
         try:
-            allocator = GstCuda.CudaPoolAllocator.new(cuda_ctx, cuda_stream, vinfo)
-            try:
-                allocator.set_active(True)
-            except Exception:
-                pass
+            # Do not use the pooled allocator here: each frame is backed by an external
+            # torch tensor. Pooling can retain wrapped memories and delay destroy-notify,
+            # leading to unbounded CUDA tensor retention (VRAM OOM) during streaming.
+            allocator = GstCuda.CudaAllocator()
         except Exception as e:
             self._record_error(f"cuda_appsrc failed to create GstCuda allocator: {e}")
+            _drop_client()
             return
 
         # Encoder chain (CUDA->NVENC->parse->mux->appsink).
         encoder = _select_gst_encoder(codec)
         if not encoder.startswith("nv"):
             self._record_error(f"cuda_appsrc requires NVENC encoder, got '{encoder}'")
+            _drop_client()
             return
         enc_props = _gst_element_properties(encoder)
         enc_opts: list[str] = []
@@ -2262,12 +2294,17 @@ class NVENCStreamer:
             )
             mux_segment = f"mpegtsmux name=mux {ts_opts}".strip()
 
+        convert_segment = ""
+        if have_cudaconvert:
+            # Older GStreamer builds required an explicit cudaconvert hop to feed NV12 into NVENC.
+            # Newer nvcodec encoders accept RGBA CUDAMemory directly, so we can keep this optional.
+            convert_segment = "cudaconvert ! video/x-raw(memory:CUDAMemory),format=NV12 ! "
+
         pipeline_str = (
             "appsrc name=src is-live=true do-timestamp=true format=time ! "
             "queue max-size-buffers=4 leaky=downstream ! "
             "video/x-raw(memory:CUDAMemory),format=RGBA ! "
-            "cudaconvert ! "
-            "video/x-raw(memory:CUDAMemory),format=NV12 ! "
+            f"{convert_segment}"
             f"{encoder_with_opts} ! "
             f"{parser_segment} ! {caps} ! "
             f"{(mux_segment + ' ! ') if mux_segment else ''}"
@@ -2284,6 +2321,7 @@ class NVENCStreamer:
                 raise RuntimeError("missing appsrc/appsink elements")
         except Exception as e:
             self._record_error(f"cuda_appsrc pipeline build failed: {e}")
+            _drop_client()
             return
 
         # Lock caps on appsrc (framerate + geometry).
@@ -2292,6 +2330,72 @@ class NVENCStreamer:
                 f"video/x-raw(memory:CUDAMemory),format=RGBA,width={int(width)},height={int(height)},framerate={int(fps)}/1"
             )
             appsrc.set_property("caps", caps_in)
+        except Exception:
+            pass
+
+        # Bound appsrc's internal queue to prevent unbounded retention of CUDA tensors when
+        # downstream stalls (e.g., slow HTTP client or muxer backpressure).
+        #
+        # Without this, each pushed buffer can keep a CUDA tensor alive via destroy-notify,
+        # eventually OOM'ing the GPU.
+        appsrc_max_buffers = 8
+        try:
+            appsrc_max_buffers = int(os.environ.get("METABONK_STREAM_APPSRC_MAX_BUFFERS", "8"))
+        except Exception:
+            appsrc_max_buffers = 8
+        if appsrc_max_buffers < 1:
+            appsrc_max_buffers = 1
+
+        frame_bytes = 0
+        try:
+            frame_bytes = int(width) * int(height) * 4  # RGBA
+        except Exception:
+            frame_bytes = 0
+
+        appsrc_max_bytes = frame_bytes * int(appsrc_max_buffers) if frame_bytes > 0 else 0
+        raw_max_bytes = str(os.environ.get("METABONK_STREAM_APPSRC_MAX_BYTES", "") or "").strip()
+        if raw_max_bytes:
+            try:
+                appsrc_max_bytes = int(raw_max_bytes)
+            except Exception:
+                pass
+
+        appsrc_max_time = 0
+        raw_max_time = str(os.environ.get("METABONK_STREAM_APPSRC_MAX_TIME_NS", "") or "").strip()
+        if raw_max_time:
+            try:
+                appsrc_max_time = int(raw_max_time)
+            except Exception:
+                appsrc_max_time = 0
+        if appsrc_max_time < 0:
+            appsrc_max_time = 0
+
+        appsrc_leaky = str(os.environ.get("METABONK_STREAM_APPSRC_LEAKY_TYPE", "") or "").strip().lower()
+        if not appsrc_leaky:
+            appsrc_leaky = "downstream"
+        if appsrc_leaky not in ("none", "upstream", "downstream"):
+            appsrc_leaky = "downstream"
+
+        try:
+            appsrc.set_property("max-buffers", int(appsrc_max_buffers))
+        except Exception:
+            pass
+        if appsrc_max_bytes >= 0:
+            try:
+                appsrc.set_property("max-bytes", int(appsrc_max_bytes))
+            except Exception:
+                pass
+        if appsrc_max_time:
+            try:
+                appsrc.set_property("max-time", int(appsrc_max_time))
+            except Exception:
+                pass
+        try:
+            appsrc.set_property("leaky-type", appsrc_leaky)
+        except Exception:
+            pass
+        try:
+            appsrc.set_property("block", False)
         except Exception:
             pass
 
@@ -2348,6 +2452,7 @@ class NVENCStreamer:
                 pipeline.set_state(Gst.State.NULL)
             except Exception:
                 pass
+            _drop_client()
             return
         if ret == Gst.StateChangeReturn.FAILURE:
             self._record_error("cuda_appsrc pipeline failed to enter PLAYING")
@@ -2355,6 +2460,7 @@ class NVENCStreamer:
                 pipeline.set_state(Gst.State.NULL)
             except Exception:
                 pass
+            _drop_client()
             return
 
         self.backend = f"gst:cuda_appsrc:{encoder}"
@@ -2397,8 +2503,55 @@ class NVENCStreamer:
         # Wrap CUDA dev_ptr -> GstCudaMemory with a destroy notify that holds tensor refs alive.
         _gst_cuda_ctypes()
         cb_t = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+        use_copy_pool = str(os.environ.get("METABONK_STREAM_CUDA_APPSRC_COPY_POOL", "1") or "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        pool_size = 0
+        try:
+            pool_size = int(os.environ.get("METABONK_STREAM_CUDA_APPSRC_POOL_SIZE", "32"))
+        except Exception:
+            pool_size = 32
+        if pool_size < 2:
+            pool_size = 2
+
+        pool_lock = threading.Lock()
+        pool_cv = threading.Condition(pool_lock)
+        pool_free: "deque[int]" = deque()
+        pool_tensors: list[object] = []
+
         ud_lock = threading.Lock()
+        ud_cv = threading.Condition(ud_lock)
         ud_refs: dict[int, object] = {}
+        max_inflight = 0
+        try:
+            max_inflight = int(os.environ.get("METABONK_STREAM_CUDA_APPSRC_MAX_INFLIGHT", "32"))
+        except Exception:
+            max_inflight = 32
+        if max_inflight < 0:
+            max_inflight = 0
+
+        if use_copy_pool:
+            try:
+                import torch  # type: ignore
+
+                dtype = getattr(tensor, "dtype", None) or torch.uint8
+                device = getattr(tensor, "device", None) or "cuda"
+                for _ in range(int(pool_size)):
+                    pool_tensors.append(
+                        torch.empty(
+                            (int(height), int(width), 4),
+                            dtype=dtype,
+                            device=device,
+                        )
+                    )
+                pool_free = deque(range(int(pool_size)))
+            except Exception as e:
+                self._record_error(f"cuda_appsrc failed to initialize copy pool: {e}")
+                use_copy_pool = False
 
         @cb_t
         def _destroy_notify(user_data_ptr):  # type: ignore[no-untyped-def]
@@ -2408,8 +2561,16 @@ class NVENCStreamer:
                 key = 0
             if key <= 0:
                 return
-            with ud_lock:
+            if use_copy_pool and pool_tensors:
+                idx = key - 1
+                if 0 <= idx < len(pool_tensors):
+                    with pool_cv:
+                        pool_free.append(idx)
+                        pool_cv.notify_all()
+                return
+            with ud_cv:
                 ud_refs.pop(key, None)
+                ud_cv.notify_all()
 
         push_stop = threading.Event()
 
@@ -2418,9 +2579,43 @@ class NVENCStreamer:
             frame_idx = 0
             period_ns = int(1_000_000_000 // max(1, int(fps)))
             next_deadline = time.monotonic_ns()
+            hard_limit = 0
+            try:
+                hard_limit = int(
+                    os.environ.get(
+                        "METABONK_STREAM_APPSRC_HARD_LIMIT_BUFFERS",
+                        str(max(128, int(appsrc_max_buffers) * 16)),
+                    )
+                )
+            except Exception:
+                hard_limit = max(128, int(appsrc_max_buffers) * 16)
+            if hard_limit < 0:
+                hard_limit = 0
             while not push_stop.is_set():
                 if stop_event is not None and stop_event.is_set():
                     break
+                pool_idx: Optional[int] = None
+                if use_copy_pool and pool_tensors:
+                    with pool_cv:
+                        while not push_stop.is_set():
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            if pool_free:
+                                pool_idx = int(pool_free.popleft())
+                                break
+                            pool_cv.wait(timeout=0.05)
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                elif max_inflight:
+                    with ud_cv:
+                        while not push_stop.is_set():
+                            if stop_event is not None and stop_event.is_set():
+                                break
+                            if len(ud_refs) < max_inflight:
+                                break
+                            ud_cv.wait(timeout=0.05)
+                    if stop_event is not None and stop_event.is_set():
+                        break
                 payload = None
                 try:
                     payload = self.cfg.cuda_frame_provider()
@@ -2428,9 +2623,28 @@ class NVENCStreamer:
                     payload = None
                 coerced = _coerce(payload) if payload is not None else None
                 if coerced is None:
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     time.sleep(0.005)
                     continue
                 t, w, h, fid, _ts = coerced
+
+                # Safety: if appsrc internal queue grows unexpectedly, abort before we OOM VRAM.
+                if hard_limit:
+                    try:
+                        queued = int(appsrc.get_property("current-level-buffers") or 0)
+                    except Exception:
+                        queued = 0
+                    if queued > hard_limit:
+                        self._record_error(
+                            f"cuda_appsrc backpressure: appsrc queued {queued} buffers (limit={hard_limit}); aborting"
+                        )
+                        break
                 try:
                     if int(w) != int(width) or int(h) != int(height):
                         # Dynamic resize would require renegotiation; hard-fail in strict mode.
@@ -2440,6 +2654,13 @@ class NVENCStreamer:
                     pass
                 if fid is not None and last_frame_id is not None and int(fid) == int(last_frame_id):
                     # No new frame; keep timing stable.
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     now = time.monotonic_ns()
                     sleep_ns = next_deadline - now
                     if sleep_ns > 0:
@@ -2454,25 +2675,61 @@ class NVENCStreamer:
                 except Exception:
                     pass
 
+                t_for_wrap = t
+                if pool_idx is not None and use_copy_pool and pool_tensors:
+                    try:
+                        dst = pool_tensors[int(pool_idx)]
+                        # Copy into a persistent pool tensor so we don't retain a new torch allocation per frame.
+                        # The pool slot is released by destroy-notify when GStreamer frees the wrapped memory.
+                        dst.copy_(t_for_wrap)  # type: ignore[attr-defined]
+                        t_for_wrap = dst
+                    except Exception as e:
+                        self._record_error(f"cuda_appsrc pool copy failed: {e}")
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
+                        continue
+
                 try:
-                    dev_ptr = int(getattr(t, "data_ptr")())
+                    dev_ptr = int(getattr(t_for_wrap, "data_ptr")())
                 except Exception:
                     self._record_error("cuda_appsrc invalid CUDA tensor (no data_ptr)")
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     break
                 expected = int(width) * int(height) * 4
                 try:
-                    numel = int(getattr(t, "numel")())
+                    numel = int(getattr(t_for_wrap, "numel")())
                     if numel != expected:
                         self._record_error(f"cuda_appsrc tensor size mismatch (numel={numel} expected={expected})")
+                        if pool_idx is not None and use_copy_pool and pool_tensors:
+                            try:
+                                with pool_cv:
+                                    pool_free.append(int(pool_idx))
+                                    pool_cv.notify_all()
+                            except Exception:
+                                pass
                         break
                 except Exception:
                     pass
 
                 # Keep the tensor alive until GstCuda frees the wrapped memory.
-                ud = ctypes.pointer(ctypes.py_object(t))
-                ud_ptr = ctypes.cast(ud, ctypes.c_void_p)
-                with ud_lock:
-                    ud_refs[int(ud_ptr.value or 0)] = ud
+                ud_ptr = None
+                if pool_idx is not None and use_copy_pool and pool_tensors:
+                    ud_ptr = ctypes.c_void_p(int(pool_idx) + 1)
+                else:
+                    ud = ctypes.pointer(ctypes.py_object(t_for_wrap))
+                    ud_ptr = ctypes.cast(ud, ctypes.c_void_p)
+                    with ud_lock:
+                        ud_refs[int(ud_ptr.value or 0)] = ud
 
                 mem_ptr = None
                 try:
@@ -2487,9 +2744,23 @@ class NVENCStreamer:
                     )
                 except Exception as e:
                     self._record_error(f"cuda_appsrc alloc_wrapped failed: {e}")
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     break
                 if not mem_ptr:
                     self._record_error("cuda_appsrc alloc_wrapped returned NULL")
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     break
 
                 buf = Gst.Buffer.new()
@@ -2516,6 +2787,13 @@ class NVENCStreamer:
                     ret = Gst.FlowReturn.ERROR
                 if ret != Gst.FlowReturn.OK:
                     self._record_error(f"cuda_appsrc push-buffer failed ({ret})")
+                    if pool_idx is not None and use_copy_pool and pool_tensors:
+                        try:
+                            with pool_cv:
+                                pool_free.append(int(pool_idx))
+                                pool_cv.notify_all()
+                        except Exception:
+                            pass
                     break
 
                 last_frame_id = int(fid) if fid is not None else last_frame_id
@@ -2548,6 +2826,7 @@ class NVENCStreamer:
             stall_timeout_s = 0.5
 
         try:
+            last_output_ts = 0.0
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
@@ -2563,14 +2842,13 @@ class NVENCStreamer:
                     if chunk_q:
                         data = chunk_q.popleft()
                 if data:
+                    last_output_ts = now
                     yield data
                     continue
-                with self._lock:
-                    last = float(self.last_chunk_ts or 0.0)
-                if (now - start_ts) >= startup_timeout_s and last <= 0.0:
+                if (now - start_ts) >= startup_timeout_s and last_output_ts <= 0.0:
                     self._record_error("cuda_appsrc startup timeout (no output from encoder)")
                     break
-                if last > 0.0 and (now - last) >= stall_timeout_s:
+                if last_output_ts > 0.0 and (now - last_output_ts) >= stall_timeout_s:
                     self._record_error("cuda_appsrc stalled (no buffers)")
                     break
         finally:

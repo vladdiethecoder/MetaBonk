@@ -719,8 +719,21 @@ class MetricsCollector:
     def _poll_workers(self) -> Dict[str, Dict[str, Any]]:
         if not (self.orch_url and HAS_REQUESTS):
             return {}
-        data = self._get_json(f"{self.orch_url}/workers")
-        return data if isinstance(data, dict) else {}
+        payload = self._get_json(f"{self.orch_url}/workers")
+        if not isinstance(payload, dict):
+            return {}
+        if isinstance(payload.get("workers_by_id"), dict):
+            return payload.get("workers_by_id") or {}
+        if isinstance(payload.get("workers"), list):
+            out: Dict[str, Dict[str, Any]] = {}
+            for row in payload.get("workers") or []:
+                if not isinstance(row, dict):
+                    continue
+                iid = str(row.get("instance_id") or "")
+                if iid:
+                    out[iid] = row
+            return out
+        return payload
 
     def _poll_pbt(self) -> Dict[str, Dict[str, Any]]:
         if not (self.orch_url and HAS_REQUESTS):

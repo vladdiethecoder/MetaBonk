@@ -274,7 +274,7 @@ def destroy_event(ev: driver.CUevent) -> None:
         pass
 
 
-def create_stream(*, non_blocking: bool = True) -> driver.CUstream:
+def create_stream(*, non_blocking: bool = True, priority: Optional[int] = None) -> driver.CUstream:
     """Create a dedicated CUDA stream for external semaphore servicing.
 
     The default stream can be implicitly synchronized with unrelated GPU work (e.g. PyTorch),
@@ -283,6 +283,10 @@ def create_stream(*, non_blocking: bool = True) -> driver.CUstream:
     """
     _ensure_ctx()
     flags = driver.CUstream_flags.CU_STREAM_NON_BLOCKING if non_blocking else driver.CUstream_flags.CU_STREAM_DEFAULT
-    err, st = driver.cuStreamCreate(flags)
-    _check(err, "cuStreamCreate")
+    if priority is None:
+        err, st = driver.cuStreamCreate(flags)
+        _check(err, "cuStreamCreate")
+    else:
+        err, st = driver.cuStreamCreateWithPriority(flags, int(priority))
+        _check(err, "cuStreamCreateWithPriority")
     return st

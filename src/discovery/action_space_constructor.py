@@ -254,27 +254,11 @@ class ActionSpaceConstructor:
             conf = float(eff.get("confidence", 0.0))
             mag = float(eff.get("magnitude", 0.0))
             mag_score = float(mag / (max_input_mag + 1e-8)) if max_input_mag > 0 else 0.0
-            common_bonus = 1.0 if self._is_common_input(str(input_id)) else 0.5
-            score = float(0.4 * conf + 0.4 * mag_score + 0.2 * common_bonus)
+            score = float(0.5 * conf + 0.5 * mag_score)
             scored.append((str(input_id), score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         return [i for i, _s in scored[:max_select]]
-
-    @staticmethod
-    def _is_common_input(input_id: str) -> bool:
-        common = {
-            "KEY_W",
-            "KEY_A",
-            "KEY_S",
-            "KEY_D",
-            "KEY_SPACE",
-            "KEY_E",
-            "KEY_R",
-            "BTN_LEFT",
-            "BTN_RIGHT",
-        }
-        return str(input_id) in common
 
     @staticmethod
     def _create_action_binding(input_id: str) -> Dict[str, Any]:

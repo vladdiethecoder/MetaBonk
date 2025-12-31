@@ -86,6 +86,11 @@ class DemandPagedFifoWriter:
     _thread: Optional[threading.Thread] = None
     _stop: threading.Event = threading.Event()
     last_error: Optional[str] = None
+    _reader_connected: bool = False
+
+    @property
+    def reader_connected(self) -> bool:
+        return bool(self._reader_connected)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -111,12 +116,14 @@ class DemandPagedFifoWriter:
             try:
                 fd = try_open_fifo_writer(self.fifo_path)
                 if fd is None:
+                    self._reader_connected = False
                     # No consumer: stay cheap.
                     self._stop.wait(backoff)
                     continue
                 if self.pipe_size_bytes > 0:
                     try_set_pipe_size(fd, self.pipe_size_bytes)
                 reader_connected = True
+                self._reader_connected = True
                 _log_fifo_event("fifo_reader_connected", path=self.fifo_path, pipe_bytes=self.pipe_size_bytes)
 
                 gen = self.chunk_iter_factory()
@@ -161,6 +168,7 @@ class DemandPagedFifoWriter:
                 _log_fifo_event("fifo_error", path=self.fifo_path, error=str(e))
                 self._stop.wait(backoff)
             finally:
+                self._reader_connected = False
                 if gen is not None:
                     try:
                         gen.close()  # type: ignore[attr-defined]

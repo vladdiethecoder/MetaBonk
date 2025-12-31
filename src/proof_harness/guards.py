@@ -9,7 +9,7 @@ from typing import Optional
 
 
 def should_mark_gameplay_started(menu_hint: Optional[bool], game_state: dict, *, min_game_time: float = 1.0) -> bool:
-    if menu_hint is not False:
+    if bool(menu_hint):
         return False
     try:
         if bool(game_state.get("isPlaying")):

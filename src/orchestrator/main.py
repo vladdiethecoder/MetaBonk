@@ -3071,7 +3071,8 @@ if app:
     @app.get("/workers")
     def list_workers():
         _prune_stale_workers()
-        out = {}
+        out_by_id: dict[str, dict] = {}
+        out_list: list[dict] = []
         for wid, hb in workers.items():
             # Backfill a characterful name even for long-running workers that
             # were created before the naming logic existed.
@@ -3079,8 +3080,14 @@ if app:
                 _ensure_auto_agent_name(hb.instance_id, hb.policy_name)
             except Exception:
                 pass
-            out[wid] = _with_sponsor_fields(hb).model_dump()
-        return out
+            d = _with_sponsor_fields(hb).model_dump()
+            out_by_id[str(wid)] = d
+            out_list.append(d)
+        try:
+            out_list.sort(key=lambda x: str(x.get("instance_id") or ""))
+        except Exception:
+            pass
+        return {"workers": out_list, "workers_by_id": out_by_id, "count": int(len(out_list))}
 
     @app.get("/api/diagnostics/stream-quality")
     def stream_quality_diagnostics():
@@ -4212,6 +4219,42 @@ if app:
     def get_config(instance_id: str):
         if instance_id in configs:
             return configs[instance_id]
+        # If the stack is launched with an explicit policy name, honor it for initial
+        # instance assignment instead of hashing into the PBT population.
+        #
+        # `scripts/start_omega.py` sets METABONK_DEFAULT_POLICY_NAME when `--policy-name`
+        # is a concrete policy (e.g. "Greed"). The special value "SinZero" means "assign
+        # from the population".
+        try:
+            default_name = str(os.environ.get("METABONK_DEFAULT_POLICY_NAME") or "").strip()
+        except Exception:
+            default_name = ""
+        if default_name and default_name.lower() != "sinzero":
+            chosen = None
+            try:
+                chosen = pbt.population.get(default_name)
+                if chosen is None:
+                    for name, st in pbt.population.items():
+                        if str(name).strip().lower() == default_name.lower():
+                            chosen = st
+                            break
+            except Exception:
+                chosen = None
+            if chosen is None:
+                try:
+                    pbt.register_policy(default_name)
+                    chosen = pbt.population.get(default_name)
+                except Exception:
+                    chosen = None
+            if chosen is not None:
+                cfg = InstanceConfig(
+                    instance_id=instance_id,
+                    display=None,
+                    policy_name=str(getattr(chosen, "policy_name", default_name) or default_name),
+                    hparams=dict(getattr(chosen, "hparams", None) or {}),
+                )
+                configs[instance_id] = cfg
+                return cfg
         # If worker asks for config and we don't have one, assign a policy.
         policy = pbt.assign_policy(instance_id)
         cfg = InstanceConfig(
@@ -4544,7 +4587,7 @@ if app:
         prompt = (
             "Create a short, human-friendly name for this learned skill token.\n"
             "Rules:\n"
-            "- Do NOT mention specific keybinds (WASD, mouse, etc.) or assume action semantics.\n"
+            "- Do NOT mention specific keybinds or assume action semantics.\n"
             "- Do NOT mention specific game entities (enemy types, items) unless explicitly present in context.\n"
             "- Use generic movement/control terms only (e.g., Drift, Micro-Adjust, Burst, Pause, Sweep).\n"
             "- Name must be 2–5 words, Title Case, no punctuation.\n"

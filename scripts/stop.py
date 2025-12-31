@@ -304,7 +304,15 @@ def main() -> int:
         cmd = [compose]
         if compose == "docker":
             cmd += ["compose"]
-        cmd += ["-f", str(repo_root / "docker" / "docker-compose.go2rtc.yml"), "down", "--remove-orphans"]
+        project = os.environ.get("METABONK_GO2RTC_COMPOSE_PROJECT") or "metabonk-go2rtc"
+        cmd += [
+            "-p",
+            project,
+            "-f",
+            str(repo_root / "docker" / "docker-compose.go2rtc.yml"),
+            "down",
+            "--remove-orphans",
+        ]
         env0 = dict(os.environ)
         try:
             subprocess.call(cmd, cwd=str(repo_root), env=env0)

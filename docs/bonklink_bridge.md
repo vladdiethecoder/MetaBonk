@@ -14,7 +14,7 @@ Install:
 - Run the game
 
 Config (`BepInEx/config/com.metabonk.bonklink.cfg`):
-- `Network.Port` (default `5555`)
+- `Network.Port` (recommend `5560`; avoid `5555` which is used by the cognitive server ZMQ by default)
 - `Network.UseNamedPipe` (default `false`)
 - `Network.PipeName` (default `BonkLink`)
 - `Performance.UpdateHz` (default `60`)
@@ -27,7 +27,7 @@ Worker flags:
 - `METABONK_USE_BONKLINK=1`
 - Optional:
   - `METABONK_BONKLINK_HOST=127.0.0.1`
-  - `METABONK_BONKLINK_PORT=5555`
+  - `METABONK_BONKLINK_PORT=5560`
   - `METABONK_BONKLINK_USE_PIPE=1` (Windows only, requires `pywin32`)
   - `METABONK_BONKLINK_PIPE_NAME=BonkLink`
 
@@ -98,4 +98,3 @@ bool   uiClick
   For full semantic grounding, use the richer VLM element‑detection path.
 - If both BonkLink and UnityBridge are enabled, BonkLink takes priority and
   UnityBridge action injection is suppressed.
-

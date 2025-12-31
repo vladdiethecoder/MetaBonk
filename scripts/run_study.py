@@ -51,6 +51,23 @@ def _http_json(url: str, timeout_s: float = 2.0) -> Any:
     return json.loads(raw)
 
 
+def _normalize_workers_payload(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    if isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if isinstance(payload.get("workers"), list):
+        out: dict[str, Any] = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
+
 def _wait_orchestrator_ready(orch_url: str, timeout_s: float) -> None:
     deadline = time.time() + max(1.0, float(timeout_s))
     last_err: Optional[Exception] = None
@@ -70,10 +87,11 @@ def _wait_workers(orch_url: str, expected: int, timeout_s: float) -> dict:
     while time.time() < deadline:
         try:
             data = _http_json(f"{orch_url.rstrip('/')}/workers", timeout_s=2.0)
-            if isinstance(data, dict):
-                last = data
-                if len(data) >= int(expected):
-                    return data
+            workers = _normalize_workers_payload(data)
+            if isinstance(workers, dict):
+                last = workers
+                if len(workers) >= int(expected):
+                    return workers
         except Exception:
             pass
         time.sleep(1.0)

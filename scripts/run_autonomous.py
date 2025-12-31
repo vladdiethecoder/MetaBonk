@@ -96,7 +96,7 @@ def _apply_key_scope(
                 seeds = []
         else:
             # If Phase 0 wasn't run, we can still derive a best-effort seed set.
-            seeds = select_seed_buttons(input_space, max_buttons=16)
+            seeds = select_seed_buttons(input_space, max_buttons=64)
             _write_json(seed_path, seeds)
         seed_keys = [s for s in seeds if isinstance(s, str) and s in keys]
         seed_btns = [s for s in seeds if isinstance(s, str) and s in buttons]
@@ -183,7 +183,7 @@ def run_phase_0(cache_dir: Path) -> Dict[str, Any]:
     input_space = InputEnumerator().get_input_space_spec()
     _write_json(input_space_path, input_space)
 
-    seed_buttons = select_seed_buttons(input_space, max_buttons=16)
+    seed_buttons = select_seed_buttons(input_space, max_buttons=64)
     _write_json(cache_dir / "seed_buttons.json", seed_buttons)
 
     suggested_env = {"METABONK_INPUT_BUTTONS": ",".join(seed_buttons)}

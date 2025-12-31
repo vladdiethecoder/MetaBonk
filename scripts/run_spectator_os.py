@@ -35,6 +35,23 @@ def _score(hb: dict) -> float:
         return 0.0
 
 
+def _normalize_workers_payload(payload: object) -> Dict[str, dict]:
+    if not isinstance(payload, dict):
+        return {}
+    if "workers_by_id" in payload and isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if "workers" in payload and isinstance(payload.get("workers"), list):
+        out: Dict[str, dict] = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="MetaBonk Spectator OS (live, no mock data)")
     parser.add_argument("--orch-url", default="http://127.0.0.1:8040")
@@ -58,7 +75,7 @@ def main() -> int:
         try:
             r = requests.get(f"{orch}/workers", timeout=2.0)
             r.raise_for_status()
-            workers: Dict[str, dict] = r.json() or {}
+            workers = _normalize_workers_payload(r.json() or {})
         except Exception as e:
             print(f"[spectator_os] poll error: {type(e).__name__}: {e}")
             time.sleep(float(args.interval_s))
@@ -119,4 +136,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

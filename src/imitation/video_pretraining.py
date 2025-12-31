@@ -2032,8 +2032,8 @@ def inspect_labels(cfg: InspectLabelsConfig) -> Dict[str, Any]:
         if "actions" in file_rep:
             a = file_rep["actions"]
             parts.append(
-                f"actions(D={int(a.get('D', 0))} move_mag_mean={a.get('move_mag_mean', 0.0):.3g} "
-                f"btn_on@0.5={a.get('btn_on_frac_0.5', 0.0):.3g})"
+                f'actions(D={int(a.get("D", 0))} move_mag_mean={a.get("move_mag_mean", 0.0):.3g} '
+                f'btn_on@0.5={a.get("btn_on_frac_0.5", 0.0):.3g})'
             )
         if "rewards" in file_rep:
             r = file_rep["rewards"]

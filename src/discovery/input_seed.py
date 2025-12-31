@@ -16,43 +16,37 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence
 
 
-_DEFAULT_KEY_PRIORITY: Sequence[str] = (
-    # Primary locomotion / navigation
-    "KEY_W",
-    "KEY_A",
-    "KEY_S",
-    "KEY_D",
-    "KEY_UP",
-    "KEY_DOWN",
-    "KEY_LEFT",
-    "KEY_RIGHT",
-    # Confirm / cancel / interact
-    "KEY_SPACE",
-    "KEY_ENTER",
-    "KEY_ESC",
-    "KEY_TAB",
-    # Common interaction keys (kept after the basics)
-    "KEY_E",
-    "KEY_Q",
-    "KEY_R",
-    "KEY_F",
-    "KEY_C",
-    "KEY_V",
-    "KEY_Z",
-    "KEY_X",
-)
+def _evdev_code(name: str) -> int | None:
+    """Return evdev numeric code for KEY_*/BTN_* names (best-effort)."""
+    try:
+        import evdev.ecodes as e  # type: ignore
 
-_DEFAULT_MOUSE_BUTTONS: Sequence[str] = (
-    "BTN_LEFT",
-    "BTN_RIGHT",
-    "BTN_MIDDLE",
-)
+        return int(getattr(e, name))
+    except Exception:
+        return None
+
+
+def _sort_inputs(names: Sequence[str]) -> list[str]:
+    """Sort by evdev code when possible, then lexicographically as fallback."""
+    with_code: list[tuple[int, str]] = []
+    without_code: list[str] = []
+    for name in names:
+        code = _evdev_code(str(name))
+        if code is None:
+            without_code.append(str(name))
+        else:
+            with_code.append((int(code), str(name)))
+
+    with_code.sort(key=lambda item: (item[0], item[1]))
+    without_code.sort()
+    return [name for _code, name in with_code] + without_code
 
 
 def select_seed_buttons(
     input_space_spec: Dict[str, Any],
     *,
-    max_buttons: int = 16,
+    max_buttons: int = 64,
+    mouse_quota: int = 3,
 ) -> List[str]:
     """Select a compact, safe-ish set of keyboard/mouse buttons.
 
@@ -60,43 +54,38 @@ def select_seed_buttons(
     `METABONK_INPUT_BUTTONS="...,..."`
     """
     max_buttons = max(1, int(max_buttons))
+    mouse_quota = max(0, int(mouse_quota))
 
     kb = dict((input_space_spec or {}).get("keyboard") or {})
     mouse = dict((input_space_spec or {}).get("mouse") or {})
-    avail_keys = {str(k) for k in (kb.get("available_keys") or []) if str(k)}
-    avail_mouse = {str(b) for b in (mouse.get("buttons") or []) if str(b)}
+    avail_keys = [str(k) for k in (kb.get("available_keys") or []) if str(k)]
+    avail_mouse = [str(b) for b in (mouse.get("buttons") or []) if str(b)]
+
+    keys_sorted = _sort_inputs(list(dict.fromkeys(avail_keys)))
+    mouse_sorted = _sort_inputs(list(dict.fromkeys(avail_mouse)))
 
     selected: List[str] = []
 
-    # Priority keys first.
-    for k in _DEFAULT_KEY_PRIORITY:
-        if k in avail_keys and k not in selected:
-            selected.append(k)
-            if len(selected) >= max_buttons:
-                return selected
-
-    # Add common mouse buttons (if available).
-    for b in _DEFAULT_MOUSE_BUTTONS:
-        if b in avail_mouse and b not in selected:
+    # Reserve a small number of slots for mouse buttons so UI navigation remains possible.
+    mouse_take = min(int(mouse_quota), len(mouse_sorted), max_buttons)
+    for b in mouse_sorted[:mouse_take]:
+        if b not in selected:
             selected.append(b)
-            if len(selected) >= max_buttons:
-                return selected
 
-    # Fill remaining slots with alphanumerics (stable ordering).
-    def _alpha_rank(name: str) -> tuple[int, str]:
-        # Prefer single-letter keys then numbers.
-        if name.startswith("KEY_") and len(name) == 5 and name[-1].isalpha():
-            return (0, name)
-        if name.startswith("KEY_") and len(name) == 6 and name[-1].isdigit():
-            return (1, name)
-        return (2, name)
-
-    for k in sorted((k for k in avail_keys if k.startswith("KEY_")), key=_alpha_rank):
+    # Fill remaining slots with keyboard keys ordered by code when possible.
+    for k in keys_sorted:
+        if len(selected) >= max_buttons:
+            break
         if k in selected:
             continue
         selected.append(k)
+
+    # If we still have space, append the remaining mouse buttons.
+    for b in mouse_sorted[mouse_take:]:
         if len(selected) >= max_buttons:
             break
+        if b in selected:
+            continue
+        selected.append(b)
 
     return selected
-

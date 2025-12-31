@@ -269,11 +269,8 @@ Please improve upon the previous attempt based on this feedback.
             # Return default reward if no client
             return """
 def reward_fn(obs, action, next_obs, info):
-    # Default reward: survival bonus + velocity
-    reward = 0.01  # Survival
-    if 'velocity' in info:
-        reward += info['velocity'] * 0.001
-    return reward
+    # Default reward: no shaped/extrinsic reward (pure-vision safe fallback).
+    return 0.0
 """
         
         try:
@@ -292,7 +289,8 @@ def reward_fn(obs, action, next_obs, info):
         except Exception:
             return """
 def reward_fn(obs, action, next_obs, info):
-    return 0.01  # Fallback
+    # Fallback: no shaped/extrinsic reward.
+    return 0.0
 """
     
     def _extract_code(self, response: str) -> str:

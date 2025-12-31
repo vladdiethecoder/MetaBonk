@@ -115,12 +115,15 @@ export default function CctvMonitor({ agent, label, isHero, effect }: MonitorPro
 
   const streamUrl = String(agent?.stream_url ?? "");
   const controlUrl = String((agent as any)?.control_url ?? "");
-  const fallbackUrl = controlUrl ? `${controlUrl.replace(/\\/+$/, "")}/frame.jpg` : undefined;
-  const metaUrl = controlUrl ? `${controlUrl.replace(/\\/+$/, "")}/stream_meta.json` : undefined;
+  const fallbackUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/frame.jpg` : undefined;
+  const metaUrl = controlUrl ? `${controlUrl.replace(/\/+$/, "")}/stream_meta.json` : undefined;
   const instanceId = String((agent as any)?.instance_id ?? "");
   const go2rtcBase = String((agent as any)?.go2rtc_base_url ?? "").trim();
   const go2rtcName = String((agent as any)?.go2rtc_stream_name ?? "").trim();
   const useGo2rtc = Boolean(go2rtcBase && go2rtcName);
+  const go2rtcEmbedUrl = useGo2rtc
+    ? `${go2rtcBase.replace(/\/+$/, "")}/stream.html?src=${encodeURIComponent(go2rtcName)}`
+    : "";
   const strictStreaming =
     Boolean((agent as any)?.stream_require_zero_copy) || String((import.meta as any)?.env?.VITE_STRICT_STREAMING ?? "") === "1";
 
@@ -128,7 +131,14 @@ export default function CctvMonitor({ agent, label, isHero, effect }: MonitorPro
     <div className={`cctv-monitor ${isHero ? "hero" : ""}`}>
       <div className="cctv-screen">
         {useGo2rtc && !effect ? (
-          <Go2rtcWebRTC baseUrl={go2rtcBase} streamName={go2rtcName} className="cctv-video" />
+          <Go2rtcWebRTC
+            baseUrl={go2rtcBase}
+            streamName={go2rtcName}
+            className="cctv-video"
+            embedUrl={go2rtcEmbedUrl || undefined}
+            embedOnError={false}
+            fallbackJpegUrl={!strictStreaming ? fallbackUrl : undefined}
+          />
         ) : !strictStreaming && streamUrl && !effect ? (
           <MseMp4Video
             url={streamUrl}

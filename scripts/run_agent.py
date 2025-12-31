@@ -260,7 +260,7 @@ class ApexAgent:
             keys = action.get("keys") or {}
             for k, v in keys.items():
                 try:
-                    await self._bridge.send_key(str(k), bool(v))
+                    await self._bridge.send_button(str(k), bool(v))
                 except Exception:
                     pass
             click = action.get("click")

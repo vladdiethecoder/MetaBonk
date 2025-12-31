@@ -84,3 +84,13 @@ class FifoH264Publisher:
         if self._writer is None:
             return None
         return self._writer.last_error
+
+    def has_reader(self) -> bool:
+        """Return True when a FIFO reader is currently attached (best-effort)."""
+        w = self._writer
+        if w is None:
+            return False
+        try:
+            return bool(getattr(w, "reader_connected"))
+        except Exception:
+            return False

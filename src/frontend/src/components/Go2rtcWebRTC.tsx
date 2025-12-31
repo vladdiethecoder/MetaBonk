@@ -95,7 +95,10 @@ export default function Go2rtcWebRTC({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const retryRef = useRef<number | null>(null);
+  const firstFrameTimerRef = useRef<number | null>(null);
+  const removeVideoListenersRef = useRef<(() => void) | null>(null);
   const stoppedRef = useRef(false);
+  const gotFirstFrameRef = useRef(false);
   const gapRef = useRef<number[]>([]);
   const lastFrameTsRef = useRef<number | null>(null);
   const hudTimerRef = useRef<number | null>(null);
@@ -154,6 +157,16 @@ export default function Go2rtcWebRTC({
     stoppedRef.current = false;
 
     const cleanupPc = () => {
+      if (removeVideoListenersRef.current) {
+        try {
+          removeVideoListenersRef.current();
+        } catch {}
+        removeVideoListenersRef.current = null;
+      }
+      if (firstFrameTimerRef.current != null) {
+        window.clearTimeout(firstFrameTimerRef.current);
+        firstFrameTimerRef.current = null;
+      }
       const pc = pcRef.current;
       pcRef.current = null;
       if (pc) {
@@ -186,9 +199,36 @@ export default function Go2rtcWebRTC({
     const connect = async () => {
       cleanupPc();
       setStatus("loading");
+      gotFirstFrameRef.current = false;
       const pc = new RTCPeerConnection();
       pcRef.current = pc;
       pc.addTransceiver("video", { direction: "recvonly" });
+
+      const markPlaying = () => {
+        if (stoppedRef.current) return;
+        if (pcRef.current !== pc) return;
+        if (gotFirstFrameRef.current) return;
+        gotFirstFrameRef.current = true;
+        if (firstFrameTimerRef.current != null) {
+          window.clearTimeout(firstFrameTimerRef.current);
+          firstFrameTimerRef.current = null;
+        }
+        setStatus("playing");
+      };
+
+      const onLoadedData = () => markPlaying();
+      const onPlaying = () => markPlaying();
+      try {
+        el.addEventListener("loadeddata", onLoadedData);
+        el.addEventListener("playing", onPlaying);
+        removeVideoListenersRef.current = () => {
+          try {
+            el.removeEventListener("loadeddata", onLoadedData);
+            el.removeEventListener("playing", onPlaying);
+          } catch {}
+        };
+      } catch {}
+
       pc.ontrack = (ev) => {
         if (ev.streams && ev.streams[0]) {
           if (el.srcObject !== ev.streams[0]) {
@@ -199,7 +239,6 @@ export default function Go2rtcWebRTC({
       };
       pc.onconnectionstatechange = () => {
         const st = pc.connectionState;
-        if (st === "connected") setStatus("playing");
         if (st === "failed" || st === "disconnected") {
           setStatus("error");
           scheduleRetry();
@@ -220,14 +259,28 @@ export default function Go2rtcWebRTC({
         const localSdp = pc.localDescription?.sdp || offer.sdp || "";
         const apiBase = normalizeGo2rtcBaseUrl(baseUrl);
         const url = `${apiBase}/api/webrtc?src=${encodeURIComponent(streamName)}`;
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/sdp",
-            Accept: "application/sdp, application/json",
-          },
-          body: localSdp,
-        });
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const fetchTimeout = controller
+          ? window.setTimeout(() => {
+              try {
+                controller.abort();
+              } catch {}
+            }, 3500)
+          : null;
+        let resp: Response;
+        try {
+          resp = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/sdp",
+              Accept: "application/sdp, application/json",
+            },
+            body: localSdp,
+            signal: controller?.signal,
+          });
+        } finally {
+          if (fetchTimeout != null) window.clearTimeout(fetchTimeout);
+        }
         if (!resp.ok) throw new Error(`webrtc offer failed (${resp.status})`);
         const ct = resp.headers.get("content-type") || "";
         let answerSdp = "";
@@ -239,7 +292,18 @@ export default function Go2rtcWebRTC({
         }
         if (!answerSdp) throw new Error("empty webrtc answer");
         await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-        setStatus("playing");
+
+        // Wait for an actual decoded frame before calling this "playing"; otherwise we can
+        // end up with a connected-but-black tile (e.g. codec mismatch or no keyframes yet).
+        if (firstFrameTimerRef.current != null) window.clearTimeout(firstFrameTimerRef.current);
+        firstFrameTimerRef.current = window.setTimeout(() => {
+          if (stoppedRef.current) return;
+          if (pcRef.current !== pc) return;
+          if (!gotFirstFrameRef.current) {
+            setStatus("error");
+            scheduleRetry();
+          }
+        }, 3500);
       } catch (e) {
         setStatus("error");
         scheduleRetry();

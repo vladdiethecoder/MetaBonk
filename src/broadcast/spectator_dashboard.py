@@ -263,7 +263,19 @@ class SpectatorDashboard:
             r = requests.get(f"{self.orch_url}/workers", timeout=1.0)
             if not r.ok:
                 return {}
-            data = r.json() or {}
+            payload = r.json() or {}
+            data = payload
+            if isinstance(payload, dict) and isinstance(payload.get("workers_by_id"), dict):
+                data = payload.get("workers_by_id") or {}
+            elif isinstance(payload, dict) and isinstance(payload.get("workers"), list):
+                mapped: dict[str, dict] = {}
+                for row in payload.get("workers") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    iid = str(row.get("instance_id") or "")
+                    if iid:
+                        mapped[iid] = row
+                data = mapped
             out: Dict[str, Heartbeat] = {}
             for wid, hb_raw in data.items():
                 try:

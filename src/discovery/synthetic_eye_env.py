@@ -157,13 +157,13 @@ class SyntheticEyeInteractionEnv:
         assert self._latest is not None
         return self._latest.to_dict()
 
-    def press_key(self, key: Union[int, str]) -> None:
+    def key_down(self, key: Union[int, str]) -> None:
         key_name = self._normalize_key(key)
         if not key_name:
             return
         self._uinput.key_down(key_name)
 
-    def release_key(self, key: Union[int, str]) -> None:
+    def key_up(self, key: Union[int, str]) -> None:
         key_name = self._normalize_key(key)
         if not key_name:
             return
@@ -312,4 +312,3 @@ class SyntheticEyeInteractionEnv:
 
 
 __all__ = ["SyntheticEyeInteractionEnv"]
-

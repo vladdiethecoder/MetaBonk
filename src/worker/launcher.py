@@ -882,27 +882,127 @@ class GameLauncher:
         if not proc:
             return
         try:
+            import psutil  # type: ignore
+        except Exception:
+            psutil = None
+
+        instance_id = str(getattr(self, "instance_id", "") or "").strip()
+        markers: list[str] = []
+        if instance_id:
+            markers = [
+                f"temp/megabonk_instances/{instance_id}".lower(),
+                f"temp\\megabonk_instances\\{instance_id}".lower(),
+                f"temp/compatdata/{instance_id}".lower(),
+                f"temp\\compatdata\\{instance_id}".lower(),
+            ]
+
+        def _kill_stragglers() -> None:
+            if psutil is None or not markers:
+                return
+            targets: list["psutil.Process"] = []
+            try:
+                for p in psutil.process_iter(["pid", "cmdline", "name", "exe"]):
+                    try:
+                        pid = int(p.info.get("pid") or 0)
+                        if pid <= 0 or pid == os.getpid():
+                            continue
+                        cmd = " ".join(p.info.get("cmdline") or [])
+                        exe = str(p.info.get("exe") or "")
+                        hay = f"{cmd} {exe}".lower()
+                        if any(m in hay for m in markers):
+                            targets.append(p)
+                            continue
+                        if "megabonk" not in hay and "proton" not in hay and "wine" not in hay:
+                            continue
+                        try:
+                            env = p.environ()
+                        except Exception:
+                            env = None
+                        if not env:
+                            continue
+                        for k in ("STEAM_COMPAT_DATA_PATH", "WINEPREFIX", "PROTON_LOG_DIR"):
+                            v = str(env.get(k) or "").lower()
+                            if v and any(m in v for m in markers):
+                                targets.append(p)
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                return
+
+            if not targets:
+                return
+            for t in targets:
+                try:
+                    t.terminate()
+                except Exception:
+                    pass
+            try:
+                _gone, alive = psutil.wait_procs(targets, timeout=5.0)
+            except Exception:
+                alive = []
+            for t in alive or []:
+                try:
+                    t.kill()
+                except Exception:
+                    pass
+            try:
+                if alive:
+                    psutil.wait_procs(alive, timeout=2.0)
+            except Exception:
+                pass
+
+        try:
             if getattr(proc, "poll", lambda: 0)() is None:
                 if os.name == "posix":
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except Exception:
-                        proc.terminate()
+                    # When MetaBonk runs under a shared job PGID (METABONK_JOB_PGID), the game's
+                    # process group may not match `proc.pid`, so killpg(proc.pid) can miss Proton/Wine
+                    # helpers and leak GPU memory across worker restarts. Prefer a conservative
+                    # process-tree kill rooted at the launcher PID.
+                    if psutil is not None:
+                        try:
+                            root = psutil.Process(int(proc.pid))
+                        except Exception:
+                            root = None
+                        if root is not None:
+                            targets = [root]
+                            try:
+                                targets.extend(root.children(recursive=True))
+                            except Exception:
+                                pass
+                            for t in targets:
+                                try:
+                                    t.terminate()
+                                except Exception:
+                                    pass
+                            try:
+                                _gone, alive = psutil.wait_procs(targets, timeout=5.0)
+                            except Exception:
+                                alive = []
+                            for t in alive or []:
+                                try:
+                                    t.kill()
+                                except Exception:
+                                    pass
+                            try:
+                                if alive:
+                                    psutil.wait_procs(alive, timeout=2.0)
+                            except Exception:
+                                pass
+
+                    # Fallback: terminate the main process. This may still leave helpers around,
+                    # but avoids accidentally killing the entire job process group.
+                    proc.terminate()
                 else:
                     proc.terminate()
                 try:
                     proc.wait(timeout=5.0)
                 except Exception:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except Exception:
-                            proc.kill()
-                    else:
-                        proc.kill()
+                    proc.kill()
                     try:
                         proc.wait(timeout=2.0)
                     except Exception:
                         pass
         except Exception:
-            return
+            pass
+        _kill_stragglers()

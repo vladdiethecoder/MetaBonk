@@ -132,21 +132,73 @@ class SkillLibrary:
         lname = str(name or "").strip().lower()
         if lname in ("noop", "idle", "wait"):
             return Action.noop()
-        if lname in ("click", "attack"):
-            btn = str(params.get("button") or "LEFT").strip().upper()
-            return Action(mouse_buttons_down=frozenset({btn}))
-        if lname in ("move_left", "strafe_left"):
-            return Action(keys_down=frozenset({"A"}))
-        if lname in ("move_right", "strafe_right"):
-            return Action(keys_down=frozenset({"D"}))
-        if lname in ("move_up", "move_forward", "forward"):
-            return Action(keys_down=frozenset({"W"}))
-        if lname in ("move_down", "backward"):
-            return Action(keys_down=frozenset({"S"}))
-        if lname in ("explore", "explore_area", "move_random"):
-            # Deterministic placeholder. Higher layers can randomize.
-            return Action(keys_down=frozenset({"W"}))
-        return Action.noop()
+
+        # No hardcoded control mappings: require explicit primitive action parameters.
+        #
+        # Accepted parameter forms (best-effort, optional):
+        #   - keys_down: str | list[str]
+        #   - mouse_buttons_down: str | list[str]
+        #   - mouse_move: (dx, dy)
+        #   - mouse_scroll: float
+        #   - click/attack: may specify "button" explicitly (no default)
+
+        def _as_str_set(v: Any) -> frozenset[str]:
+            if v is None:
+                return frozenset()
+            if isinstance(v, (set, frozenset, list, tuple)):
+                items: Iterable[Any] = v
+            else:
+                items = [v]
+            out: List[str] = []
+            for item in items:
+                s = str(item).strip().upper()
+                if s:
+                    out.append(s)
+            return frozenset(out)
+
+        keys = params.get("keys_down") if "keys_down" in params else params.get("keys")
+        if keys is None:
+            keys = params.get("key")
+
+        mouse_buttons = params.get("mouse_buttons_down") if "mouse_buttons_down" in params else params.get("mouse_buttons")
+        if mouse_buttons is None:
+            mouse_buttons = params.get("mouse_button")
+
+        if lname in ("click", "attack") and not mouse_buttons:
+            # Require explicit button selection; do not assume LEFT.
+            mouse_buttons = params.get("button")
+
+        mouse_move = params.get("mouse_move")
+        dx = dy = 0.0
+        if isinstance(mouse_move, (list, tuple)) and len(mouse_move) >= 2:
+            try:
+                dx = float(mouse_move[0])
+                dy = float(mouse_move[1])
+            except Exception:
+                dx = dy = 0.0
+
+        mouse_scroll = 0.0
+        if "mouse_scroll" in params and params.get("mouse_scroll") is not None:
+            try:
+                mouse_scroll = float(params.get("mouse_scroll"))
+            except Exception:
+                mouse_scroll = 0.0
+
+        action = Action(
+            keys_down=_as_str_set(keys),
+            mouse_buttons_down=_as_str_set(mouse_buttons),
+            mouse_move=(dx, dy),
+            mouse_scroll=float(mouse_scroll),
+        )
+
+        if (
+            not action.keys_down
+            and not action.mouse_buttons_down
+            and action.mouse_move == (0.0, 0.0)
+            and float(action.mouse_scroll) == 0.0
+        ):
+            return Action.noop()
+        return action
 
 
 __all__ = [
@@ -154,4 +206,3 @@ __all__ = [
     "SkillLibrary",
     "SkillStats",
 ]
-

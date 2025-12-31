@@ -256,20 +256,31 @@ class MetaBonk2Controller:
         if name in ("noop", "idle"):
             return Action.noop()
         if name in ("attack", "combat_combo"):
-            # Prefer a mouse-left style button if configured, else SPACE.
-            for btn in ("LEFT", "MOUSE_LEFT", "BTN_LEFT"):
-                if btn in self._key_to_idx:
-                    return Action(mouse_buttons_down=frozenset({btn}))
-            if "SPACE" in self._key_to_idx:
-                return Action(keys_down=frozenset({"SPACE"}))
-            return Action.noop()
+            # Prefer a mouse button if one is available (no hardcoded button names).
+            mouse_specs = [
+                spec
+                for spec in self.button_specs
+                if str(spec.get("kind", "") or "").strip().lower() == "mouse"
+                and str(spec.get("button", "") or "").strip()
+            ]
+            if not mouse_specs:
+                return Action.noop()
+            idx = int(self._rng.integers(0, len(mouse_specs)))
+            btn = str(mouse_specs[idx].get("button", "") or "").strip().upper()
+            return Action(mouse_buttons_down=frozenset({btn})) if btn else Action.noop()
         if name in ("move_random", "explore_area", "navigate_to", "collect_resource", "defeat_enemy"):
-            # Choose a direction key if available.
-            candidates = [k for k in ("W", "A", "S", "D", "UP", "LEFT", "DOWN", "RIGHT") if k in self._key_to_idx]
-            if candidates:
-                k = str(self._rng.choice(candidates))
-                return Action(keys_down=frozenset({k}))
-            return Action.noop()
+            # Choose any available keyboard key (no hardcoded mappings).
+            key_specs = [
+                spec
+                for spec in self.button_specs
+                if str(spec.get("kind", "") or "").strip().lower() != "mouse"
+                and str(spec.get("name", "") or "").strip()
+            ]
+            if not key_specs:
+                return Action.noop()
+            idx = int(self._rng.integers(0, len(key_specs)))
+            key = str(key_specs[idx].get("name", "") or "").strip().upper()
+            return Action(keys_down=frozenset({key})) if key else Action.noop()
         return Action.noop()
 
 

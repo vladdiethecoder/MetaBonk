@@ -660,7 +660,19 @@ export async function muteIssue(id: string, muted = true, ttl_s?: number): Promi
 }
 
 export async function fetchWorkers(): Promise<Record<string, Heartbeat>> {
-  return fetchJson(`${ORCH}/workers`);
+  const data: any = await fetchJson(`${ORCH}/workers`);
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    if (
+      "workers_by_id" in data &&
+      (data as any).workers_by_id &&
+      typeof (data as any).workers_by_id === "object" &&
+      !Array.isArray((data as any).workers_by_id)
+    ) {
+      return (data as any).workers_by_id as Record<string, Heartbeat>;
+    }
+    return data as Record<string, Heartbeat>;
+  }
+  return {};
 }
 
 export async function fetchPolicies(): Promise<PoliciesResponse> {

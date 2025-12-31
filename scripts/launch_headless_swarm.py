@@ -75,7 +75,7 @@ def main() -> int:
     parser.add_argument("--worker-base-port", type=int, default=5000)
     parser.add_argument("--sidecar-base-port", type=int, default=9000)
     parser.add_argument("--bonklink-host", default=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"))
-    parser.add_argument("--bonklink-base-port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")))
+    parser.add_argument("--bonklink-base-port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")))
     parser.add_argument("--instance-prefix", default="swarm")
     parser.add_argument("--policy-name", default=os.environ.get("POLICY_NAME", "Greed"))
     parser.add_argument("--no-vision", action="store_true")

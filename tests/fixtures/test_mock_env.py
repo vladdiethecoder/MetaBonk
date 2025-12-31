@@ -12,9 +12,9 @@ def test_mock_env_schema_and_step_changes_pixels() -> None:
     assert obs0["pixels"].dtype == np.uint8
 
     # Movement should change pixels.
-    env.press_key("MOVE_RIGHT")
+    env.key_down("MOVE_RIGHT")
     env.step(5)
-    env.release_key("MOVE_RIGHT")
+    env.key_up("MOVE_RIGHT")
     obs1 = env.get_obs()
     diff = np.abs(obs1["pixels"].astype(np.float32) - obs0["pixels"].astype(np.float32)).mean()
     assert diff > 0.0
@@ -23,9 +23,9 @@ def test_mock_env_schema_and_step_changes_pixels() -> None:
 def test_mock_env_interact_increases_reward() -> None:
     env = MockGameEnv(seed=0)
     r0 = float(env.get_obs()["reward"])
-    env.press_key("INTERACT")
+    env.key_down("INTERACT")
     env.step(1)
-    env.release_key("INTERACT")
+    env.key_up("INTERACT")
     r1 = float(env.get_obs()["reward"])
     assert r1 > r0
 
@@ -39,4 +39,3 @@ def test_mock_env_deterministic_for_seed() -> None:
         assert np.array_equal(o1, o2)
         env1.step(1)
         env2.step(1)
-

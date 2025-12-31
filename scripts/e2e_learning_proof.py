@@ -162,6 +162,23 @@ def _env_truthy(val: Optional[str]) -> bool:
     return str(val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _normalize_workers_payload(payload: object) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if "workers_by_id" in payload and isinstance(payload.get("workers_by_id"), dict):
+        return payload.get("workers_by_id") or {}
+    if "workers" in payload and isinstance(payload.get("workers"), list):
+        out: Dict[str, Any] = {}
+        for row in payload.get("workers") or []:
+            if not isinstance(row, dict):
+                continue
+            iid = str(row.get("instance_id") or "")
+            if iid:
+                out[iid] = row
+        return out
+    return payload
+
+
 def _wait_for_workers(cfg: ProofConfig, timeout_s: float = 120.0) -> Dict[str, Any]:
     deadline = time.time() + timeout_s
     url = f"{_orch_url(cfg)}/workers"
@@ -169,7 +186,7 @@ def _wait_for_workers(cfg: ProofConfig, timeout_s: float = 120.0) -> Dict[str, A
         try:
             r = requests.get(url, timeout=1.0)
             if r.ok:
-                data = r.json()
+                data = _normalize_workers_payload(r.json())
                 if isinstance(data, dict) and len(data) >= cfg.workers:
                     return data
         except Exception:
@@ -251,7 +268,7 @@ def _start_stream_recording(
         while not stop.is_set():
             try:
                 r = requests.get(f"{_orch_url(cfg)}/workers", timeout=1.0)
-                data = r.json() if r.ok else {}
+                data = _normalize_workers_payload(r.json()) if r.ok else {}
                 hb = data.get(instance_id, {}) if isinstance(data, dict) else {}
                 step = int(hb.get("step") or 0)
                 reward = hb.get("reward")

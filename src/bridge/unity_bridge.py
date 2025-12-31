@@ -257,8 +257,8 @@ class UnityBridge:
             print(f"Action send error: {e}")
             return False
     
-    async def send_key(self, key: str, pressed: bool = True) -> bool:
-        """Send keyboard input."""
+    async def send_button(self, key: str, pressed: bool = True) -> bool:
+        """Send a keyboard button state (pressed/released)."""
         return await self.send_action(GameAction(
             action_type="key",
             key=key,
@@ -565,9 +565,9 @@ class NeuralTrainingLoop:
             if isinstance(keys, dict):
                 desired = {k for k, v in keys.items() if v}
                 for k in desired - self._held_keys:
-                    await self.bridge.send_key(str(k), True)
+                    await self.bridge.send_button(str(k), True)
                 for k in self._held_keys - desired:
-                    await self.bridge.send_key(str(k), False)
+                    await self.bridge.send_button(str(k), False)
                 self._held_keys = desired
 
             look = action.get("look") or action.get("aim")

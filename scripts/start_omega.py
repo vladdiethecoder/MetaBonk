@@ -42,6 +42,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.common.gpu_contract import enforce_gpu_contract
 from src.config import apply_streaming_profile
+try:
+    from src.game.configuration import configure_all_workers  # type: ignore
+except Exception:  # pragma: no cover
+    configure_all_workers = None  # type: ignore
 
 
 @dataclass
@@ -329,6 +333,75 @@ def _wait_for_compositor_env(
     return last
 
 
+def _cleanup_stale_x11_lockfiles(*, verbose: bool = False) -> int:
+    """Remove stale X11 lock/socket files owned by the current user.
+
+    Multi-worker Smithay Eye runs spawn multiple XWayland instances. If the previous run
+    crashed or was interrupted, XWayland can leave behind `/tmp/.Xn-lock` and
+    `/tmp/.X11-unix/Xn` entries for dead PIDs. Those stale artifacts can slow down or
+    block subsequent XWayland startups (e.g. the 5th worker never becomes ready within
+    the compositor handshake timeout).
+    """
+    uid = os.getuid()
+    cleaned = 0
+    lock_glob = Path("/tmp").glob(".X*-lock")
+    sock_dir = Path("/tmp/.X11-unix")
+    for lock_path in lock_glob:
+        name = lock_path.name
+        if not name.startswith(".X") or not name.endswith("-lock"):
+            continue
+        try:
+            if lock_path.stat().st_uid != uid:
+                continue
+        except Exception:
+            continue
+        num_s = name[2:-5]  # ".X" + <n> + "-lock"
+        try:
+            num = int(num_s)
+        except Exception:
+            continue
+        if num <= 0:
+            # Do not touch the desktop Xwayland/Xorg.
+            continue
+        try:
+            pid_s = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            pid_s = ""
+        try:
+            pid = int(pid_s)
+        except Exception:
+            pid = 0
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                # Process exists; lock is active.
+                continue
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+            except Exception:
+                pass
+        # Stale: remove lock and corresponding socket if owned by us.
+        try:
+            lock_path.unlink()
+            cleaned += 1
+            if verbose:
+                print(f"[start_omega] cleaned stale X11 lock {lock_path}", flush=True)
+        except Exception:
+            pass
+        sock_path = sock_dir / f"X{num}"
+        try:
+            if sock_path.exists() and sock_path.stat().st_uid == uid:
+                sock_path.unlink()
+                cleaned += 1
+                if verbose:
+                    print(f"[start_omega] cleaned stale X11 socket {sock_path}", flush=True)
+        except Exception:
+            pass
+    return cleaned
+
+
 def _wait_for_xtest(*, display: str, timeout_s: float) -> Tuple[bool, str]:
     """Wait for the XTEST extension to be available on a given DISPLAY."""
     if shutil.which("xdpyinfo") is None:
@@ -516,10 +589,13 @@ def _supervise(
                 continue
             print(f"[start_omega] restarting {pr.name} (exit {ret}, attempt {pr.restart_count + 1})")
             try:
+                restart_env = dict(pr.env) if pr.env else None
+                if restart_env is not None and not str(pr.name or "").endswith("-eye"):
+                    restart_env = _refresh_synthetic_eye_x11_env(restart_env)
                 new_pr = _spawn(
                     pr.name,
                     list(pr.cmd or []),
-                    env=dict(pr.env) if pr.env else None,
+                    env=restart_env,
                     role=pr.role,
                     restart_count=int(pr.restart_count) + 1,
                     stdout_path=pr.stdout_path,
@@ -535,7 +611,11 @@ def _probe_gst_encoder(gst_inspect: str, enc: str) -> Optional[str]:
     if not enc:
         return "empty encoder name"
     try:
-        out = subprocess.check_output([gst_inspect, enc], stderr=subprocess.STDOUT, timeout=1.5)
+        timeout_s = float(str(os.environ.get("METABONK_GST_INSPECT_TIMEOUT_S", "6.0") or "6.0").strip())
+    except Exception:
+        timeout_s = 6.0
+    try:
+        out = subprocess.check_output([gst_inspect, enc], stderr=subprocess.STDOUT, timeout=max(0.5, timeout_s))
         txt = out.decode("utf-8", "replace").lower()
     except subprocess.CalledProcessError as e:
         txt = (e.output or b"").decode("utf-8", "replace").lower()
@@ -563,6 +643,9 @@ def _auto_nvenc_max_sessions(env: Dict[str, str]) -> Optional[int]:
         return None
     if str(env.get("METABONK_NVENC_LIMIT_AUTO", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
         return None
+    name_s = ""
+    cc_major_i: Optional[int] = None
+    cc_minor_i: Optional[int] = None
     try:
         import pynvml  # type: ignore
 
@@ -574,16 +657,92 @@ def _auto_nvenc_max_sessions(env: Dict[str, str]) -> Optional[int]:
             name_s = name.decode("utf-8", "replace")
         else:
             name_s = str(name)
+        try:
+            cc_major, cc_minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            cc_major_i = int(cc_major)
+            cc_minor_i = int(cc_minor)
+        except Exception:
+            cc_major_i = None
+            cc_minor_i = None
     except Exception:
-        return None
+        # NVML is optional; fall back to `nvidia-smi` probing below.
+        pass
+
+    # Fallback: older pynvml builds may not expose nvmlDeviceGetCudaComputeCapability.
+    if cc_major_i is None:
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=compute_cap,name",
+                    "--format=csv,noheader",
+                ],
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            line = out.decode("utf-8", "replace").strip()
+            if line:
+                parts = [p.strip() for p in line.split(",", 1)]
+                if parts:
+                    try:
+                        cc = float(parts[0])
+                        cc_major_i = int(cc)
+                        cc_minor_i = int(round((cc - float(cc_major_i)) * 10.0))
+                    except Exception:
+                        cc_major_i = None
+                        cc_minor_i = None
+                if len(parts) > 1 and not name_s:
+                    name_s = parts[1]
+        except Exception:
+            pass
     low = name_s.lower()
     # Pro/Datacenter GPUs: effectively unlimited, don't force a limit.
     if any(tok in low for tok in ("tesla", "quadro", "a100", "h100", "l40", "l4", "rtx a", "a40")):
         return 0
+    # Newer GeForce generations (e.g. RTX 5090 / CC 12.0) can sustain many concurrent NVENC streams.
+    # Avoid artificially clamping them to legacy 2-session caps.
+    if cc_major_i is not None and int(cc_major_i) >= 12:
+        return 8
     # Consumer GPUs: conservative default.
     if "geforce" in low:
         return 2
     return None
+
+
+def _refresh_synthetic_eye_x11_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Best-effort refresh DISPLAY/frame socket for Smithay Eye compositor workers.
+
+    The Smithay Eye compositor chooses an XWayland DISPLAY dynamically and writes it into
+    `compositor.env`. When a worker process is restarted by the supervisor, we must refresh
+    DISPLAY from that file; otherwise the restarted worker may target a stale X server and
+    the compositor will never see DMA-BUF surfaces (leading to repeated "no XWayland DMA-BUF"
+    failures and restart-limit exhaustion).
+    """
+    flag = _parse_env_bool(str(env.get("METABONK_SYNTHETIC_EYE_COMPOSITOR") or "").strip())
+    if flag is not True:
+        return env
+    xdg = str(env.get("XDG_RUNTIME_DIR") or "").strip()
+    if not xdg:
+        return env
+    env_path = Path(xdg) / "compositor.env"
+    try:
+        if not env_path.exists():
+            return env
+    except Exception:
+        return env
+    kv = _read_env_kv_file(env_path)
+    disp = str(kv.get("DISPLAY") or "").strip()
+    if disp:
+        env["DISPLAY"] = disp
+        env["METABONK_INPUT_DISPLAY"] = disp
+    frame_sock = str(kv.get("METABONK_FRAME_SOCK") or "").strip()
+    if frame_sock:
+        env["METABONK_FRAME_SOCK"] = frame_sock
+    # Keep forcing X11 for the game even when the compositor exposes WAYLAND_DISPLAY.
+    env.pop("WAYLAND_DISPLAY", None)
+    env.setdefault("SDL_VIDEODRIVER", "x11")
+    env.setdefault("MEGABONK_USE_GAMESCOPE", "0")
+    return env
 
 
 def _forward_meta_events_enabled(env: Dict[str, str]) -> bool:
@@ -805,8 +964,11 @@ def _cuda_preflight(
         if not err:
             return None
 
-    return "CUDA preflight: GStreamer NVENC encoder not available (gst-nvcodec missing; expected nvh264enc)."
-    return None
+    last_err = err or "unknown"
+    return (
+        "CUDA preflight: GStreamer NVENC encoder not available "
+        f"(tried {', '.join(candidates)}; last_error={last_err})."
+    )
 
 
 def main() -> int:
@@ -906,7 +1068,7 @@ def main() -> int:
     parser.add_argument("--instance-prefix", default="omega", help="Worker instance id prefix")
     parser.add_argument("--policy-name", default="SinZero", help="Policy name served by learner")
     parser.add_argument("--bonklink-host", default=os.environ.get("METABONK_BONKLINK_HOST", "127.0.0.1"))
-    parser.add_argument("--bonklink-base-port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5555")))
+    parser.add_argument("--bonklink-base-port", type=int, default=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")))
     parser.add_argument(
         "--capture-disabled",
         action=argparse.BooleanOptionalAction,
@@ -960,6 +1122,36 @@ def main() -> int:
 
     # Train/play: start services and optionally spawn workers.
     env = os.environ.copy()
+
+    # Guardrail: BonkLink defaults used to collide with the cognitive server's ZMQ port (5555),
+    # which prevents the plugin from binding and silently breaks menu interaction.
+    disable_bonklink_env = str(env.get("METABONK_DISABLE_BONKLINK", "0") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not disable_bonklink_env and int(getattr(args, "workers", 0) or 0) > 0:
+        cognitive_port: Optional[int] = None
+        raw_url = str(env.get("METABONK_COGNITIVE_SERVER_URL") or "").strip()
+        if raw_url.startswith("tcp://") and ":" in raw_url:
+            try:
+                cognitive_port = int(raw_url.rsplit(":", 1)[-1])
+            except Exception:
+                cognitive_port = None
+        if cognitive_port is None:
+            try:
+                cognitive_port = int(str(env.get("METABONK_COGNITIVE_ZMQ_PORT", "5555") or "5555").strip())
+            except Exception:
+                cognitive_port = 5555
+        bonk_start = int(getattr(args, "bonklink_base_port", 0) or 0)
+        bonk_end = bonk_start + max(0, int(getattr(args, "workers", 0) or 0) - 1)
+        if bonk_start <= cognitive_port <= bonk_end:
+            raise SystemExit(
+                "[start_omega] ERROR: BonkLink port range "
+                f"{bonk_start}-{bonk_end} overlaps cognitive server port {cognitive_port}. "
+                "Pick a different --bonklink-base-port (e.g. 5560) or change METABONK_COGNITIVE_ZMQ_PORT."
+            )
     # Avoid leaking a stale PipeWire target from the user's shell environment.
     # Gamescope recreates nodes/ports frequently; the worker will auto-discover the
     # current target unless the user explicitly pins an override.
@@ -985,36 +1177,73 @@ def main() -> int:
     env.setdefault("METABONK_USE_BONKLINK", "1")
     env.setdefault("METABONK_BONKLINK_USE_PIPE", "0")
     env.setdefault("METABONK_USE_LEARNED_REWARD", "1")
+    if str(env.get("METABONK_PURE_VISION_MODE", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        # Pure-vision validation forbids any external/shaped reward sources.
+        env["METABONK_USE_LEARNED_REWARD"] = "0"
     env.setdefault("METABONK_VIDEO_REWARD_CKPT", str(repo_root / "checkpoints" / "video_reward_model.pt"))
 
     # Input + action space defaults:
     # - ensure learner and workers agree on discrete branch sizing
     # - keep menu progression learnable (no hardcoded bootstraps by default)
     libxdo_ok = _libxdo_available()
-    env.setdefault("METABONK_INPUT_BACKEND", "libxdo" if libxdo_ok else "xdotool")
+    # Prefer in-game action injection (BonkLink/UnityBridge) over OS-level X11 injection.
+    # If a caller explicitly wants OS injection, they can set METABONK_INPUT_BACKEND=uinput|libxdo|xdotool.
+    if str(env.get("METABONK_USE_BONKLINK", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
+        env.setdefault("METABONK_INPUT_BACKEND", "libxdo" if libxdo_ok else "xdotool")
     env.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
     if not (
         env.get("METABONK_INPUT_BUTTONS")
         or env.get("METABONK_INPUT_KEYS")
         or env.get("METABONK_BUTTON_KEYS")
     ):
-        # Include a minimal mouse click so agents can learn UI interactions without scripts.
-        env["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN,MOUSE_LEFT"
-    # Encourage leaving menus without hardcoding which button to press.
-    if args.mode == "train":
-        env.setdefault("METABONK_MENU_PENALTY", "-0.001")
-        env.setdefault("METABONK_MENU_EXIT_BONUS", "0.05")
+        # Derive a game-agnostic seed vocabulary from the host's available input devices.
+        # This avoids hardcoding WASD/menu keys while still giving the agent something to explore.
+        try:
+            from src.discovery import InputEnumerator, select_seed_buttons  # type: ignore
+
+            input_space = InputEnumerator().get_input_space_spec()
+            try:
+                max_buttons = int(env.get("METABONK_AUTO_SEED_MAX_BUTTONS", "64"))
+            except Exception:
+                max_buttons = 64
+            seed = select_seed_buttons(input_space, max_buttons=max_buttons)
+        except Exception as e:
+            raise SystemExit(
+                f"[start_omega] ERROR: no input seed configured (METABONK_INPUT_BUTTONS). "
+                f"Auto-seed failed: {e}"
+            )
+        if not seed:
+            raise SystemExit(
+                "[start_omega] ERROR: no input seed configured (METABONK_INPUT_BUTTONS) "
+                "and host input enumeration returned no usable keys/buttons."
+            )
+        env["METABONK_INPUT_BUTTONS"] = ",".join(seed)
+    # Optional menu shaping is available via env vars, but we do not enable it by default.
+    # (Pure-vision runs disable menu shaping inside the worker anyway.)
 
     # Streaming profile selection:
     # - default profiles are chosen inside apply_streaming_profile (train/play -> prod)
     # - strict GPU-only runs should not silently opt into "local" fallbacks
 
     # Streaming defaults (YAML profile -> env defaults). Env vars/CLI override these.
+    stream_profile_raw = str(getattr(args, "stream_profile", "") or "").strip()
+    stream_profile_explicit = bool(stream_profile_raw)
+    pre_profile_nvenc = str(env.get("METABONK_NVENC_MAX_SESSIONS", "") or "").strip()
     try:
-        apply_streaming_profile(env, mode=str(args.mode), profile=str(getattr(args, "stream_profile", "") or "") or None)
+        apply_streaming_profile(env, mode=str(args.mode), profile=stream_profile_raw or None)
     except Exception as e:
         print(f"[start_omega] ERROR: failed to apply streaming profile: {e}", file=sys.stderr)
         return 1
+    # When running without the UI dashboard, avoid expensive upscaling in the worker's spectator
+    # normalization path by defaulting the featured spectator size to the actual game render size.
+    if not bool(getattr(args, "ui", True)):
+        try:
+            gs_w = int(getattr(args, "gamescope_width", 0) or 0)
+            gs_h = int(getattr(args, "gamescope_height", 0) or 0)
+        except Exception:
+            gs_w, gs_h = 0, 0
+        if gs_w > 0 and gs_h > 0:
+            env.setdefault("METABONK_FEATURED_SPECTATOR_SIZE", f"{gs_w}x{gs_h}")
     # Default to GPU-first streaming if PipeWire is available.
     env.setdefault("METABONK_STREAM", "1")
     env.setdefault("METABONK_STREAM_CONTAINER", "mp4")
@@ -1023,11 +1252,15 @@ def main() -> int:
     env.setdefault("METABONK_STREAM_BITRATE", "6M")
     env.setdefault("METABONK_STREAM_FPS", "60")
     env.setdefault("METABONK_STREAM_GOP", "60")
+    # If the user did not explicitly set a stream profile or NVENC max sessions, allow the
+    # hardware auto-probe to override YAML defaults (e.g. RTX 5090 can handle >2 sessions).
+    if (not stream_profile_explicit) and (not pre_profile_nvenc):
+        env.pop("METABONK_NVENC_MAX_SESSIONS", None)
     auto_nvenc = _auto_nvenc_max_sessions(env)
     if auto_nvenc is not None:
         env["METABONK_NVENC_MAX_SESSIONS"] = str(int(auto_nvenc))
         if int(auto_nvenc) > 0:
-            print(f"[start_omega] INFO: defaulting METABONK_NVENC_MAX_SESSIONS={int(auto_nvenc)} (consumer NVENC limit)")
+            print(f"[start_omega] INFO: defaulting METABONK_NVENC_MAX_SESSIONS={int(auto_nvenc)} (auto NVENC session cap)")
     # Local app viewing quality: upscale pixel_obs streams to 1080p unless explicitly overridden.
     # This does not affect the agent's observation tensor.
     if bool(getattr(args, "ui", True)) and not _truthy(str(env.get("METABONK_ENABLE_PUBLIC_STREAM") or "0")):
@@ -1123,7 +1356,13 @@ def main() -> int:
         # from the Synthetic Eye CUDA frame path (appsrc->NVENC) instead of requiring PipeWire.
         if strict_streaming:
             env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "0"
-            env.setdefault("METABONK_STREAM_BACKEND", "cuda_appsrc")
+            # Stream profiles set METABONK_STREAM_BACKEND to "gst", but for Synthetic Eye we
+            # want the explicit CUDA appsrc path. Only preserve the value when the user
+            # explicitly requested a backend via CLI.
+            if not _arg_specified("--stream-backend"):
+                env["METABONK_STREAM_BACKEND"] = "cuda_appsrc"
+            else:
+                env.setdefault("METABONK_STREAM_BACKEND", "cuda_appsrc")
         else:
             env["METABONK_REQUIRE_PIPEWIRE_STREAM"] = "1" if public_stream else "0"
     else:
@@ -1159,6 +1398,10 @@ def main() -> int:
             env.setdefault("METABONK_STREAM_BACKEND", "cuda_appsrc")
     env.setdefault("MEGABONK_LOG_DIR", str(repo_root / "temp" / "game_logs"))
     env.setdefault("METABONK_SUPERVISE_WORKERS", "1")
+    # Synthetic Eye + Proton cold-start can be flaky; default to more restarts with a slightly
+    # longer backoff so we recover without exhausting the supervisor quickly.
+    env.setdefault("METABONK_WORKER_RESTART_MAX", "10")
+    env.setdefault("METABONK_WORKER_RESTART_BACKOFF_S", "5.0")
     if (
         str(env.get("METABONK_USE_RESEARCH_SHM") or "0").strip().lower() in ("1", "true", "yes", "on")
         and Path("/dev/shm").exists()
@@ -1545,6 +1788,18 @@ def main() -> int:
             )
             return
         print(f"[start_omega] resolved Proton: {proton_bin}")
+        # Launcher priority tuning: the default template runs game instances at a lower CPU/IO
+        # priority to keep the desktop responsive. For multi-worker throughput validation, allow
+        # overriding these via env.
+        try:
+            game_nice = int(os.environ.get("METABONK_GAME_NICE", "10") or "10")
+        except Exception:
+            game_nice = 10
+        try:
+            game_ionice_class = int(os.environ.get("METABONK_GAME_IONICE_CLASS", "3") or "3")
+        except Exception:
+            game_ionice_class = 3
+        game_prefix = f"nice -n {int(game_nice)} ionice -c{int(game_ionice_class)} "
         # If the user has an old MEGABONK_CMD/MEGABONK_COMMAND in their shell env (often pointing
         # at a local helper like ./run), it will override MEGABONK_CMD_TEMPLATE and gamescope will
         # launch a non-existent binary, yielding a black PipeWire stream. Prefer the generated
@@ -1598,11 +1853,11 @@ def main() -> int:
             "CMD_GS=\\\"${MEGABONK_USE_GAMESCOPE:-1}\\\"; "
             "if [ \\\"$CMD_GS\\\" = \\\"1\\\" ]; then "
             "  if ! command -v gamescope >/dev/null 2>&1; then echo '[start_omega] ERROR: gamescope requested but not found' >&2; exit 1; fi; "
-            "  exec nice -n 10 ionice -c3 "
+            f"  exec {game_prefix}"
             f"{gs}"
             f"\\\"{proton_bin}\\\" run \\\"$GAME\\\" $EXTRA_ARGS; "
             "else "
-            f"  exec nice -n 10 ionice -c3 \\\"{proton_bin}\\\" run \\\"$GAME\\\" $EXTRA_ARGS; "
+            f"  exec {game_prefix}\\\"{proton_bin}\\\" run \\\"$GAME\\\" $EXTRA_ARGS; "
             "fi; "
             "\""
         )
@@ -1617,12 +1872,26 @@ def main() -> int:
         base = [compose]
         if compose == "docker":
             base += ["compose"]
+        project = os.environ.get("METABONK_GO2RTC_COMPOSE_PROJECT") or "metabonk-go2rtc"
+        base += ["-p", project]
         mode = str(env.get("METABONK_GO2RTC_MODE") or "fifo").strip().lower()
         compose_file = "docker-compose.go2rtc.exec.yml" if mode == "exec" else "docker-compose.go2rtc.yml"
         base += ["-f", str(repo_root / "docker" / compose_file)]
         base += list(extra)
         try:
-            return int(subprocess.call(base, cwd=str(repo_root), env=env))
+            # Some environments export DOCKER_HOST pointing at a Podman socket. MetaBonk's
+            # go2rtc stack is expected to run on the system Docker daemon (host networking,
+            # consistent volume mounts). If we detect Podman, prefer the default Docker socket.
+            docker_env = dict(env)
+            try:
+                if (
+                    str(docker_env.get("DOCKER_HOST") or "").find("podman") >= 0
+                    and Path("/var/run/docker.sock").exists()
+                ):
+                    docker_env.pop("DOCKER_HOST", None)
+            except Exception:
+                pass
+            return int(subprocess.call(base, cwd=str(repo_root), env=docker_env))
         except Exception:
             return 1
     try:
@@ -1679,13 +1948,23 @@ def main() -> int:
                     cwd=str(repo_root),
                     env=env,
                 )
-                _go2rtc_compose("up", "-d", "--remove-orphans")
+                rc = _go2rtc_compose("up", "-d", "--remove-orphans")
+                if rc != 0:
+                    raise RuntimeError(f"go2rtc compose up failed (rc={int(rc)})")
                 go2rtc_started = True
                 print(f"[start_omega] public stream -> {env.get('METABONK_GO2RTC_URL')}/")
             except Exception as e:
                 print(f"[start_omega] WARN: failed to start go2rtc ({e})", file=sys.stderr)
 
         if not args.no_orchestrator:
+            # When a concrete policy name is supplied (e.g. "Greed"), default all instances to it.
+            # The special value "SinZero" means "let the orchestrator assign from the population".
+            try:
+                pname = str(getattr(args, "policy_name", "") or "").strip()
+            except Exception:
+                pname = ""
+            if pname and pname.lower() != "sinzero":
+                env.setdefault("METABONK_DEFAULT_POLICY_NAME", pname)
             procs.append(
                 _spawn(
                     "orchestrator",
@@ -1727,6 +2006,16 @@ def main() -> int:
 
         n_workers = 1 if args.mode == "play" else int(args.workers)
         if n_workers > 0:
+            if configure_all_workers is not None:
+                try:
+                    print("[start_omega] applying optimal game settings...")
+                    configure_all_workers(
+                        int(n_workers),
+                        instance_prefix=str(args.instance_prefix),
+                        appid=int(args.appid),
+                    )
+                except Exception as e:
+                    print(f"[start_omega] WARN: game configuration step failed ({e})", file=sys.stderr)
             # Steamworks titles under Proton may hard-fail if Steam isn't running.
             try:
                 appid_int = int(args.appid)
@@ -1794,9 +2083,9 @@ def main() -> int:
 
                 auto_input_space = InputEnumerator().get_input_space_spec()
                 try:
-                    max_buttons = int(env.get("METABONK_AUTO_SEED_MAX_BUTTONS", "16"))
+                    max_buttons = int(env.get("METABONK_AUTO_SEED_MAX_BUTTONS", "64"))
                 except Exception:
-                    max_buttons = 16
+                    max_buttons = 64
                 auto_seed_buttons = ",".join(select_seed_buttons(auto_input_space, max_buttons=max_buttons))
             except Exception as e:
                 auto_seed_buttons = None
@@ -1834,12 +2123,16 @@ def main() -> int:
         except Exception:
             spawn_stagger_s = 0.0
         if spawn_stagger_s <= 0.0:
+            # Default to a small stagger for Synthetic Eye workers to reduce Proton/XWayland
+            # cold-start contention (helps avoid flapping during multi-worker launches).
+            if bool(getattr(args, "synthetic_eye", False)) and int(n_workers) > 1:
+                spawn_stagger_s = 1.0
             try:
                 max_nvenc = int(str(env.get("METABONK_NVENC_MAX_SESSIONS", "0") or "0").strip() or "0")
             except Exception:
                 max_nvenc = 0
             if max_nvenc > 0 and int(n_workers) > int(max_nvenc):
-                spawn_stagger_s = 0.5
+                spawn_stagger_s = max(float(spawn_stagger_s), 0.5)
         for i in range(max(0, n_workers)):
             _ram_governor_before_spawn(worker_idx=i)
             iid = f"{args.instance_prefix}-{i}"
@@ -1874,18 +2167,19 @@ def main() -> int:
             if not use_eye_compositor:
                 wenv.pop("DISPLAY", None)
                 wenv.pop("METABONK_INPUT_DISPLAY", None)
-            if not wenv.get("METABONK_INPUT_BACKEND"):
-                wenv["METABONK_INPUT_BACKEND"] = "libxdo" if libxdo_ok else "xdotool"
-            wenv.setdefault("METABONK_INPUT_DISPLAY_WAIT_S", "20")
-            # XTEST gate: libxdo/xdotool require XTEST to inject into XWayland (gamescope or Smithay Eye).
-            # Xwayland generally exports XTEST by default, but some builds/flags disable it.
-            wenv.setdefault("METABONK_INPUT_XTEST_WAIT_S", "20")
-            if str(wenv.get("METABONK_INPUT_BACKEND") or "").strip().lower() in ("libxdo", "xdotool"):
+            backend = str(wenv.get("METABONK_INPUT_BACKEND") or "").strip().lower()
+            if backend in ("libxdo", "xdotool"):
+                wenv.setdefault("METABONK_INPUT_DISPLAY_WAIT_S", "20")
+                # XTEST gate: libxdo/xdotool require XTEST to inject into XWayland (gamescope or Smithay Eye).
+                # Xwayland generally exports XTEST by default, but some builds/flags disable it.
+                wenv.setdefault("METABONK_INPUT_XTEST_WAIT_S", "20")
                 # Xorg/Xwayland use `+extension` to enable and `-extension` to disable.
                 want = "+extension XTEST"
                 existing = _strip_shell_quotes(str(wenv.get("GAMESCOPE_XWAYLAND_ARGS") or "").strip())
                 if "XTEST" not in existing.upper():
                     wenv["GAMESCOPE_XWAYLAND_ARGS"] = (existing + " " + want).strip() if existing else want
+                if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
+                    wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
             # Do not hardcode menu progression: allow agents to discover routes via their own
             # policy/exploration. (Bootstrap remains available via explicit env/CLI override.)
             wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
@@ -1894,12 +2188,13 @@ def main() -> int:
                 or wenv.get("METABONK_INPUT_KEYS")
                 or wenv.get("METABONK_BUTTON_KEYS")
             ):
-                if autonomous_mode and auto_seed_buttons:
+                if auto_seed_buttons:
                     wenv["METABONK_INPUT_BUTTONS"] = auto_seed_buttons
                 else:
-                    wenv["METABONK_INPUT_BUTTONS"] = "W,A,S,D,SPACE,ENTER,ESC,LEFT,RIGHT,UP,DOWN,MOUSE_LEFT"
-            if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
-                wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
+                    raise SystemExit(
+                        "[start_omega] ERROR: METABONK_INPUT_BUTTONS not set and autonomous input seed unavailable. "
+                        "Set METABONK_INPUT_BUTTONS explicitly or enable input discovery."
+                    )
             worker_port = str(wenv.get("WORKER_PORT") or "")
             if worker_port:
                 if worker_port in seen_worker_ports:
@@ -2071,13 +2366,46 @@ def main() -> int:
                 env_path = None
                 min_mtime_ns = None
                 if use_eye_compositor:
-                    env_path = Path(run_root) / iid / "compositor.env"
+                    if i == 0:
+                        cleaned = _cleanup_stale_x11_lockfiles(verbose=False)
+                        if cleaned:
+                            print(
+                                f"[start_omega] cleaned {cleaned} stale X11 lock/socket artifacts from /tmp",
+                                flush=True,
+                            )
+                    inst_dir = Path(run_root) / iid
+                    env_path = inst_dir / "compositor.env"
+                    # Ensure we do not reuse a stale compositor.env from a previous run. The Smithay
+                    # compositor writes compositor.env once XWayland is Ready; if the old file remains
+                    # and XWayland takes longer than the handshake timeout, the launcher may fail even
+                    # though the compositor eventually comes up.
+                    try:
+                        inst_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    for stale in (
+                        env_path,
+                        inst_dir / "compositor.env.tmp",
+                        inst_dir / "frame.sock",
+                        inst_dir / f"metabonk-wl-{iid}",
+                        inst_dir / f"metabonk-wl-{iid}.lock",
+                        inst_dir / "xwayland.log",
+                    ):
+                        try:
+                            if stale.exists():
+                                stale.unlink()
+                        except Exception:
+                            pass
                     try:
                         if env_path.exists():
                             min_mtime_ns = env_path.stat().st_mtime_ns
                     except Exception:
                         min_mtime_ns = None
                 eye_env = wenv.copy()
+                # The Synthetic Eye exporter can be extremely chatty (per-frame WARN/INFO) which
+                # can dominate multi-worker performance. Default to suppressing it unless a run
+                # explicitly requests verbose logs.
+                eye_env.setdefault("RUST_LOG", str(wenv.get("METABONK_EYE_RUST_LOG") or "error"))
                 # Synthetic Eye -> CUDA interop: exporting a linear staging buffer can trigger
                 # sporadic cuImportExternalMemory failures on some driver stacks. The worker
                 # supports detiling modifiers via CUDA mipmapped-array import, so default to
@@ -2096,17 +2424,36 @@ def main() -> int:
                     if env_path is None:
                         env_path = Path(run_root) / iid / "compositor.env"
                     try:
-                        wait_s = float(os.environ.get("METABONK_SYNTHETIC_EYE_ENV_WAIT_S", "10.0"))
+                        default_wait_s = 20.0 if int(n_workers) > 1 else 10.0
+                        wait_s = float(
+                            os.environ.get("METABONK_SYNTHETIC_EYE_ENV_WAIT_S", str(default_wait_s))
+                        )
                     except Exception:
-                        wait_s = 10.0
+                        wait_s = 20.0 if int(n_workers) > 1 else 10.0
                     kv = _wait_for_compositor_env(env_path, wait_s, min_mtime_ns=min_mtime_ns)
                     disp = str(kv.get("DISPLAY") or "").strip()
                     wl = str(kv.get("WAYLAND_DISPLAY") or "").strip()
                     xdg = str(kv.get("XDG_RUNTIME_DIR") or "").strip()
                     if not (disp and wl and xdg):
+                        extra = ""
+                        try:
+                            if env_path.exists():
+                                raw = env_path.read_text(encoding="utf-8", errors="replace").strip()
+                                if len(raw) > 800:
+                                    raw = raw[-800:]
+                                extra += f"\ncompositor.env:\n{raw}\n"
+                        except Exception:
+                            pass
+                        try:
+                            xwl = env_path.parent / "xwayland.log"
+                            if xwl.exists():
+                                tail = xwl.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+                                extra += "\nxwayland.log (tail):\n" + "\n".join(tail) + "\n"
+                        except Exception:
+                            pass
                         raise SystemExit(
                             f"[start_omega] ERROR: Synthetic Eye compositor handshake failed (missing DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR) "
-                            f"after {wait_s}s: {env_path}"
+                            f"after {wait_s}s: {env_path}{extra}"
                         )
                     wenv["DISPLAY"] = disp
                     wenv["METABONK_INPUT_DISPLAY"] = disp
