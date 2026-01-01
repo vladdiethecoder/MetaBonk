@@ -7,12 +7,11 @@ PyOpenGL>=3.1.6
 PyOpenGL_accelerate>=3.1.6
 #
 # CUDA bindings (already present in some environments)
-cuda-python>=12.0
+cuda-python>=13.1
 #
 # VPF/PyNvVideoCodec (NVENC bindings) - package name varies by distribution.
 # Install from NVIDIA's Video Codec SDK / VPF wheels appropriate to your CUDA version.
 # PyNvVideoCodec
 #
 # CuPy for convenient GPU array interop (optional)
-# cupy-cuda12x
-
+# cupy-cuda13x

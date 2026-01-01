@@ -44,14 +44,12 @@ except Exception:  # pragma: no cover
 
 from src.common.device import resolve_device
 from src.common.schemas import PredictRequest, PredictResponse
-from .menu_classifier import load_menu_classifier, MenuClassifier, heuristic_menu_metrics
 
 
 app = FastAPI(title="MetaBonk Vision Service")
 
 _model: Optional[Any] = None
 _device: Optional[str] = None
-_menu_classifier: Optional[MenuClassifier] = None
 
 
 def _load_model(weights: str) -> Any:
@@ -113,12 +111,6 @@ def _run_yolo(frame: "Image.Image") -> Tuple[List[Dict[str, Any]], float]:
     return dets, latency_ms
 
 
-def _run_menu_classifier(frame: "Image.Image") -> Dict[str, Any]:
-    if _menu_classifier is None:
-        return {}
-    return _menu_classifier.predict(frame)
-
-
 @app.get("/")
 async def read_root():
     return {"message": "MetaBonk Vision Service is running"}
@@ -142,19 +134,9 @@ async def predict(req: PredictRequest):
         raise HTTPException(status_code=400, detail="Provide image_b64 or shm_name+width+height")
 
     dets, latency_ms = _run_yolo(frame)
-    metrics = {}
-    try:
-        metrics.update(_run_menu_classifier(frame))
-    except Exception:
-        metrics = metrics or {}
-    if not metrics:
-        try:
-            metrics.update(heuristic_menu_metrics(frame))
-        except Exception:
-            metrics = metrics or {}
     # Recovery vision service returns detections only. Downstream code may also
     # consume a `metrics` dict when a richer visual model is used.
-    return PredictResponse(detections=dets, latency_ms=latency_ms, metrics=metrics)
+    return PredictResponse(detections=dets, latency_ms=latency_ms, metrics={})
 
 
 def main() -> None:
@@ -163,31 +145,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--weights", default="yolo11n.pt")
     parser.add_argument("--device", default=os.environ.get("METABONK_VISION_DEVICE", ""))
-    parser.add_argument("--menu-weights", default=os.environ.get("METABONK_MENU_WEIGHTS", ""))
-    parser.add_argument("--menu-device", default=os.environ.get("METABONK_MENU_DEVICE", ""))
-    parser.add_argument("--menu-thresh", type=float, default=float(os.environ.get("METABONK_MENU_THRESH", "0.5")))
     args = parser.parse_args()
 
     global _model
     global _device
-    global _menu_classifier
     _device = resolve_device(str(args.device or "").strip(), context="vision")
     _model = _load_model(args.weights)
-    menu_weights = str(args.menu_weights or "").strip()
-    if menu_weights:
-        try:
-            menu_dev = str(args.menu_device or "").strip()
-            if menu_dev:
-                menu_dev = resolve_device(menu_dev, context="menu classifier")
-            else:
-                menu_dev = _device
-            _menu_classifier = load_menu_classifier(
-                menu_weights,
-                device=menu_dev or None,
-                threshold=float(args.menu_thresh),
-            )
-        except Exception:
-            _menu_classifier = None
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

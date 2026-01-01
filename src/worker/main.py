@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, TYPE_CHECKING
+from typing import Deque, Dict, List, Optional
 
 try:
     import requests
@@ -60,10 +60,7 @@ from .rollout import LearnerClient, RolloutBuffer, PixelRolloutBuffer
 from .nvenc_streamer import NVENCConfig, NVENCStreamer, PixelFrame, CudaFrame
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
-from .stream_health import jpeg_luma_variance
-
-if TYPE_CHECKING:
-    from src.control.menu_reasoner import MenuAction
+from .stream_health import jpeg_luma_thumbnail, luma_mean_abs_diff
 
 try:
     from src.agent.cognitive_client import CognitiveClient  # type: ignore
@@ -73,6 +70,11 @@ try:
     from src.agent.rl_integration import RLLogger  # type: ignore
 except Exception:  # pragma: no cover
     RLLogger = None  # type: ignore
+
+try:
+    from src.agent.visual_exploration_reward import VisualExplorationReward  # type: ignore
+except Exception:  # pragma: no cover
+    VisualExplorationReward = None  # type: ignore
 
 try:
     from src.bridge.unity_bridge import UnityBridge, BridgeConfig, GameFrame
@@ -126,101 +128,6 @@ def _game_restart_possible() -> bool:
         or os.environ.get("MEGABONK_CMD_TEMPLATE")
         or os.environ.get("MEGABONK_COMMAND_TEMPLATE")
     )
-
-
-class AdaptiveTeacher:
-    def __init__(
-        self,
-        *,
-        patience_s: float = 2.0,
-        max_patience_s: float = 30.0,
-        growth: float = 1.5,
-        cooldown_s: float = 0.5,
-        log_every: int = 60,
-    ) -> None:
-        self.patience_s = float(patience_s)
-        self.max_patience_s = float(max_patience_s)
-        self.growth = float(growth)
-        self.cooldown_s = float(cooldown_s)
-        self.log_every = max(1, int(log_every))
-        self._menu_elapsed_s = 0.0
-        self._last_ts = 0.0
-        self._last_menu_key = ""
-        self._last_intervention_ts = 0.0
-        self._intervention_count = 0
-
-    @classmethod
-    def from_env(cls) -> "AdaptiveTeacher":
-        def _get_float(name: str, default: float) -> float:
-            try:
-                return float(os.environ.get(name, str(default)))
-            except Exception:
-                return float(default)
-
-        def _get_int(name: str, default: int) -> int:
-            try:
-                return int(os.environ.get(name, str(default)))
-            except Exception:
-                return int(default)
-
-        return cls(
-            patience_s=_get_float("METABONK_MENU_TEACHER_PATIENCE_S", 2.0),
-            max_patience_s=_get_float("METABONK_MENU_TEACHER_MAX_S", 30.0),
-            growth=_get_float("METABONK_MENU_TEACHER_GROWTH", 1.5),
-            cooldown_s=_get_float("METABONK_MENU_TEACHER_COOLDOWN_S", 0.5),
-            log_every=_get_int("METABONK_MENU_TEACHER_LOG_EVERY", 60),
-        )
-
-    def step(self, now: float, *, in_menu: bool, menu_key: str) -> bool:
-        if not in_menu:
-            self._menu_elapsed_s = 0.0
-            self._last_ts = now
-            self._last_menu_key = ""
-            return False
-        if self._last_ts <= 0.0:
-            self._last_ts = now
-        dt = max(0.0, float(now - self._last_ts))
-        self._last_ts = now
-        if menu_key and menu_key != self._last_menu_key:
-            self._menu_elapsed_s = 0.0
-            self._last_menu_key = menu_key
-        else:
-            self._menu_elapsed_s += dt
-        if self._menu_elapsed_s < self.patience_s:
-            return False
-        if self._last_intervention_ts > 0 and (now - self._last_intervention_ts) < self.cooldown_s:
-            return False
-        return True
-
-    def record_intervention(self, now: float) -> None:
-        self._last_intervention_ts = now
-        self._menu_elapsed_s = 0.0
-        self._intervention_count += 1
-
-    def pick_action_index(self, indices: List[int], cycle_k: int) -> Optional[int]:
-        if not indices:
-            return None
-        k = max(1, min(len(indices), int(cycle_k)))
-        return indices[self._intervention_count % k]
-
-    def should_log_intervention(self) -> bool:
-        return self._intervention_count % self.log_every == 0
-
-    def recent_intervention(self, now: float, window_s: float) -> bool:
-        if self._last_intervention_ts <= 0:
-            return False
-        return (now - self._last_intervention_ts) <= float(window_s)
-
-    def on_student_success(self) -> None:
-        prev = float(self.patience_s)
-        self.patience_s = min(self.max_patience_s, float(self.patience_s) * float(self.growth))
-        print(
-            f"[TEACHER] Student acted independently; patience {prev:.1f}s -> {self.patience_s:.1f}s",
-            flush=True,
-        )
-
-    def on_teacher_success(self) -> None:
-        print("[TEACHER] Intervention triggered reward", flush=True)
 
 
 class WorkerService:
@@ -299,11 +206,16 @@ class WorkerService:
             self._system2_blend = 0.7
         self._system2_blend = max(0.0, min(1.0, float(self._system2_blend)))
         try:
-            self._system2_menu_click_cooldown_s = float(os.environ.get("METABONK_SYSTEM2_MENU_CLICK_COOLDOWN_S", "1.0"))
+            cooldown_raw = str(os.environ.get("METABONK_SYSTEM2_UI_CLICK_COOLDOWN_S", "") or "").strip()
+            if not cooldown_raw:
+                # Back-compat (deprecated)
+                cooldown_raw = str(os.environ.get("METABONK_SYSTEM2_MENU_CLICK_COOLDOWN_S", "1.0") or "1.0")
+            self._system2_ui_click_cooldown_s = float(cooldown_raw or 1.0)
         except Exception:
-            self._system2_menu_click_cooldown_s = 1.0
-        self._system2_last_menu_click_ts = 0.0
-        self._system2_last_menu_click_resp_ts = 0.0
+            self._system2_ui_click_cooldown_s = 1.0
+        self._system2_last_ui_click_ts = 0.0
+        self._system2_last_ui_click_resp_ts = 0.0
+        self._vlm_hints_used: int = 0
         self._system2_override_cont = str(os.environ.get("METABONK_SYSTEM2_OVERRIDE_CONT", "1") or "").strip().lower() not in (
             "0",
             "false",
@@ -478,9 +390,9 @@ class WorkerService:
         self._obs_backend = str(os.environ.get("METABONK_OBS_BACKEND", "detections") or "").strip().lower()
         if not self._obs_backend:
             self._obs_backend = "detections"
-        if self._obs_backend not in ("detections", "pixels", "hybrid"):
+        if self._obs_backend not in ("detections", "pixels", "hybrid", "cutile"):
             raise ValueError(f"invalid METABONK_OBS_BACKEND={self._obs_backend!r}")
-        self._pixel_obs_enabled = self._obs_backend in ("pixels", "hybrid")
+        self._pixel_obs_enabled = self._obs_backend in ("pixels", "hybrid", "cutile")
         # Pixel observation refresh rate. When using Synthetic Eye, the drain loop can easily
         # become compute-bound if we normalize pixels for *every* compositor frame. Throttle
         # pixel obs refresh to a reasonable rate while still servicing fences at full speed.
@@ -492,13 +404,15 @@ class WorkerService:
         self._pixel_obs_h = 0
         self._pixel_ui_grid = str(os.environ.get("METABONK_PIXEL_UI_GRID", "") or "").strip().lower()
         if not self._pixel_ui_grid:
-            # Reuse menu grid default but bias larger for pixel policies.
-            self._pixel_ui_grid = str(os.environ.get("METABONK_MENU_GRID", "8x8") or "8x8").strip().lower()
+            # Keep the implicit default at 32 targets so it fully covers the screen without
+            # truncating to the top-left.
+            self._pixel_ui_grid = str(os.environ.get("METABONK_UI_GRID", "8x4") or "8x4").strip().lower()
         self._pixel_lock = threading.Lock()
         self._latest_pixel_obs = None
         self._latest_pixel_frame_id: Optional[int] = None
         self._latest_pixel_ts: float = 0.0
         self._latest_pixel_src_size: Optional[tuple[int, int]] = None
+        self._cutile_obs = None
         # Spectator frames (higher-res, 16:9) are derived from Synthetic Eye frames, but are
         # intentionally decoupled from the agent observation tensor. This prevents "square
         # obs upscaled to 1080p with huge black bars" in the Stream UI.
@@ -541,6 +455,32 @@ class WorkerService:
                 self._pixel_obs_h = 128
             if self._pixel_obs_w <= 0 or self._pixel_obs_h <= 0:
                 raise ValueError("METABONK_PIXEL_OBS_W/H must be positive")
+            # CuTile obs mode: enforce prerequisites (no silent fallback).
+            self._pixel_preprocess_backend = str(os.environ.get("METABONK_PIXEL_PREPROCESS_BACKEND", "") or "").strip().lower()
+            if not self._pixel_preprocess_backend:
+                self._pixel_preprocess_backend = "cutile" if self._obs_backend == "cutile" else "torch"
+            if self._obs_backend == "cutile":
+                try:
+                    from src.worker.gpu_preprocess import HAS_CUTILE
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError(f"cuTile backend requested but gpu_preprocess import failed: {e}") from e
+                if not HAS_CUTILE:
+                    raise RuntimeError(
+                        "METABONK_OBS_BACKEND=cutile requires cuTile+CuPy (install cuda-tile + cupy-cuda13x)."
+                    )
+                if (int(self._pixel_obs_h) % 32) != 0 or (int(self._pixel_obs_w) % 32) != 0:
+                    raise ValueError(
+                        f"METABONK_OBS_BACKEND=cutile requires METABONK_PIXEL_OBS_H/W to be multiples of 32 "
+                        f"(got {int(self._pixel_obs_h)}x{int(self._pixel_obs_w)})"
+                    )
+                try:
+                    from src.perception.cutile_observations import CuTileObsConfig, CuTileObservations
+
+                    self._cutile_obs = CuTileObservations(
+                        cfg=CuTileObsConfig(out_size=(int(self._pixel_obs_h), int(self._pixel_obs_w)))
+                    )
+                except Exception as e:  # pragma: no cover
+                    raise RuntimeError(f"Failed to initialize CuTileObservations: {e}") from e
             # VisionActorCritic uses a 3x stride-2 CNN stem (downscale factor 8) before the
             # ViT-style patch embedding conv. If the patch size is too large relative to the
             # post-stem spatial size, Torch will raise:
@@ -687,6 +627,9 @@ class WorkerService:
         self._last_frame_var_ts: float = 0.0
         self._last_frame_var: Optional[float] = None
         self._black_frame_since: float = 0.0
+        self._frozen_frame_since: float = 0.0
+        self._last_frame_luma = None
+        self._last_frame_luma_diff: Optional[float] = None
         self._obs_frame_times: Deque[float] = deque(maxlen=120)
         self._obs_fps: Optional[float] = None
         self._pipewire_health_ts: float = 0.0
@@ -710,7 +653,6 @@ class WorkerService:
             self._synthetic_eye_stall_restart_s = 60.0
         self._synthetic_eye_drain_enabled: bool = False
         self._synthetic_eye_drain_last_error_ts: float = 0.0
-        self._menu_doom_score: float = 0.0
         self._game_restart_enabled = os.environ.get("METABONK_GAME_RESTART", "1") in ("1", "true", "True")
         self._game_restart_possible = _game_restart_possible()
         self._game_restart_count = 0
@@ -718,16 +660,8 @@ class WorkerService:
         self._game_restart_failed = False
         self._last_step_seen: int = 0
         self._last_step_ts: float = 0.0
-        self._last_menu_mode: Optional[bool] = None
-        self._last_menu_mode_log: Optional[bool] = None
-        self._last_menu_name: Optional[str] = None
-        self._last_menu_raw: Optional[str] = None
-        self._last_menu_log_ts: float = 0.0
-        self._menu_state_since_ts: float = 0.0
         self._last_state_ts: float = 0.0
-        self._menu_seen_main: bool = False
         self._reward_log = os.environ.get("METABONK_REWARD_LOG", "0") in ("1", "true", "True")
-        self._menu_log = os.environ.get("METABONK_MENU_LOG", "0") in ("1", "true", "True")
         try:
             self._action_log_freq = int(os.environ.get("METABONK_ACTION_LOG_FREQ", "0"))
         except Exception:
@@ -743,10 +677,6 @@ class WorkerService:
         except Exception:
             self._action_clip_max = 1.0
         self._action_clip_logged = False
-        try:
-            self._menu_start_bonus = float(os.environ.get("METABONK_MENU_START_BONUS", "0") or 0.0)
-        except Exception:
-            self._menu_start_bonus = 0.0
         self._reward_hit_saved = False
         self._reward_hit_frame_path = os.environ.get(
             "METABONK_REWARD_HIT_FRAME_PATH", str(Path("temp") / "reward_hits")
@@ -838,6 +768,12 @@ class WorkerService:
         except Exception:
             self._hud_pulse_log_s = 0.0
         self._hud_pulse_last_ts = 0.0
+        self._hud_phase_log = str(os.environ.get("METABONK_HUD_PHASE_LOG", "0") or "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self._phase_model_path = str(os.environ.get("METABONK_PHASE_MODEL_PATH", "") or "").strip()
         self._phase_model_enabled = bool(self._phase_model_path)
         try:
@@ -945,6 +881,16 @@ class WorkerService:
             "yes",
             "on",
         )
+        self._visual_exploration = VisualExplorationReward() if VisualExplorationReward is not None else None
+        try:
+            self._visual_exploration_interval_s = float(
+                os.environ.get("METABONK_VISUAL_EXPLORATION_INTERVAL_S", "0") or 0.0
+            )
+        except Exception:
+            self._visual_exploration_interval_s = 0.0
+        self._visual_exploration_last_update_ts: float = 0.0
+        self._visual_exploration_last_scene_hash: Optional[str] = None
+        self._visual_exploration_last_scene_change_ts: float = 0.0
 
         # Optional UnityBridge embodiment (BepInEx plugin).
         self._use_bridge = os.environ.get("METABONK_USE_UNITY_BRIDGE", "0") in ("1", "true", "True")
@@ -960,126 +906,6 @@ class WorkerService:
         self._input_backend_name = str(os.environ.get("METABONK_INPUT_BACKEND", "") or "").strip().lower()
         self._input_backend = None
         self._input_buttons: List[dict] = []
-        self._menu_bias_enabled = os.environ.get("METABONK_MENU_ACTION_BIAS", "0") in ("1", "true", "True")
-        try:
-            self._menu_bias_prob = float(os.environ.get("METABONK_MENU_ACTION_BIAS_P", "0.6"))
-        except Exception:
-            self._menu_bias_prob = 0.6
-        try:
-            self._menu_bias_decay = float(os.environ.get("METABONK_MENU_ACTION_BIAS_DECAY", "0.995"))
-        except Exception:
-            self._menu_bias_decay = 0.995
-        try:
-            self._menu_bias_min = float(os.environ.get("METABONK_MENU_ACTION_BIAS_MIN", "0.05"))
-        except Exception:
-            self._menu_bias_min = 0.05
-        self._menu_bias_successes = 0
-        self._menu_bias_indices: List[int] = []
-        if self._pure_vision_mode:
-            self._menu_bias_enabled = False
-        menu_teacher_env = str(os.environ.get("METABONK_MENU_TEACHER", "") or "").strip().lower()
-        if not menu_teacher_env:
-            self._menu_teacher_enabled = bool(self._menu_bias_enabled)
-        else:
-            self._menu_teacher_enabled = menu_teacher_env in ("1", "true", "yes", "on")
-        if self._pure_vision_mode:
-            self._menu_teacher_enabled = False
-        self._menu_teacher = AdaptiveTeacher.from_env() if self._menu_teacher_enabled else None
-        try:
-            self._menu_teacher_window_s = float(os.environ.get("METABONK_MENU_TEACHER_WINDOW_S", "2.0"))
-        except Exception:
-            self._menu_teacher_window_s = 2.0
-        try:
-            self._menu_teacher_cycle_k = int(os.environ.get("METABONK_MENU_TEACHER_CYCLE_K", "2"))
-        except Exception:
-            self._menu_teacher_cycle_k = 2
-        try:
-            self._menu_teacher_lobby_linger_s = float(
-                os.environ.get("METABONK_MENU_TEACHER_LOBBY_LINGER_S", "6.0")
-            )
-        except Exception:
-            self._menu_teacher_lobby_linger_s = 6.0
-        self._menu_teacher_confirm_template = str(
-            os.environ.get("METABONK_MENU_TEACHER_CONFIRM_TEMPLATE", "") or ""
-        ).strip()
-        if not self._menu_teacher_confirm_template:
-            default_tpl = Path("assets") / "ui_templates" / "confirm_button.png"
-            if default_tpl.exists():
-                self._menu_teacher_confirm_template = str(default_tpl)
-        try:
-            self._menu_teacher_confirm_thresh = float(
-                os.environ.get("METABONK_MENU_TEACHER_CONFIRM_THRESH", "0.75")
-            )
-        except Exception:
-            self._menu_teacher_confirm_thresh = 0.75
-        try:
-            self._menu_teacher_confirm_scale = float(
-                os.environ.get("METABONK_MENU_TEACHER_CONFIRM_SCALE", "1.0")
-            )
-        except Exception:
-            self._menu_teacher_confirm_scale = 1.0
-        self._menu_teacher_confirm_enabled = bool(self._menu_teacher_confirm_template)
-        self._menu_teacher_confirm_gray = None
-        self._menu_teacher_confirm_warned = False
-        self._menu_teacher_confirm_wait_until_ts: float = 0.0
-        self._menu_teacher_confirm_pending: bool = False
-        self._menu_teacher_play_template = str(
-            os.environ.get("METABONK_MENU_TEACHER_PLAY_TEMPLATE", "") or ""
-        ).strip()
-        if not self._menu_teacher_play_template:
-            default_tpl = Path("assets") / "ui_templates" / "play_button.png"
-            if default_tpl.exists():
-                self._menu_teacher_play_template = str(default_tpl)
-        try:
-            self._menu_teacher_play_thresh = float(
-                os.environ.get("METABONK_MENU_TEACHER_PLAY_THRESH", "0.75")
-            )
-        except Exception:
-            self._menu_teacher_play_thresh = 0.75
-        try:
-            self._menu_teacher_play_scale = float(
-                os.environ.get("METABONK_MENU_TEACHER_PLAY_SCALE", "1.0")
-            )
-        except Exception:
-            self._menu_teacher_play_scale = 1.0
-        self._menu_teacher_play_enabled = bool(self._menu_teacher_play_template)
-        self._menu_teacher_play_gray = None
-        self._menu_teacher_play_warned = False
-        self._menu_teacher_play_rect_warned = False
-        self._menu_teacher_play_pending = False
-        self._menu_teacher_play_pending_deadline = 0.0
-        self._menu_teacher_play_ref_var: Optional[float] = None
-        try:
-            self._menu_teacher_play_transition_s = float(
-                os.environ.get("METABONK_MENU_TEACHER_PLAY_TRANSITION_S", "2.0")
-            )
-        except Exception:
-            self._menu_teacher_play_transition_s = 2.0
-        try:
-            self._menu_teacher_play_transition_var_delta = float(
-                os.environ.get("METABONK_MENU_TEACHER_PLAY_TRANSITION_VAR_DELTA", "60.0")
-            )
-        except Exception:
-            self._menu_teacher_play_transition_var_delta = 60.0
-        self._menu_teacher_play_fallback: List[tuple[float, float]] = []
-        fallback_env = str(os.environ.get("METABONK_MENU_TEACHER_PLAY_FALLBACK", "") or "").strip()
-        if not fallback_env:
-            fallback_env = "0.18,0.35;0.18,0.45;0.18,0.55;0.18,0.65"
-        for chunk in fallback_env.split(";"):
-            if not chunk.strip():
-                continue
-            try:
-                xs, ys = chunk.split(",")
-                fx = max(0.0, min(1.0, float(xs.strip())))
-                fy = max(0.0, min(1.0, float(ys.strip())))
-                self._menu_teacher_play_fallback.append((fx, fy))
-            except Exception:
-                continue
-        self._teacher_debug_enabled = os.environ.get("METABONK_TEACHER_DEBUG", "0") in ("1", "true", "True")
-        self._teacher_debug_dir = str(
-            os.environ.get("METABONK_TEACHER_DEBUG_DIR", str(Path("temp") / "teacher_debug"))
-            or str(Path("temp") / "teacher_debug")
-        )
         self._input_held_keys: set[str] = set()
         self._input_held_mouse: set[str] = set()
         self._input_cursor_pos: Optional[tuple[int, int]] = None
@@ -1092,14 +918,6 @@ class WorkerService:
             self._input_scroll_scale = float(os.environ.get("METABONK_INPUT_SCROLL_SCALE", "3.0"))
         except Exception:
             self._input_scroll_scale = 3.0
-        # Menu bootstrapping is an explicit opt-in. Agents must learn navigation via their
-        # action space + reward shaping rather than hardcoded input scripts.
-        self._input_menu_bootstrap = os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP", "0") in ("1", "true", "True")
-        if self._pure_vision_mode:
-            self._input_menu_bootstrap = False
-        self._menu_bootstrap_step = 0
-        self._menu_bootstrap_next_ts = 0.0
-        self._menu_bootstrap_last_menu: Optional[str] = None
         # Delay X11 input backend init until after the game (gamescope/Xwayland) display exists.
         # Optional BonkLink bridge (BepInEx 6 IL2CPP).
         self._use_bonklink = os.environ.get("METABONK_USE_BONKLINK", "0") in ("1", "true", "True")
@@ -1110,44 +928,6 @@ class WorkerService:
         except Exception:
             self._bonklink_retry_s = 5.0
         self._bonklink_last_attempt = 0.0
-        # Optional VLM-driven menu navigation (Lobby Agent).
-        self._use_vlm_menu = (not self._pure_vision_mode) and (
-            os.environ.get("METABONK_USE_VLM_MENU", "0") in ("1", "true", "True")
-        )
-        self._vlm_menu_goal = os.environ.get("METABONK_MENU_GOAL", "Start Run")
-        self._vlm_menu = None
-        if self._use_vlm_menu:
-            try:
-                from .vlm_navigator import VLMNavigator, VLMConfig as _MenuVLMConfig
-
-                model = os.environ.get("METABONK_VLM_MENU_MODEL")
-                cfg = _MenuVLMConfig(model=model) if model else _MenuVLMConfig()
-                self._vlm_menu = VLMNavigator(cfg)
-            except Exception:
-                self._vlm_menu = None
-                self._use_vlm_menu = False
-        # Optional switching controller (System-2 menu override).
-        # Pure-vision runs forbid any scripted/menu-teacher overrides; System-2 should act
-        # only via the VLM strategy loop.
-        self._use_switching_controller = (not self._pure_vision_mode) and (
-            os.environ.get("METABONK_USE_SWITCHING_CONTROLLER", "0") in ("1", "true", "True")
-        )
-        self._switching_controller = None
-        if self._use_switching_controller:
-            try:
-                from src.control.switching_controller import SwitchingController
-
-                self._switching_controller = SwitchingController()
-                # Avoid double menu overrides.
-                self._use_vlm_menu = False
-                self._vlm_menu = None
-            except Exception:
-                self._use_switching_controller = False
-                self._switching_controller = None
-        # Note: we intentionally do NOT disable menu bootstrapping when a VLM controller is
-        # enabled. The rollout loop already skips bootstrapping when a menu override action
-        # was applied, and keeping bootstrapping available avoids deadlocks when menu detection
-        # fails (e.g., early photosensitivity prompt with `menu_hint=None`).
         # Optional causal Scientist for item/build discovery.
         self._use_causal_scientist = os.environ.get("METABONK_USE_CAUSAL", "0") in (
             "1",
@@ -2097,7 +1877,7 @@ class WorkerService:
                                 except Exception:
                                     want_pixels_update = True
                             # Spectator frames are primarily used for human streaming/preview, but System2
-                            # (centralized VLM) also needs readable frames to navigate menus. Historically
+                            # (centralized VLM) also needs readable frames to navigate UI flows. Historically
                             # we avoided generating spectator frames unless there was an active stream
                             # client, which meant System2 silently fell back to 128x128 pixel obs and could
                             # not localize UI buttons.
@@ -2269,11 +2049,18 @@ class WorkerService:
                                                     o = None
                                                     s = None
                                                     if want_pixels_update:
-                                                        o = normalize_obs_u8_chw(
-                                                            obs_u8,
-                                                            out_h=int(self._pixel_obs_h),
-                                                            out_w=int(self._pixel_obs_w),
-                                                        )
+                                                        cutile_obs = getattr(self, "_cutile_obs", None)
+                                                        if getattr(self, "_obs_backend", "") == "cutile" and cutile_obs is not None:
+                                                            o = cutile_obs.extract_from_chw_u8(obs_u8)
+                                                        else:
+                                                            o = normalize_obs_u8_chw(
+                                                                obs_u8,
+                                                                out_h=int(self._pixel_obs_h),
+                                                                out_w=int(self._pixel_obs_w),
+                                                                backend=str(
+                                                                    getattr(self, "_pixel_preprocess_backend", "torch") or "torch"
+                                                                ),
+                                                            )
                                                     if want_spectator_update:
                                                         s = normalize_spectator_u8_chw(
                                                             obs_u8,
@@ -2570,21 +2357,26 @@ class WorkerService:
 
             deadline = time.time() + float(os.environ.get("METABONK_INPUT_AUDIT_WAIT_S", "15.0") or "15.0")
             wid = None
-            before_menu = None
+            before_scene = None
+            before_started = bool(getattr(self, "_gameplay_started", False))
             while time.time() < deadline:
                 try:
                     if hasattr(backend, "get_window_id"):
                         wid = backend.get_window_id()
                 except Exception:
                     wid = None
-                before_menu = getattr(self, "_last_menu_mode", None)
-                if wid is not None or before_menu is not None:
+                try:
+                    ve = getattr(self, "_visual_exploration", None)
+                    before_scene = getattr(ve, "last_scene_hash", None) if ve is not None else None
+                except Exception:
+                    before_scene = None
+                if wid is not None or before_scene is not None:
                     break
                 time.sleep(0.1)
 
             print(
                 f"[INPUT] worker={self.instance_id} audit BEGIN display={os.environ.get('DISPLAY')} wid={wid} "
-                f"before_menu_mode={before_menu}",
+                f"before_scene_hash={before_scene} gameplay_started={before_started}",
                 flush=True,
             )
 
@@ -2657,10 +2449,19 @@ class WorkerService:
                 pointer_moved = (dx + dy) >= 5
 
             time.sleep(float(os.environ.get("METABONK_INPUT_AUDIT_POST_S", "1.0") or "1.0"))
-            after_menu = getattr(self, "_last_menu_mode", None)
-            changed = (before_menu is not None) and (after_menu is not None) and (after_menu != before_menu)
+            try:
+                ve = getattr(self, "_visual_exploration", None)
+                after_scene = getattr(ve, "last_scene_hash", None) if ve is not None else None
+            except Exception:
+                after_scene = None
+            after_started = bool(getattr(self, "_gameplay_started", False))
+            changed = (
+                (before_scene is not None)
+                and (after_scene is not None)
+                and (str(after_scene) != str(before_scene))
+            )
             print(
-                f"[INPUT] worker={self.instance_id} audit END after_menu_mode={after_menu} changed={changed} "
+                f"[INPUT] worker={self.instance_id} audit END after_scene_hash={after_scene} scene_changed={changed} "
                 f"pointer_moved={pointer_moved} send_fail={send_fail} "
                 f"mouse_before={pointer_before} mouse_after={pointer_after}",
                 flush=True,
@@ -3179,7 +2980,6 @@ class WorkerService:
 
     def _update_gameplay_state(
         self,
-        menu_hint: Optional[bool],
         game_state: dict,
         *,
         hud_present: bool = False,
@@ -3194,20 +2994,11 @@ class WorkerService:
         try:
             from src.proof_harness.guards import should_mark_gameplay_started
 
-            if should_mark_gameplay_started(menu_hint, game_state):
+            if should_mark_gameplay_started(game_state):
                 self._gameplay_started = True
                 self._gameplay_start_ts = time.time()
         except Exception:
             return
-
-    def _update_menu_doom(self, menu_hint: Optional[bool]) -> None:
-        if menu_hint is None:
-            return
-        # Increment slowly while stuck in menus, decay faster when gameplay resumes.
-        if menu_hint:
-            self._menu_doom_score = min(100.0, float(self._menu_doom_score) + 1.8)
-        else:
-            self._menu_doom_score = max(0.0, float(self._menu_doom_score) - 3.6)
 
     def _flag_action_guard_violation(self, reason: str) -> None:
         if self._action_guard_violation:
@@ -3233,7 +3024,6 @@ class WorkerService:
         self,
         *,
         action_source: str,
-        menu_override_active: bool,
         forced_ui_click: Optional[tuple[int, int]],
         input_bootstrap: bool,
         sima2_action: Optional[List[float]],
@@ -3248,7 +3038,6 @@ class WorkerService:
             reason = action_guard_violation(
                 gameplay_started=self._gameplay_started,
                 action_source=action_source,
-                menu_override_active=menu_override_active,
                 forced_ui_click=forced_ui_click,
                 input_bootstrap=input_bootstrap,
                 sima2_action=sima2_action,
@@ -3592,31 +3381,19 @@ class WorkerService:
         except Exception:
             return None
 
-    def _weak_phase_label(self, menu_hint: Optional[bool], game_state: dict) -> str:
+    def _weak_phase_label(self, game_state: dict) -> str:
+        """Best-effort coarse phase label (game-agnostic).
+
+        Intentionally avoids any game-specific menu/scene taxonomy. For labeling
+        and debugging, prefer `VisualExplorationReward.metrics()["scene_hash"]`.
+        """
+        if self._hud_present:
+            return "gameplay"
         try:
             if game_state.get("isPlaying") is True:
                 return "gameplay"
         except Exception:
             pass
-        if self._hud_present:
-            return "gameplay"
-        try:
-            menu_raw = str(game_state.get("currentMenu") or "").strip().lower()
-        except Exception:
-            menu_raw = ""
-        if menu_raw in ("mainmenu",):
-            return "main_menu"
-        if menu_raw in ("bootscene",):
-            # BootScene is often reused by the game for multiple non-gameplay screens; treat as unknown.
-            return "unknown"
-        if menu_raw in ("characterselect", "characterselection", "characters", "selectcharacter"):
-            return "char_select"
-        if menu_raw in ("generatedmap", "mapselect", "mapselection"):
-            return "map_select"
-        if menu_raw in ("loadingscreen", "loading"):
-            return "loading"
-        if menu_hint:
-            return "menu"
         return "unknown"
 
     def _phase_dataset_label_count(self, label: str) -> int:
@@ -3656,7 +3433,6 @@ class WorkerService:
             self._maybe_dump_phase_sample(
                 now=now,
                 label="pre_loading",
-                menu_hint=None,
                 game_state={},
                 force=True,
                 event="arm_loading",
@@ -3672,7 +3448,6 @@ class WorkerService:
         *,
         now: float,
         base_label: str,
-        menu_hint: Optional[bool],
         game_state: dict,
         gameplay_now: bool,
     ) -> str:
@@ -3725,52 +3500,11 @@ class WorkerService:
         except Exception:
             pass
 
-    def _teacher_debug_dump(
-        self,
-        *,
-        now: float,
-        payload: Optional[bytes],
-        mode: str,
-        roi: Optional[tuple[int, int, int, int]] = None,
-        candidates: Optional[List[tuple[int, int, int, int, float]]] = None,
-        chosen: Optional[tuple[float, float]] = None,
-    ) -> None:
-        if not self._teacher_debug_enabled:
-            return
-        if not payload:
-            return
-        arr = self._decode_jpeg_to_array(payload)
-        if arr is None:
-            return
-        try:
-            from PIL import Image, ImageDraw
-
-            out_dir = Path(self._teacher_debug_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            ts_ms = int(now * 1000)
-            base = out_dir / f"main_menu_{ts_ms}"
-            img = Image.fromarray(arr)
-            img.save(base.with_suffix(".jpg"))
-            draw = ImageDraw.Draw(img)
-            if roi:
-                draw.rectangle(roi, outline="cyan", width=2)
-            if candidates:
-                for (x, y, w, h, _) in candidates:
-                    draw.rectangle((x, y, x + w, y + h), outline="yellow", width=2)
-            if chosen:
-                cx, cy = chosen
-                draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), outline="red", width=2)
-            draw.text((8, 8), f"{mode}", fill="white")
-            img.save(base.with_name(base.name + "_overlay.jpg"))
-        except Exception:
-            return
-
     def _maybe_dump_phase_sample(
         self,
         *,
         now: float,
         label: str,
-        menu_hint: Optional[bool],
         game_state: dict,
         force: bool = False,
         event: Optional[str] = None,
@@ -3815,10 +3549,15 @@ class WorkerService:
             out_dir.mkdir(parents=True, exist_ok=True)
             ts_ms = int(now * 1000)
             out_path = out_dir / f"{self.instance_id}_{ts_ms}.npz"
+            scene_hash = None
+            try:
+                if self._visual_exploration is not None:
+                    scene_hash = (self._visual_exploration.metrics() or {}).get("scene_hash")
+            except Exception:
+                scene_hash = None
             meta = {
                 "instance": self.instance_id,
-                "menu": str(game_state.get("currentMenu") or ""),
-                "menu_hint": bool(menu_hint) if menu_hint is not None else None,
+                "scene_hash": str(scene_hash) if scene_hash is not None else None,
                 "hud_present": bool(self._hud_present),
                 "isPlaying": bool(game_state.get("isPlaying")),
                 "phase_label": self._phase_label,
@@ -4184,59 +3923,31 @@ class WorkerService:
         if stats and (not self._frame_is_black(stats)):
             self._last_valid_frame = entry
 
-    def _resolve_menu_bias_indices(self) -> List[int]:
-        if not self._input_buttons:
-            return []
-        raw = os.environ.get("METABONK_MENU_ACTION_BIAS_KEYS", "SPACE,ENTER,RETURN,MOUSE_LEFT,LEFT")
-        bias_items = [s.strip().upper() for s in str(raw).split(",") if s.strip()]
-        bias_keys = set(bias_items)
-        idxs: List[int] = []
-        for i, spec in enumerate(self._input_buttons):
-            kind = str(spec.get("kind") or "").lower()
-            if kind == "mouse":
-                btn = str(spec.get("button") or "").upper()
-                if btn in bias_keys:
-                    idxs.append(i)
-                continue
-            name = str(spec.get("name") or "").strip()
-            up = name.upper()
-            if up.startswith("KEY_"):
-                up = up[4:]
-            if up in bias_keys:
-                idxs.append(i)
-        return idxs
-
     def _init_input_backend(self) -> None:
         name = self._input_backend_name
         if name not in ("uinput", "xdotool", "xdo", "libxdo"):
             return
         strict_input = os.environ.get("METABONK_REQUIRE_INPUT", "1") in ("1", "true", "True")
         self._input_buttons = self._parse_input_buttons()
-        self._menu_bias_indices = self._resolve_menu_bias_indices()
         if not self._input_buttons:
             print(f"[worker:{self.instance_id}] input backend enabled but no METABONK_INPUT_BUTTONS set")
         if name == "uinput":
             if UInputBackend is None:
                 print(f"[worker:{self.instance_id}] uinput backend unavailable (missing dependency)")
-                self._input_menu_bootstrap = False
                 return
             try:
                 key_names = [b["name"] for b in self._input_buttons if b.get("kind") == "key"]
-                if self._input_menu_bootstrap:
-                    key_names.extend(["SPACE", "ENTER", "ESC"])
                 key_names = list({str(k) for k in key_names if str(k).strip()})
                 self._input_backend = UInputBackend(keys=key_names)
                 print(f"[worker:{self.instance_id}] uinput backend enabled (focused window receives input)")
             except UInputError as e:
                 print(f"[worker:{self.instance_id}] uinput backend failed: {e}")
                 self._input_backend = None
-                self._input_menu_bootstrap = False
             return
         # libxdo backend (direct X11 input)
         if name == "libxdo":
             if LibXDoBackend is None:
                 print(f"[worker:{self.instance_id}] libxdo backend unavailable (missing dependency)")
-                self._input_menu_bootstrap = False
                 return
             try:
                 wait_s = float(os.environ.get("METABONK_INPUT_DISPLAY_WAIT_S", "5.0"))
@@ -4272,12 +3983,10 @@ class WorkerService:
                     ) from e
                 print(f"[worker:{self.instance_id}] libxdo backend failed: {e}")
                 self._input_backend = None
-                self._input_menu_bootstrap = False
             return
         # xdotool backend (per-display input)
         if XDoToolBackend is None:
             print(f"[worker:{self.instance_id}] xdotool backend unavailable (missing dependency)")
-            self._input_menu_bootstrap = False
             return
         try:
             display = os.environ.get("METABONK_INPUT_DISPLAY") or self.display
@@ -4310,7 +4019,6 @@ class WorkerService:
                 ) from e
             print(f"[worker:{self.instance_id}] xdotool backend failed: {e}")
             self._input_backend = None
-            self._input_menu_bootstrap = False
 
     def _init_metabonk2_controller(self) -> None:
         if not getattr(self, "_use_metabonk2", False) or self._metabonk2_controller is not None:
@@ -4327,148 +4035,6 @@ class WorkerService:
         except Exception:
             self._use_metabonk2 = False
             self._metabonk2_controller = None
-
-    def _input_should_bootstrap(self, menu_hint: Optional[bool], game_state: dict) -> bool:
-        if not self._input_backend or not self._input_menu_bootstrap:
-            return False
-        try:
-            if bool(game_state.get("isPlaying")):
-                # Some early startup prompts can report `isPlaying=true` even though the HUD/gameplay
-                # isn't active yet (e.g., photosensitivity warning). Only suppress bootstrapping once
-                # we have positive evidence of gameplay.
-                if bool(getattr(self, "_hud_present", False)) or bool(getattr(self, "_gameplay_started", False)):
-                    return False
-        except Exception:
-            pass
-        cm = str(game_state.get("currentMenu") or "").strip()
-        cm_l = cm.lower()
-        # Avoid bootstrapping during combat/play states.
-        if cm_l in ("combat", "none"):
-            return False
-        if menu_hint is True:
-            return True
-        if cm:
-            return True
-        # If we have no menu hint and no menu name, still attempt to advance prompts.
-        return True
-
-    def _run_menu_bootstrap(self, current_menu: str = "") -> None:
-        if not self._input_backend:
-            return
-        now = time.time()
-        if now < self._menu_bootstrap_next_ts:
-            return
-        cm = (current_menu or "").strip().lower()
-        if cm in ("loadingscreen", "loading"):
-            return
-        if cm and cm != (self._menu_bootstrap_last_menu or ""):
-            self._menu_bootstrap_step = 0
-            self._menu_bootstrap_last_menu = cm
-            try:
-                pause = float(os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_MENU_PAUSE", "1.0"))
-            except Exception:
-                pause = 1.0
-            self._menu_bootstrap_next_ts = now + max(0.1, pause)
-            return
-        if cm in ("generatedmap",):
-            steps = [
-                ("click_center", None),
-                ("click_at", (0.5, 0.85)),
-                ("click_at", (0.8, 0.85)),
-                ("key_tap", "ENTER"),
-                ("key_tap", "SPACE"),
-            ]
-        else:
-            steps = [
-                ("key_tap", "SPACE"),
-                ("key_tap", "ENTER"),
-                ("click_center", None),
-                ("click_at", (0.5, 0.85)),
-                ("key_tap", "ENTER"),
-            ]
-        kind, payload = steps[self._menu_bootstrap_step % len(steps)]
-        try:
-            if os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_DEBUG", "0") in ("1", "true", "True"):
-                print(f"[worker:{self.instance_id}] menu_bootstrap menu='{current_menu}' step={self._menu_bootstrap_step} action={kind} payload={payload}")
-        except Exception:
-            pass
-        try:
-            if kind == "key_tap":
-                self._input_backend.key_down(str(payload))
-                self._input_backend.key_up(str(payload))
-            elif kind == "mouse_move":
-                dx, dy = payload
-                self._input_backend.mouse_move(int(dx), int(dy))
-            elif kind == "mouse_click":
-                self._input_backend.mouse_button(str(payload), True)
-                self._input_backend.mouse_button(str(payload), False)
-            elif kind == "click_center":
-                try:
-                    clicker = getattr(self._input_backend, "click_center", None)
-                    if callable(clicker):
-                        clicker()
-                except Exception:
-                    pass
-            elif kind == "click_at":
-                try:
-                    clicker = getattr(self._input_backend, "click_at", None)
-                    if callable(clicker):
-                        x_frac, y_frac = payload
-                        clicker(float(x_frac), float(y_frac))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        self._menu_bootstrap_step += 1
-        try:
-            interval = float(os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_INTERVAL", "0.35"))
-        except Exception:
-            interval = 0.35
-        if cm in ("generatedmap",):
-            try:
-                interval = float(
-                    os.environ.get("METABONK_INPUT_MENU_BOOTSTRAP_INTERVAL_MAP", str(interval))
-                )
-            except Exception:
-                pass
-        self._menu_bootstrap_next_ts = now + max(0.1, interval)
-
-    def _input_send_menu_action(self, action: "MenuAction", frame_size: Optional[tuple[int, int]]) -> bool:
-        if not self._input_backend:
-            return False
-        try:
-            kind = str(getattr(action, "kind", "") or "").lower()
-        except Exception:
-            return False
-        if kind == "key":
-            try:
-                key = str(getattr(action, "key", "") or "").strip()
-                if key:
-                    self._input_backend.key_down(key)
-                    self._input_backend.key_up(key)
-                return True
-            except Exception:
-                return False
-        if kind == "click":
-            try:
-                tx = int(getattr(action, "x", 0))
-                ty = int(getattr(action, "y", 0))
-                if frame_size:
-                    w, h = frame_size
-                    if not self._input_cursor_pos:
-                        self._input_cursor_pos = (w // 2, h // 2)
-                    cx, cy = self._input_cursor_pos
-                    dx = int(tx - cx)
-                    dy = int(ty - cy)
-                    if dx or dy:
-                        self._input_backend.mouse_move(dx, dy)
-                    self._input_cursor_pos = (tx, ty)
-                self._input_backend.mouse_button("left", True)
-                self._input_backend.mouse_button("left", False)
-                return True
-            except Exception:
-                return False
-        return False
 
     def _input_send_actions(self, a_cont: List[float], a_disc: List[int]) -> None:
         if not self._input_backend:
@@ -4541,7 +4107,7 @@ class WorkerService:
         game_state: dict,
         detections: List[dict],
         frame_size: Optional[tuple[int, int]],
-        menu_hint: Optional[bool],
+        stuck: bool,
         now: float,
     ) -> dict:
         health: Optional[float] = None
@@ -4605,12 +4171,12 @@ class WorkerService:
         except Exception:
             ui_elements = []
 
-        # If we have no UI detections (common in early boot / menu screens), optionally
+        # If we have no UI detections (common in early boot / UI screens), optionally
         # attach OCR-derived UI candidates from the most recent full-res spectator frame.
         #
         # This remains vision-only (text is read from pixels) while avoiding hardcoded
         # menu scripts in the worker. System2 decides what to click based on the list.
-        if (not ui_elements) and bool(menu_hint):
+        if (not ui_elements) and bool(stuck):
             try:
                 ocr_enabled = str(
                     os.environ.get("METABONK_SYSTEM2_OCR_UI_ELEMENTS", "1" if self._pure_vision_mode else "0")
@@ -4734,6 +4300,25 @@ class WorkerService:
                     except Exception:
                         ui_elements = ui_elements
 
+        # Vision-only exploration context (pure signals, no scene labels).
+        scene_hash = None
+        visual_novelty = None
+        scenes_discovered = None
+        stuck_score = None
+        try:
+            ve = getattr(self, "_visual_exploration", None)
+            if ve is not None:
+                metrics = ve.metrics()
+                scene_hash = metrics.get("scene_hash")
+                visual_novelty = metrics.get("visual_novelty")
+                scenes_discovered = metrics.get("scenes_discovered")
+                stuck_score = metrics.get("stuck_score")
+        except Exception:
+            scene_hash = None
+            visual_novelty = None
+            scenes_discovered = None
+            stuck_score = None
+
         return {
             "instance_id": self.instance_id,
             "ts": float(now),
@@ -4744,7 +4329,12 @@ class WorkerService:
             "enemies_nearby": int(len(detections or [])),
             "frame_w": int(w),
             "frame_h": int(h),
-            "menu_hint": bool(menu_hint) if menu_hint is not None else None,
+            "gameplay_started": bool(getattr(self, "_gameplay_started", False)),
+            "stuck": bool(stuck),
+            "stuck_score": stuck_score,
+            "visual_novelty": visual_novelty,
+            "scene_hash": scene_hash,
+            "scenes_discovered": scenes_discovered,
             "ui_elements": ui_elements,
         }
 
@@ -5080,9 +4670,9 @@ class WorkerService:
             except Exception:
                 max_clients = 1
             ok_ttl = float(os.environ.get("METABONK_STREAM_OK_TTL_S", "10.0"))
-            stream_ok = bool((last > 0 and (now - last) <= ok_ttl) or (enc_last > 0 and (now - enc_last) <= ok_ttl))
+            stream_ok_age = bool((last > 0 and (now - last) <= ok_ttl) or (enc_last > 0 and (now - enc_last) <= ok_ttl))
             last_any = max(last, enc_last)
-            # Optional black-frame watchdog (uses cached JPEG, so no extra capture cost).
+            # Optional stream-quality watchdog (uses cached JPEG, so no extra capture cost).
             try:
                 black_var = float(os.environ.get("METABONK_STREAM_BLACK_VAR", "1.0"))
             except Exception:
@@ -5095,15 +4685,47 @@ class WorkerService:
                 black_check_s = float(os.environ.get("METABONK_STREAM_BLACKCHECK_S", "5.0"))
             except Exception:
                 black_check_s = 5.0
-            if black_var > 0 and black_s > 0 and black_check_s > 0 and (now - self._last_frame_var_ts) >= black_check_s:
+            try:
+                frozen_diff = float(os.environ.get("METABONK_STREAM_FROZEN_DIFF", "1.0"))
+            except Exception:
+                frozen_diff = 1.0
+            try:
+                frozen_s = float(os.environ.get("METABONK_STREAM_FROZEN_S", "8.0"))
+            except Exception:
+                frozen_s = 8.0
+            try:
+                frozen_check_s = float(os.environ.get("METABONK_STREAM_FROZENCHECK_S", str(black_check_s)))
+            except Exception:
+                frozen_check_s = black_check_s
+            quality_intervals = []
+            if black_var > 0 and black_s > 0 and black_check_s > 0:
+                quality_intervals.append(float(black_check_s))
+            if frozen_diff > 0 and frozen_s > 0 and frozen_check_s > 0:
+                quality_intervals.append(float(frozen_check_s))
+            quality_check_s = min(quality_intervals) if quality_intervals else 0.0
+            if quality_check_s > 0 and (now - self._last_frame_var_ts) >= quality_check_s:
                 self._last_frame_var_ts = now
-                var = jpeg_luma_variance(self._latest_jpeg_bytes or b"")
+                thumb = jpeg_luma_thumbnail(self._latest_jpeg_bytes or b"")
+                var = float(thumb.var()) if thumb is not None else None
+                diff = luma_mean_abs_diff(thumb, self._last_frame_luma) if thumb is not None else None
                 self._last_frame_var = var
-                if var is not None and var <= black_var:
+                self._last_frame_luma_diff = diff
+                self._last_frame_luma = thumb
+
+                if black_var > 0 and black_s > 0 and var is not None and var <= black_var:
                     if self._black_frame_since <= 0:
                         self._black_frame_since = now
                 else:
                     self._black_frame_since = 0.0
+
+                if frozen_diff > 0 and frozen_s > 0 and diff is not None and diff <= frozen_diff:
+                    if self._frozen_frame_since <= 0:
+                        self._frozen_frame_since = now
+                else:
+                    self._frozen_frame_since = 0.0
+
+            quality_ok = bool(self._black_frame_since <= 0 and self._frozen_frame_since <= 0)
+            stream_ok = bool(stream_ok_age and quality_ok)
             if stream_ok:
                 self._last_stream_ok_ts = now
             heal_s = float(os.environ.get("METABONK_STREAM_SELF_HEAL_S", "20.0"))
@@ -5128,6 +4750,15 @@ class WorkerService:
                     and (now - self._last_stream_ok_ts) >= black_s
                 ):
                     reason = f"stream black frames (var={self._last_frame_var})"
+                    should_heal = True
+                elif (
+                    frozen_diff > 0
+                    and frozen_s > 0
+                    and self._frozen_frame_since > 0
+                    and (now - self._frozen_frame_since) >= frozen_s
+                    and (now - self._last_stream_ok_ts) >= frozen_s
+                ):
+                    reason = f"stream frozen frames (diff={self._last_frame_luma_diff})"
                     should_heal = True
                 # Never tear down/recreate the streamer while a client is actively consuming it.
                 # Doing so causes visible "cut out" flapping for the UI and can fight go2rtc/FIFO readers.
@@ -5185,6 +4816,13 @@ class WorkerService:
                 self._last_step_seen = step_now
                 self._last_step_ts = now
             step_age_s = (now - self._last_step_ts) if self._last_step_ts > 0 else None
+            stuck_score = None
+            try:
+                ve = getattr(self, "_visual_exploration", None)
+                if ve is not None and hasattr(ve, "stuck_score"):
+                    stuck_score = float(ve.stuck_score())
+            except Exception:
+                stuck_score = None
 
             # Memory telemetry (best-effort; do not fail the heartbeat on /proc parsing issues).
             def _kb_from_status(pid: int) -> tuple[Optional[float], Optional[float]]:
@@ -5279,6 +4917,8 @@ class WorkerService:
                 stream_keyframe_count=stream_keyframe_count,
                 stream_frame_var=self._last_frame_var,
                 stream_black_since_s=(now - self._black_frame_since) if self._black_frame_since > 0 else None,
+                stream_frame_diff=self._last_frame_luma_diff,
+                stream_frozen_since_s=(now - self._frozen_frame_since) if self._frozen_frame_since > 0 else None,
                 fifo_stream_enabled=bool(getattr(self, "_fifo_stream_enabled", False)),
                 fifo_stream_path=getattr(self, "_fifo_stream_path", None),
                 fifo_stream_last_error=(self._fifo_publisher.last_error() if self._fifo_publisher is not None else None),
@@ -5311,7 +4951,7 @@ class WorkerService:
                 obs_fps=self._obs_fps,
                 action_entropy=action_entropy,
                 bonk_confidence=bonk_confidence,
-                menu_doom_spiral=float(self._menu_doom_score),
+                stuck_score=stuck_score,
                 rss_mb=_mb(rss_kb),
                 vms_mb=_mb(vms_kb),
                 launcher_rss_mb=_mb(launcher_rss_kb),
@@ -5504,7 +5144,6 @@ class WorkerService:
             forced_ui_click: Optional[tuple[int, int]] = None
             suppress_policy_clicks: bool = False
             sima2_action: Optional[List[float]] = None
-            menu_override_action: Optional["MenuAction"] = None
 
             # ResearchPlugin shared memory path (highest priority if enabled).
             if self._use_research_shm and self._research_shm is not None:
@@ -5927,11 +5566,11 @@ class WorkerService:
             if latest_image_bytes is not None:
                 self._set_latest_jpeg(latest_image_bytes)
             elif (
-                str(os.environ.get("METABONK_MENU_SNAPSHOT_FALLBACK", "1")).lower() in ("1", "true", "yes")
+                str(os.environ.get("METABONK_FRAME_SNAPSHOT_FALLBACK", "1")).lower() in ("1", "true", "yes")
                 and self.streamer is not None
                 and hasattr(self.streamer, "capture_jpeg")
             ):
-                # Best-effort snapshot for menu reasoning when no live frames are available.
+                # Best-effort snapshot when no live frames are available.
                 try:
                     snap = self.streamer.capture_jpeg(
                         timeout_s=float(os.environ.get("METABONK_FRAME_JPEG_TIMEOUT_S", "1.5"))
@@ -5971,6 +5610,41 @@ class WorkerService:
                 except Exception:
                     pass
 
+            # Vision-only intrinsic exploration signals (game-agnostic).
+            # These are used to (a) provide reward in pure-vision mode and (b) increase
+            # exploration pressure when the screen is static ("stuck"), without any menu/UI
+            # semantics.
+            stuck = False
+            if self._visual_exploration is not None:
+                try:
+                    interval_s = float(getattr(self, "_visual_exploration_interval_s", 0.0) or 0.0)
+                except Exception:
+                    interval_s = 0.0
+                should_update = interval_s <= 0.0 or (now - float(self._visual_exploration_last_update_ts or 0.0)) >= interval_s
+                if should_update:
+                    frame_for_exploration = reward_frame_hwc
+                    if frame_for_exploration is None and latest_image_bytes is not None:
+                        # Fallback decode when only JPEG bytes are available.
+                        try:
+                            import io
+                            import numpy as np
+                            from PIL import Image
+
+                            img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
+                            frame_for_exploration = np.asarray(img)
+                        except Exception:
+                            frame_for_exploration = None
+                    if frame_for_exploration is not None:
+                        try:
+                            self._visual_exploration_last_update_ts = float(now)
+                            self._visual_exploration.update(frame_for_exploration)
+                        except Exception:
+                            pass
+                try:
+                    stuck = bool(self._visual_exploration.is_stuck())
+                except Exception:
+                    stuck = False
+
             hud_rise = False
             prev_hud = bool(self._hud_present)
             hud_present = self._hud_present
@@ -5996,7 +5670,7 @@ class WorkerService:
                 self._update_hud_state(bool(hud_present))
                 hud_rise = (not prev_hud) and bool(self._hud_present)
                 phase = "gameplay" if self._hud_present else "lobby"
-                if self._menu_log and phase != self._hud_last_phase:
+                if self._hud_phase_log and phase != self._hud_last_phase:
                     print(
                         f"[HUD] instance={self.instance_id} phase={phase} hud={self._hud_present}",
                         flush=True,
@@ -6040,44 +5714,7 @@ class WorkerService:
             self._phase_effective_label = phase_effective_label
             self._phase_effective_source = phase_effective_source
 
-            menu_hint: Optional[bool] = None
-            if isinstance(vision_metrics, dict):
-                try:
-                    if vision_metrics.get("menu_mode") is not None:
-                        menu_hint = bool(vision_metrics.get("menu_mode"))
-                except Exception:
-                    pass
-            if menu_hint is None:
-                try:
-                    cm = str(game_state.get("currentMenu") or "").strip().lower()
-                    if cm and cm not in ("none", "combat", ""):
-                        menu_hint = True
-                    elif game_state.get("levelUpOptions"):
-                        menu_hint = True
-                    elif game_state.get("isPlaying") is True:
-                        menu_hint = False
-                    elif cm in ("none", "combat"):
-                        menu_hint = False
-                except Exception:
-                    pass
-            if str(os.environ.get("METABONK_MENU_FORCE", "0")).lower() in ("1", "true", "yes"):
-                menu_hint = True
-            if self._hud_present:
-                menu_hint = False
-            if phase_confident:
-                if phase_label == "gameplay":
-                    menu_hint = False
-                elif phase_menu:
-                    menu_hint = True
-                elif phase_block:
-                    menu_hint = False
-            elif gameplay_now:
-                menu_hint = False
-            if menu_hint is None:
-                # Safety net: during early startup the game state / vision metrics may not yet
-                # be populated. Treat non-gameplay as "menu-like" so menu automation can
-                # advance prompts (e.g., photosensitivity warning) instead of deadlocking.
-                menu_hint = bool((not gameplay_now) and (not self._gameplay_started))
+            # Pure vision: no menu heuristics (no scene/UI taxonomy).
             if gameplay_now and self._hud_pulse_log_s > 0.0:
                 if (now - self._hud_pulse_last_ts) >= float(self._hud_pulse_log_s):
                     try:
@@ -6107,121 +5744,20 @@ class WorkerService:
                         pass
                     self._hud_pulse_last_ts = now
 
-            weak_label = self._weak_phase_label(menu_hint, game_state)
+            weak_label = self._weak_phase_label(game_state)
             dataset_label = self._phase_dataset_label_override(
                 now=now,
                 base_label=weak_label,
-                menu_hint=menu_hint,
                 game_state=game_state,
                 gameplay_now=gameplay_now,
             )
-            self._maybe_dump_phase_sample(now=now, label=dataset_label, menu_hint=menu_hint, game_state=game_state)
-
-            # If we recently attempted click_play, only arm "loading" once we observe a real transition.
-            if self._menu_teacher_play_pending and latest_image_bytes is not None:
-                var = jpeg_luma_variance(latest_image_bytes)
-                stats = self._frame_stats_from_bytes(latest_image_bytes)
-                transitioned = False
-                if stats and self._frame_is_black(stats):
-                    transitioned = True
-                if (not transitioned) and (var is not None) and (self._menu_teacher_play_ref_var is not None):
-                    if abs(float(var) - float(self._menu_teacher_play_ref_var)) >= float(
-                        self._menu_teacher_play_transition_var_delta
-                    ):
-                        transitioned = True
-                if transitioned:
-                    self._arm_loading_window(now=now)
-                    self._menu_teacher_play_pending = False
-                    self._menu_teacher_play_pending_deadline = 0.0
-                    self._menu_teacher_play_ref_var = None
-                elif now >= float(self._menu_teacher_play_pending_deadline):
-                    self._menu_teacher_play_pending = False
-                    self._menu_teacher_play_pending_deadline = 0.0
-                    self._menu_teacher_play_ref_var = None
-
-            # Explicit menu-change logging for debug.
-            if self._menu_log:
-                try:
-                    raw_menu = str(game_state.get("currentMenu") or "")
-                except Exception:
-                    raw_menu = ""
-                norm_menu = raw_menu.strip().lower()
-                prev_raw = self._last_menu_raw or ""
-                should_log = False
-                if raw_menu != prev_raw:
-                    should_log = True
-                elif (now - self._last_menu_log_ts) >= 1.0:
-                    should_log = True
-                if should_log and (raw_menu or prev_raw):
-                    try:
-                        playing_flag = bool(game_state.get("isPlaying"))
-                    except Exception:
-                        playing_flag = False
-                    if self._last_state_ts > 0:
-                        age_ms = int(max(0.0, (now - self._last_state_ts) * 1000.0))
-                    else:
-                        age_ms = -1
-                    print(
-                        f"[MENU] instance={self.instance_id} raw='{raw_menu}' norm='{norm_menu}' "
-                        f"prev='{prev_raw}' playing={playing_flag} seen_main={self._menu_seen_main} "
-                        f"menu_start_bonus={self._menu_start_bonus:.2f} age_ms={age_ms}"
-                    )
-                    self._last_menu_log_ts = now
-                self._last_menu_raw = raw_menu
+            self._maybe_dump_phase_sample(now=now, label=dataset_label, game_state=game_state)
 
             self._update_gameplay_state(
-                menu_hint,
                 game_state,
                 hud_present=self._hud_present,
                 phase_gameplay=gameplay_now,
             )
-            self._update_menu_doom(menu_hint)
-
-            if menu_hint is not None and menu_hint != self._last_menu_mode_log:
-                try:
-                    cm_dbg = str(game_state.get("currentMenu") or "")
-                except Exception:
-                    cm_dbg = ""
-                print(f"[worker:{self.instance_id}] menu_mode={menu_hint} currentMenu='{cm_dbg}'")
-                self._last_menu_mode_log = menu_hint
-
-            menu_override_active = False
-            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_START
-            if (
-                not self._gameplay_started
-                and self._switching_controller is not None
-                and menu_hint
-                and latest_image_bytes is not None
-            ):
-                try:
-                    import io
-                    from PIL import Image
-
-                    img = Image.open(io.BytesIO(latest_image_bytes)).convert("RGB")
-                    menu_override_action = self._switching_controller.step(
-                        img,
-                        bool(menu_hint),
-                        detections=detections,
-                        hint=str(game_state.get("currentMenu") or ""),
-                    )
-                except Exception:
-                    menu_override_action = None
-                if menu_override_action is not None:
-                    suppress_policy_clicks = True
-                    if self._input_backend is not None:
-                        menu_override_active = self._input_send_menu_action(
-                            menu_override_action,
-                            frame_size,
-                        )
-                    elif str(getattr(menu_override_action, "kind", "")) == "click":
-                        try:
-                            forced_ui_click = (
-                                int(menu_override_action.x),
-                                int(menu_override_action.y),
-                            )
-                        except Exception:
-                            forced_ui_click = None
-            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END
 
             pixel_tensor = None
             pixel_frame_id = None
@@ -6275,7 +5811,7 @@ class WorkerService:
             # Optional System 2/3 centralized VLM loop (non-blocking).
             if self._cognitive_client is not None:
                 try:
-                    # System2/VLM needs readable frames for menus. BonkLink/PipeWire snapshots
+                    # System2/VLM needs readable frames for UI flows. BonkLink/PipeWire snapshots
                     # can be low-res (and Synthetic Eye often has higher-res spectator frames).
                     #
                     # Throttle frame ingestion to avoid 60Hz CPU encode/decode overhead.
@@ -6423,7 +5959,7 @@ class WorkerService:
                             game_state=game_state,
                             detections=detections,
                             frame_size=frame_size,
-                            menu_hint=menu_hint,
+                            stuck=stuck,
                             now=now,
                         )
                         req = self._cognitive_client.request_strategy(agent_state=agent_state)
@@ -6435,10 +5971,43 @@ class WorkerService:
             ui_elements_cache = None
             action_mask_cache = None
             try:
-                from .perception import parse_detections, build_ui_candidates, build_grid_ui_elements
+                from .perception import (
+                    build_grid_ui_elements,
+                    build_saliency_ui_elements,
+                    build_ui_elements,
+                    parse_detections,
+                )
 
-                if bool(getattr(self, "_pixel_obs_enabled", False)) and not detections:
-                    rows, cols = self._parse_grid_spec(str(getattr(self, "_pixel_ui_grid", "")))
+                ui_mode = str(os.environ.get("METABONK_UI_CANDIDATES_MODE", "") or "").strip().lower()
+                if not ui_mode:
+                    ui_mode = "saliency" if bool(getattr(self, "_pure_vision_mode", False)) else "detections"
+
+                # UI candidate grids: default to 8x4 to match the fixed 32-slot UI branch
+                # without discarding half the screen by truncation.
+                rows, cols = self._parse_grid_spec(
+                    str(getattr(self, "_pixel_ui_grid", "")),
+                    default_rows=8,
+                    default_cols=4,
+                )
+
+                if ui_mode in ("saliency", "attention"):
+                    # Game-agnostic: derive click candidates from pixel saliency (no class taxonomy).
+                    if reward_frame_hwc is not None and frame_size is not None:
+                        ui_elements_cache, action_mask_cache = build_saliency_ui_elements(
+                            reward_frame_hwc,
+                            frame_size,
+                            max_elements=32,
+                            grid_rows=rows,
+                            grid_cols=cols,
+                        )
+                    else:
+                        ui_elements_cache, action_mask_cache = build_grid_ui_elements(
+                            frame_size,
+                            max_elements=32,
+                            rows=rows,
+                            cols=cols,
+                        )
+                elif bool(getattr(self, "_pixel_obs_enabled", False)) and not detections:
                     ui_elements_cache, action_mask_cache = build_grid_ui_elements(
                         frame_size,
                         max_elements=32,
@@ -6447,11 +6016,28 @@ class WorkerService:
                     )
                 else:
                     dets_parsed = parse_detections(detections)
-                    ui_elements_cache, action_mask_cache, _ = build_ui_candidates(
+                    ui_elements_cache, action_mask_cache, _ = build_ui_elements(
                         dets_parsed,
                         frame_size=frame_size,
-                        menu_hint=menu_hint,
                     )
+                    # If the detector produced no clickable candidates, fall back to saliency
+                    # so the discrete click branch can still explore.
+                    try:
+                        if (
+                            reward_frame_hwc is not None
+                            and frame_size is not None
+                            and action_mask_cache is not None
+                            and sum(1 for m in action_mask_cache[:-1] if int(m) == 1) <= 0
+                        ):
+                            ui_elements_cache, action_mask_cache = build_saliency_ui_elements(
+                                reward_frame_hwc,
+                                frame_size,
+                                max_elements=32,
+                                grid_rows=rows,
+                                grid_cols=cols,
+                            )
+                    except Exception:
+                        pass
             except Exception:
                 ui_elements_cache = None
                 action_mask_cache = None
@@ -6461,7 +6047,6 @@ class WorkerService:
                 obs_dim=self._obs_dim_raw,
                 pixel_tensor=pixel_tensor,
                 frame_size=frame_size,
-                menu_hint=menu_hint,
                 ui_override=ui_elements_cache,
                 action_mask_override=action_mask_cache,
             )
@@ -6594,130 +6179,64 @@ class WorkerService:
                 except Exception:
                     sima2_action = None
 
-            # Optional menu exploration: epsilon-greedy clicks when stuck in menus.
-            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_START
-            if (not self._gameplay_started) and menu_hint and action_mask and self._input_backend is None:
+            # Optional UI exploration: epsilon-greedy UI clicks when the screen has been static
+            # for a long time ("stuck"). This is game-agnostic: no scene/menu labels, just
+            # "change the screen" exploration pressure.
+            if (
+                bool(stuck)
+                and action_mask
+                and self._input_backend is None
+                and (forced_ui_click is None)
+                and (not suppress_policy_clicks)
+            ):
                 try:
-                    eps = float(os.environ.get("METABONK_MENU_EPS", "0") or 0.0)
+                    eps = float(str(os.environ.get("METABONK_UI_EPS", "0") or "0").strip() or 0.0)
                 except Exception:
                     eps = 0.0
+                if eps <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)):
+                    eps = 0.5
                 if eps > 0.0 and random.random() < eps:
                     try:
-                        valid = [i for i, m in enumerate(action_mask[:-1]) if m == 1]
-                        if valid:
+                        valid = [i for i, m in enumerate(action_mask[:-1]) if int(m) == 1]
+                        if valid and a_disc:
                             a_disc[0] = int(random.choice(valid))
                     except Exception:
                         pass
 
-            # Optional Lobby Agent override for menus/level-up screens.
-            if (
-                (not self._gameplay_started)
-                and self._use_vlm_menu
-                and self._vlm_menu is not None
-                and latest_image_bytes is not None
-                and frame_size is not None
-                and self._input_backend is None
-            ):
-                menu_mode = False
-                if isinstance(vision_metrics, dict):
-                    try:
-                        if vision_metrics.get("menu_mode") is not None:
-                            menu_mode = bool(vision_metrics.get("menu_mode"))
-                    except Exception:
-                        pass
-                try:
-                    cm = game_state.get("currentMenu")
-                    if isinstance(cm, str) and cm.lower() not in ("none", "combat", ""):
-                        menu_mode = True
-                    if game_state.get("levelUpOptions"):
-                        menu_mode = True
-                except Exception:
-                    pass
-                if not menu_mode:
-                    try:
-                        from .perception import parse_detections, derive_state_onehot
-
-                        st = derive_state_onehot(parse_detections(detections))
-                        if (len(st) > 0 and st[0] == 1.0) or (len(st) > 2 and st[2] == 1.0):
-                            menu_mode = True
-                    except Exception:
-                        pass
-
-                if menu_mode:
-                    suppress_policy_clicks = True
-                    try:
-                        hint = str(game_state.get("currentMenu") or "")
-                        act = self._vlm_menu.infer_action(
-                            latest_image_bytes, self._vlm_menu_goal, hint
-                        )
-                        kind = act.get("action")
-                        if kind == "click_xy":
-                            forced_ui_click = (
-                                int(act.get("x", 0)),
-                                int(act.get("y", 0)),
-                            )
-                        elif kind == "click":
-                            target = str(act.get("target_text", "")).strip().lower()
-                            try:
-                                from .perception import (
-                                    parse_detections,
-                                    build_ui_elements,
-                                    CLASS_NAMES,
-                                )
-
-                                dets_parsed = parse_detections(detections)
-                                ui_elements, mask2, _ = build_ui_elements(
-                                    dets_parsed, frame_size=frame_size
-                                )
-                                best_idx = None
-                                for i, ui in enumerate(ui_elements):
-                                    if mask2[i] != 1:
-                                        continue
-                                    cls = int(ui[4])
-                                    cname = CLASS_NAMES.get(cls, "").replace("_", " ")
-                                    if target and target in cname:
-                                        best_idx = i
-                                        break
-                                if best_idx is None:
-                                    for i, ui in enumerate(ui_elements):
-                                        if mask2[i] != 1:
-                                            continue
-                                        cls = int(ui[4])
-                                        cname = CLASS_NAMES.get(cls, "").replace("_", " ")
-                                        if any(tok in target for tok in cname.split()):
-                                            best_idx = i
-                                            break
-                                if best_idx is None:
-                                    for i in range(len(ui_elements)):
-                                        if mask2[i] == 1:
-                                            best_idx = i
-                                            break
-                                if best_idx is not None:
-                                    w, h = frame_size
-                                    forced_ui_click = (
-                                        int(ui_elements[best_idx][0] * w),
-                                        int(ui_elements[best_idx][1] * h),
-                                    )
-                            except Exception:
-                                forced_ui_click = None
-                    except Exception:
-                        forced_ui_click = None
-
-            # Optional System 2 (centralized VLM) menu directive -> UI click via BonkLink/UnityBridge.
-            # This keeps menu progression vision-only (no game state) while allowing the agent to
-            # use the VLM to target visible buttons (Confirm/Continue/etc.).
+            # Optional System 2 (centralized VLM) directive -> UI click via BonkLink/UnityBridge.
+            # This keeps progression vision-only (no game state) while allowing System2 to target
+            # visible affordances.
             if (
                 forced_ui_click is None
                 and self._cognitive_client is not None
                 and frame_size is not None
                 and self._input_backend is None
-                and (menu_hint or not self._gameplay_started)
+                and (bool(stuck) or not self._gameplay_started)
             ):
                 try:
                     directive = getattr(self, "_system2_last_response", None)
                     if isinstance(directive, dict) and directive:
-                        data = directive.get("directive") or {}
-                        act = str(data.get("action") or "").strip().lower()
+                        conf_min = None
+                        try:
+                            raw = str(os.environ.get("METABONK_SYSTEM2_CLICK_CONF_MIN", "") or "").strip()
+                            if raw:
+                                conf_min = float(raw)
+                        except Exception:
+                            conf_min = None
+                        if conf_min is None:
+                            conf_min = 0.5 if bool(getattr(self, "_pure_vision_mode", False)) else 0.0
+                        try:
+                            conf_f = float(directive.get("confidence") or 0.0)
+                        except Exception:
+                            conf_f = 0.0
+                        if conf_f < float(conf_min):
+                            data = None
+                        else:
+                            data = directive.get("directive") or {}
+                        if isinstance(data, dict):
+                            act = str(data.get("action") or "").strip().lower()
+                        else:
+                            act = ""
                         if act in ("interact", "click", "confirm", "select"):
                             target = data.get("target")
                             if isinstance(target, (list, tuple)) and len(target) >= 2:
@@ -6751,7 +6270,7 @@ class WorkerService:
                                         ocr_fallback = False
                                     if (
                                         ocr_fallback
-                                        and menu_hint
+                                        and bool(stuck)
                                         and (abs(float(tx) - 0.5) <= 0.12)
                                         and (abs(float(ty) - 0.5) <= 0.12)
                                     ):
@@ -6808,14 +6327,18 @@ class WorkerService:
                                         except Exception:
                                             pass
                                     last_resp_ts = float(getattr(self, "_system2_last_response_ts", 0.0) or 0.0)
-                                    last_click_resp = float(getattr(self, "_system2_last_menu_click_resp_ts", 0.0) or 0.0)
-                                    last_click_ts = float(getattr(self, "_system2_last_menu_click_ts", 0.0) or 0.0)
-                                    cooldown_s = float(getattr(self, "_system2_menu_click_cooldown_s", 1.0) or 1.0)
+                                    last_click_resp = float(getattr(self, "_system2_last_ui_click_resp_ts", 0.0) or 0.0)
+                                    last_click_ts = float(getattr(self, "_system2_last_ui_click_ts", 0.0) or 0.0)
+                                    cooldown_s = float(getattr(self, "_system2_ui_click_cooldown_s", 1.0) or 1.0)
                                     if last_resp_ts > 0 and last_resp_ts > last_click_resp and (now - last_click_ts) >= cooldown_s:
                                         forced_ui_click = (int(x), int(y))
                                         suppress_policy_clicks = True
-                                        self._system2_last_menu_click_ts = float(now)
-                                        self._system2_last_menu_click_resp_ts = float(last_resp_ts)
+                                        self._system2_last_ui_click_ts = float(now)
+                                        self._system2_last_ui_click_resp_ts = float(last_resp_ts)
+                                        try:
+                                            self._vlm_hints_used = int(getattr(self, "_vlm_hints_used", 0) or 0) + 1
+                                        except Exception:
+                                            self._vlm_hints_used = 1
                                         action_source = f"{action_source}+system2_click" if action_source else "system2_click"
                 except Exception:
                     pass
@@ -6825,7 +6348,7 @@ class WorkerService:
                 self._cognitive_client is not None
                 and self._system2_override_cont
                 and frame_size is not None
-                and not menu_hint
+                and bool(self._gameplay_started)
             ):
                 try:
                     directive = self._cognitive_client.get_current_directive()
@@ -6860,250 +6383,11 @@ class WorkerService:
                         )
 
             input_bootstrap = False
-            teacher_action_idx = None
-            teacher_action_kind = None
-            cur_menu = ""
-            playing_flag = False
-            in_menu = False
-            if self._input_backend and self._menu_bias_indices:
-                try:
-                    cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
-                except Exception:
-                    cur_menu = ""
-                try:
-                    playing_flag = bool(game_state.get("isPlaying"))
-                except Exception:
-                    playing_flag = False
-                if gameplay_now or phase_block:
-                    if gameplay_now:
-                        playing_flag = True
-                    in_menu = False
-                else:
-                    in_menu = bool(menu_hint) or (cur_menu not in ("", "none", "combat")) or (not playing_flag)
-                if cur_menu and cur_menu != (self._last_menu_name or ""):
-                    self._menu_state_since_ts = now
-                    self._last_menu_name = cur_menu
-                elif cur_menu and self._menu_state_since_ts <= 0.0:
-                    self._menu_state_since_ts = now
-            if (
-                self._input_backend
-                and (not menu_override_active)
-                and self._menu_teacher_enabled
-                and self._menu_teacher is not None
-                and self._menu_bias_indices
-                and in_menu
-            ):
-                menu_key = cur_menu or str(game_state.get("currentMenu") or "")
-                menu_elapsed = 0.0
-                if menu_key:
-                    menu_elapsed = max(0.0, float(now - float(self._menu_state_since_ts or now)))
-                if self._menu_teacher.step(now, in_menu=in_menu, menu_key=menu_key):
-                    clicked = False
-                    in_lobby = menu_key in ("generatedmap", "mapselect", "mapselection")
-                    in_main_menu = (not in_lobby) and (not gameplay_now) and (not phase_block) and (
-                        menu_key in ("mainmenu", "bootscene", "") or (menu_hint and not playing_flag)
-                    )
-                    if (
-                        in_main_menu
-                        and self._input_backend
-                        and latest_image_bytes is not None
-                        and frame_size is not None
-                        and hasattr(self._input_backend, "click_at")
-                    ):
-                        candidates: Optional[List[tuple[int, int, int, int, float]]] = None
-                        roi_box: Optional[tuple[int, int, int, int]] = None
-                        chosen: Optional[tuple[float, float]] = None
-                        play_mode = "template"
-                        score = 0.0
-                        match = self._match_play_template(latest_image_bytes)
-                        if match:
-                            score, cx, cy = match
-                            chosen = (cx, cy)
-                        else:
-                            play_mode = "rect"
-                            rect_match = self._find_play_button_rect(latest_image_bytes)
-                            if rect_match:
-                                score, cx, cy, candidates, roi_box = rect_match
-                                chosen = (cx, cy)
-                            else:
-                                play_mode = "fallback"
-                                if self._menu_teacher_play_fallback:
-                                    idx = self._menu_teacher.pick_action_index(
-                                        list(range(len(self._menu_teacher_play_fallback))),
-                                        self._menu_teacher_cycle_k,
-                                    )
-                                    if idx is not None:
-                                        fx, fy = self._menu_teacher_play_fallback[idx]
-                                        chosen = (fx * frame_size[0], fy * frame_size[1])
-                        self._teacher_debug_dump(
-                            now=now,
-                            payload=latest_image_bytes,
-                            mode=f"click_play:{play_mode} score={score:.3f}",
-                            roi=roi_box,
-                            candidates=candidates,
-                            chosen=chosen,
-                        )
-                        if chosen is not None:
-                            try:
-                                fx = float(chosen[0]) / float(frame_size[0])
-                                fy = float(chosen[1]) / float(frame_size[1])
-                            except Exception:
-                                fx = fy = None
-                            if fx is not None and fy is not None:
-                                try:
-                                    self._maybe_dump_phase_sample(
-                                        now=now,
-                                        label="main_menu",
-                                        menu_hint=menu_hint,
-                                        game_state=game_state,
-                                        force=True,
-                                    )
-                                    self._input_backend.click_at(fx, fy)
-                                    clicked = True
-                                    teacher_action_kind = f"click_play:{play_mode}"
-                                    # Only label as loading once we observe a real transition (prevents poison on missed clicks).
-                                    self._menu_teacher_play_pending = True
-                                    self._menu_teacher_play_pending_deadline = float(
-                                        now + max(0.0, float(self._menu_teacher_play_transition_s))
-                                    )
-                                    self._menu_teacher_play_ref_var = jpeg_luma_variance(latest_image_bytes)
-                                    self._menu_teacher.record_intervention(now)
-                                    if self._menu_teacher.should_log_intervention():
-                                        print(
-                                            f"[TEACHER] Stalled in {menu_key or 'menu'}; "
-                                            f"click_play mode={play_mode} score={score:.3f} x={fx:.3f} y={fy:.3f}",
-                                            flush=True,
-                                        )
-                                except Exception:
-                                    clicked = False
-                    if (
-                        (not clicked)
-                        and self._menu_teacher_confirm_enabled
-                        and latest_image_bytes is not None
-                        and frame_size is not None
-                        and hasattr(self._input_backend, "click_at")
-                    ):
-                        match = self._match_confirm_template(latest_image_bytes)
-                        if not match:
-                            rect = self._find_confirm_button_rect(latest_image_bytes)
-                            if rect is not None:
-                                score, cx, cy, _, _ = rect
-                                match = (score, cx, cy)
-                        if not match:
-                            self._menu_teacher_confirm_pending = False
-                            self._menu_teacher_confirm_wait_until_ts = 0.0
-                        else:
-                            score, cx, cy = match
-                            # First time we see a confirm affordance: label the linger window as map_select.
-                            if not self._menu_teacher_confirm_pending:
-                                self._menu_teacher_confirm_pending = True
-                                self._menu_teacher_confirm_wait_until_ts = float(
-                                    now + float(self._menu_teacher_lobby_linger_s)
-                                )
-                                self._set_phase_dataset_forced_label(
-                                    "map_select",
-                                    now=now,
-                                    duration_s=float(self._menu_teacher_lobby_linger_s),
-                                )
-                                if self._menu_teacher.should_log_intervention():
-                                    print(
-                                        f"[TEACHER] Confirm visible in {menu_key or 'menu'}; "
-                                        f"linger {self._menu_teacher_lobby_linger_s:.1f}s score={score:.3f}",
-                                        flush=True,
-                                    )
-                            if now < float(self._menu_teacher_confirm_wait_until_ts):
-                                clicked = False
-                            else:
-                                try:
-                                    fx = float(cx) / float(frame_size[0])
-                                    fy = float(cy) / float(frame_size[1])
-                                except Exception:
-                                    fx = fy = None
-                                if fx is not None and fy is not None:
-                                    try:
-                                        self._maybe_dump_phase_sample(
-                                            now=now,
-                                            label="map_select",
-                                            menu_hint=menu_hint,
-                                            game_state=game_state,
-                                            force=True,
-                                        )
-                                        self._input_backend.click_at(fx, fy)
-                                        self._arm_loading_window(now=now)
-                                        clicked = True
-                                        teacher_action_kind = "click_confirm"
-                                        self._menu_teacher_confirm_pending = False
-                                        self._menu_teacher_confirm_wait_until_ts = 0.0
-                                        self._menu_teacher.record_intervention(now)
-                                        if self._menu_teacher.should_log_intervention():
-                                            print(
-                                                f"[TEACHER] Stalled in {menu_key or 'menu'}; "
-                                                f"click_confirm score={score:.3f} x={fx:.3f} y={fy:.3f}",
-                                                flush=True,
-                                            )
-                                    except Exception:
-                                        clicked = False
-                    if not clicked:
-                        teacher_action_idx = self._menu_teacher.pick_action_index(
-                            self._menu_bias_indices, self._menu_teacher_cycle_k
-                        )
-                        if teacher_action_idx is not None and teacher_action_idx < len(a_disc):
-                            a_disc[teacher_action_idx] = 1
-                            teacher_action_kind = f"key:{teacher_action_idx}"
-                            self._menu_teacher.record_intervention(now)
-                            if self._menu_teacher.should_log_intervention():
-                                print(
-                                    f"[TEACHER] Stalled in {menu_key or 'menu'}; injecting idx={teacher_action_idx}",
-                                    flush=True,
-                                )
-                    # If we still didn't click anything, try a generic confirm in menus (game-agnostic).
-                    if (not clicked) and teacher_action_idx is None and hasattr(self._input_backend, "key_down"):
-                        try:
-                            self._input_backend.key_down("Return")
-                            time.sleep(0.06)
-                            self._input_backend.key_up("Return")
-                            teacher_action_kind = "key:Return"
-                            # Occasionally wiggle selection to avoid focus dead-ends.
-                            if random.random() < 0.2:
-                                self._input_backend.key_down("Right")
-                                time.sleep(0.04)
-                                self._input_backend.key_up("Right")
-                            self._menu_teacher.record_intervention(now)
-                            if self._menu_teacher.should_log_intervention():
-                                print(
-                                    f"[TEACHER] Stalled in {menu_key or 'menu'}; generic_confirm=Return",
-                                    flush=True,
-                                )
-                        except Exception:
-                            pass
-            if (
-                self._input_backend
-                and self._menu_bias_enabled
-                and (not self._menu_teacher_enabled)
-                and self._menu_bias_indices
-                and in_menu
-            ):
-                prob = max(0.0, min(1.0, float(self._menu_bias_prob)))
-                for idx in self._menu_bias_indices:
-                    if idx >= len(a_disc):
-                        continue
-                    if random.random() < prob:
-                        a_disc[idx] = 1
-            if (
-                self._input_backend
-                and (not menu_override_active)
-                and (not self._gameplay_started)
-                and self._input_should_bootstrap(menu_hint, game_state)
-            ):
-                self._run_menu_bootstrap(str(game_state.get("currentMenu") or ""))
-                input_bootstrap = True
-            elif self._input_backend and (not menu_override_active):
+            if self._input_backend is not None:
                 self._input_send_actions(a_cont, a_disc)
-            # PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END
 
             self._action_guard_check(
                 action_source=action_source,
-                menu_override_active=menu_override_active,
                 forced_ui_click=forced_ui_click,
                 input_bootstrap=input_bootstrap,
                 sima2_action=sima2_action,
@@ -7112,14 +6396,8 @@ class WorkerService:
             # Flight recorder: store last actions + thumbnails for Context Drawer.
             try:
                 action_label = "random" if (self._gameplay_started and action_source == "random") else "policy"
-                if menu_override_active and menu_override_action is not None:
-                    action_label = f"menu:{getattr(menu_override_action, 'kind', 'override')}"
-                elif forced_ui_click is not None:
+                if forced_ui_click is not None:
                     action_label = "click_xy"
-                elif input_bootstrap:
-                    action_label = "bootstrap"
-                elif teacher_action_kind is not None:
-                    action_label = f"teacher:{teacher_action_kind}"
                 elif a_disc:
                     action_label = f"disc:{int(a_disc[0])}"
                 elif a_cont:
@@ -7134,11 +6412,9 @@ class WorkerService:
                         disc_preview = disc_on[:8]
                         disc_suffix = f"+{len(disc_on) - len(disc_preview)}" if len(disc_on) > len(disc_preview) else ""
                         cont_preview = [round(float(x), 3) for x in (a_cont or [])[:3]]
-                        menu_name = cur_menu or str(game_state.get("currentMenu") or "")
                         print(
                             f"[worker:{self.instance_id}] action step={step_now} src={action_source} "
-                            f"label={action_label} menu={menu_name or 'none'} playing={playing_flag} "
-                            f"bootstrap={input_bootstrap} cont={cont_preview} disc={disc_preview}{disc_suffix}",
+                            f"label={action_label} stuck={bool(stuck)} cont={cont_preview} disc={disc_preview}{disc_suffix}",
                             flush=True,
                         )
                 self._record_flight_frame(
@@ -7303,6 +6579,7 @@ class WorkerService:
             # If BonkLink, send continuous movement + optional UI click.
             if self._use_bonklink and self._bonklink is not None and self._input_backend is None and not input_bootstrap:
                 try:
+                    from src.bridge.bonklink_coords import map_click_top_left_to_bonklink
                     from src.bridge.bonklink_client import BonkLinkAction
                     from .perception import parse_detections, build_ui_elements
 
@@ -7312,22 +6589,18 @@ class WorkerService:
 
                     if forced_ui_click is not None:
                         action.ui_click = True
-                        click_x = int(forced_ui_click[0])
-                        click_y = int(forced_ui_click[1])
                         try:
                             cap = getattr(self, "_bonklink_capture_size", None)
                         except Exception:
                             cap = None
-                        if cap and frame_size and frame_size[0] > 0 and frame_size[1] > 0:
-                            try:
-                                click_x = int((float(click_x) / float(frame_size[0])) * float(cap[0]))
-                                click_y = int((float(click_y) / float(frame_size[1])) * float(cap[1]))
-                                # BonkLink ClickAtPosition uses Unity screen coordinates (origin bottom-left).
-                                # Our vision/UI coordinates use image coordinates (origin top-left), so flip Y.
-                                click_y = max(0, min(int(cap[1] - 1), int(int(cap[1] - 1) - int(click_y))))
-                            except Exception:
-                                click_x = int(forced_ui_click[0])
-                                click_y = int(forced_ui_click[1])
+                        click_x_tl = int(forced_ui_click[0])
+                        click_y_tl = int(forced_ui_click[1])
+                        click_x, click_y = map_click_top_left_to_bonklink(
+                            x_top_left=click_x_tl,
+                            y_top_left=click_y_tl,
+                            frame_size=frame_size,
+                            capture_size=cap,
+                        )
                         action.click_x = int(click_x)
                         action.click_y = int(click_y)
                         if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
@@ -7346,40 +6619,89 @@ class WorkerService:
                         idx = int(a_disc[0])
                         allow_repeat = False
                         try:
-                            if menu_hint and os.environ.get("METABONK_MENU_ALLOW_REPEAT_CLICK", "0") in ("1", "true", "True"):
+                            if os.environ.get("METABONK_UI_ALLOW_REPEAT_CLICK", "0") in ("1", "true", "True"):
                                 allow_repeat = True
                         except Exception:
                             allow_repeat = False
+                        if (not allow_repeat) and bool(getattr(self, "_pure_vision_mode", False)) and bool(stuck):
+                            # Pure-vision default: allow repeated UI clicks while stuck, but
+                            # throttle them to avoid spamming the target app.
+                            allow_repeat = True
+                        repeat_s = 0.4
+                        try:
+                            repeat_s = float(os.environ.get("METABONK_UI_CLICK_REPEAT_S", "0.4") or 0.4)
+                        except Exception:
+                            repeat_s = 0.4
+                        repeat_s = max(0.0, float(repeat_s))
+                        last_click_ts = float(getattr(self, "_last_ui_click_ts", 0.0) or 0.0)
                         if (
                             (allow_repeat or idx != self._last_disc_action)
                             and 0 <= idx < len(ui_elements)
                             and action_mask2[idx] == 1
                         ):
-                            w, h = frame_size
-                            cx, cy = ui_elements[idx][0], ui_elements[idx][1]
-                            action.ui_click = True
-                            click_x = int(cx * w)
-                            click_y = int(cy * h)
-                            try:
-                                cap = getattr(self, "_bonklink_capture_size", None)
-                            except Exception:
-                                cap = None
-                            if cap and w > 0 and h > 0:
+                            should_click = True
+                            if allow_repeat and idx == self._last_disc_action and repeat_s > 0.0:
+                                if (now - last_click_ts) < repeat_s:
+                                    # Too soon to repeat the same click.
+                                    should_click = False
+                            if should_click:
+                                w, h = frame_size
+                                cx, cy = ui_elements[idx][0], ui_elements[idx][1]
+                                ew, eh = ui_elements[idx][2], ui_elements[idx][3]
+                                cls = ui_elements[idx][4]
+                                action.ui_click = True
                                 try:
-                                    click_x = int((float(click_x) / float(w)) * float(cap[0]))
-                                    click_y = int((float(click_y) / float(h)) * float(cap[1]))
-                                    # BonkLink ClickAtPosition uses Unity screen coordinates (origin bottom-left).
-                                    # Our vision/UI coordinates use image coordinates (origin top-left), so flip Y.
-                                    click_y = max(0, min(int(cap[1] - 1), int(int(cap[1] - 1) - int(click_y))))
+                                    cap = getattr(self, "_bonklink_capture_size", None)
                                 except Exception:
-                                    click_x = int(cx * w)
-                                    click_y = int(cy * h)
-                            action.click_x = int(click_x)
-                            action.click_y = int(click_y)
-                            if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
-                                print(
-                                    f"[worker:{self.instance_id}] ui_click idx={idx} x={action.click_x} y={action.click_y}"
+                                    cap = None
+                                click_x_tl = int(cx * w)
+                                click_y_tl = int(cy * h)
+                                # Coarse candidates (e.g., saliency/grid cells) benefit from
+                                # sampling inside the candidate box so clicks can land on
+                                # smaller buttons without hardcoding semantics.
+                                try:
+                                    jitter_raw = str(os.environ.get("METABONK_UI_CLICK_JITTER", "") or "").strip()
+                                    if not jitter_raw:
+                                        # Back-compat (deprecated)
+                                        jitter_raw = str(os.environ.get("METABONK_UI_GRID_JITTER", "0") or "0").strip()
+                                    jitter = float(jitter_raw or 0.0)
+                                    if jitter <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)) and bool(stuck):
+                                        # Pure-vision default: coarse saliency/grid candidates (cls<0)
+                                        # benefit from sampling across the entire candidate region to
+                                        # hit smaller buttons without encoding game/UI semantics.
+                                        jitter = 1.0 if float(cls) < 0 else 0.6
+                                    jitter = max(0.0, min(1.0, jitter))
+                                    if jitter > 0.0:
+                                        # Only jitter for candidates with large boxes (normalized).
+                                        if float(ew) >= 0.10 or float(eh) >= 0.10:
+                                            dx = (random.random() - 0.5) * float(ew) * float(w) * jitter
+                                            dy = (random.random() - 0.5) * float(eh) * float(h) * jitter
+                                            click_x_tl = int((float(cx) * float(w)) + dx)
+                                            click_y_tl = int((float(cy) * float(h)) + dy)
+                                except Exception:
+                                    pass
+                                click_x, click_y = map_click_top_left_to_bonklink(
+                                    x_top_left=click_x_tl,
+                                    y_top_left=click_y_tl,
+                                    frame_size=frame_size,
+                                    capture_size=cap,
                                 )
+                                action.click_x = int(click_x)
+                                action.click_y = int(click_y)
+                                if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
+                                    print(
+                                        f"[worker:{self.instance_id}] ui_click idx={idx} x={action.click_x} y={action.click_y}"
+                                    )
+                                self._last_ui_click_ts = float(now)
+                            else:
+                                if os.environ.get("METABONK_LOG_UI_CLICKS", "0") in ("1", "true", "True"):
+                                    try:
+                                        dt = float(now - last_click_ts)
+                                    except Exception:
+                                        dt = 0.0
+                                    print(
+                                        f"[worker:{self.instance_id}] ui_click throttled idx={idx} dt={dt:.3f}s < {repeat_s:.3f}s"
+                                    )
                         self._last_disc_action = idx
 
                     self._bonklink.send_action(action)
@@ -7414,7 +6736,10 @@ class WorkerService:
             # In pure-vision mode we explicitly disable all extrinsic reward sources
             # and rely on intrinsic reward shaping in the learner.
             if self._pure_vision_mode:
-                reward = 0.0
+                try:
+                    reward = float(self._visual_exploration.last_reward) if self._visual_exploration is not None else 0.0
+                except Exception:
+                    reward = 0.0
             elif self._use_learned_reward:
                 if reward_frame_hwc is None:
                     # Grace window to allow the game bridge / capture pipeline to warm up.
@@ -7442,84 +6767,36 @@ class WorkerService:
                     "No reward available (game reward missing and learned reward disabled). "
                     "Enable learned reward (METABONK_USE_LEARNED_REWARD=1) or provide a reward-capable bridge."
                 )
-            # Optional menu shaping: discourage menu stalls, reward exiting menus.
-            # Forced off in pure-vision mode.
-            if menu_hint is not None:
-                if self._pure_vision_mode:
-                    menu_penalty = 0.0
-                    menu_exit_bonus = 0.0
-                else:
-                    try:
-                        menu_penalty = float(os.environ.get("METABONK_MENU_PENALTY", "0") or 0.0)
-                    except Exception:
-                        menu_penalty = 0.0
-                    try:
-                        menu_exit_bonus = float(os.environ.get("METABONK_MENU_EXIT_BONUS", "0") or 0.0)
-                    except Exception:
-                        menu_exit_bonus = 0.0
-                if menu_hint and menu_penalty:
-                    reward += menu_penalty
-                if (not menu_hint) and (self._last_menu_mode is True) and menu_exit_bonus:
-                    reward += menu_exit_bonus
-                self._last_menu_mode = bool(menu_hint)
-            # Optional menu transition bonus (e.g., MainMenu -> GeneratedMap).
-            menu_start_bonus = 0.0 if self._pure_vision_mode else float(self._menu_start_bonus or 0.0)
+
+            reward_hit = False
             try:
-                cur_menu = str(game_state.get("currentMenu") or "").strip().lower()
+                if self._visual_exploration is not None:
+                    reward_hit = bool(
+                        bool(getattr(self._visual_exploration, "last_new_scene", False))
+                        or bool(getattr(self._visual_exploration, "last_transition", False))
+                    )
             except Exception:
-                cur_menu = ""
-            prev_menu = self._last_menu_name
-            bonus_fired = False
-            if cur_menu:
-                if cur_menu == "mainmenu":
-                    self._menu_seen_main = True
-                    if self._menu_log:
-                        print(
-                            f"[MENU] instance={self.instance_id} seen_main=True "
-                            f"raw='mainmenu' norm='mainmenu' prev='{prev_menu or ''}'"
-                        )
-                if menu_start_bonus and cur_menu == "generatedmap" and self._menu_seen_main:
-                    reward += menu_start_bonus
-                    self._menu_seen_main = False
-                    bonus_fired = True
-                    if self._menu_log:
-                        print(
-                            f"[MENU] instance={self.instance_id} start_bonus_fired={menu_start_bonus:.2f} "
-                            f"prev='{prev_menu or ''}' cur='generatedmap'"
-                        )
-                    if self._menu_teacher_enabled and self._menu_teacher is not None:
-                        if self._menu_teacher.recent_intervention(now, self._menu_teacher_window_s):
-                            self._menu_teacher.on_teacher_success()
-                        else:
-                            self._menu_teacher.on_student_success()
-                    elif self._menu_bias_enabled:
-                        self._menu_bias_successes += 1
-                        prev_prob = float(self._menu_bias_prob)
-                        self._menu_bias_prob = max(
-                            float(self._menu_bias_min), float(self._menu_bias_prob) * float(self._menu_bias_decay)
-                        )
-                        print(
-                            f"[CURRICULUM] instance={self.instance_id} success={self._menu_bias_successes} "
-                            f"menu_bias_prob={prev_prob:.3f}->{self._menu_bias_prob:.3f}",
-                            flush=True,
-                        )
-                self._last_menu_name = cur_menu
-            # Optional reward logging (useful for menu shaping/debug).
+                reward_hit = False
+
+            # Optional reward logging.
             if self._reward_log and abs(float(reward)) > 1e-9:
                 try:
                     playing_flag = bool(game_state.get("isPlaying"))
                 except Exception:
                     playing_flag = False
-                menu_reason = ""
-                if prev_menu or cur_menu:
-                    menu_reason = f"{prev_menu or ''}->{cur_menu or ''}"
+                scene_hash = None
+                try:
+                    if self._visual_exploration is not None:
+                        scene_hash = self._visual_exploration.last_scene_hash
+                except Exception:
+                    scene_hash = None
                 print(
                     f"[REWARD] instance={self.instance_id} reward={float(reward):.4f} "
-                    f"menu={menu_reason} playing={playing_flag}",
+                    f"scene_hash={scene_hash} playing={playing_flag} stuck={bool(stuck)}",
                     flush=True,
                 )
             # Dump a frame on reward hit (for manual verification).
-            if bonus_fired and (not self._reward_hit_once or not self._reward_hit_saved):
+            if reward_hit and (not self._reward_hit_once or not self._reward_hit_saved):
                 try:
                     base = Path(self._reward_hit_frame_path)
                     if base.suffix.lower() in (".jpg", ".jpeg", ".png"):
@@ -7771,7 +7048,6 @@ class WorkerService:
                         health_ratio = None
                         enemy_count = None
                         player_pos = None
-                        menu_mode = None
                         crit_chance = None
                         overcrit_tier = None
                         last_hit_damage = None
@@ -7814,12 +7090,6 @@ class WorkerService:
                         except Exception:
                             pass
                         try:
-                            v = vision_metrics.get("menu_mode")
-                            if v is not None:
-                                menu_mode = bool(v)
-                        except Exception:
-                            pass
-                        try:
                             from .perception import parse_detections, ICON_BOSS, MINIMAP_ICON_RED
 
                             dets_parsed = parse_detections(detections)
@@ -7827,18 +7097,6 @@ class WorkerService:
                             # If no explicit enemy_count, use a conservative visual proxy from minimap danger icons.
                             if enemy_count is None:
                                 enemy_count = int(sum(1 for d in dets_parsed if d.cls in (MINIMAP_ICON_RED, ICON_BOSS)))
-                            # If no explicit menu_mode, infer from UI state.
-                            if menu_mode is None:
-                                try:
-                                    from .perception import derive_state_onehot
-
-                                    st = derive_state_onehot(dets_parsed)
-                                    if (len(st) > 0 and st[0] == 1.0) or (len(st) > 2 and st[2] == 1.0):
-                                        menu_mode = True
-                                    else:
-                                        menu_mode = False
-                                except Exception:
-                                    pass
                         except Exception:
                             pass
                         if not self._visual_only:
@@ -7863,18 +7121,6 @@ class WorkerService:
                                         player_pos = [float(pp[0]), float(pp[1]), float(pp[2])]
                             except Exception:
                                 pass
-                            try:
-                                if menu_mode is None:
-                                    cm = game_state.get("currentMenu")
-                                    if isinstance(cm, str) and cm.lower() not in ("none", "combat", ""):
-                                        menu_mode = True
-                                    elif game_state.get("levelUpOptions"):
-                                        menu_mode = True
-                                    else:
-                                        menu_mode = False
-                            except Exception:
-                                pass
-
                         # Optional "juicy" combat telemetry (only if the game/plugin provides it).
                         # We do not synthesize these values.
                         # Prefer vision-derived metrics when present.
@@ -8305,7 +7551,6 @@ class WorkerService:
                                 "health_ratio": health_ratio,
                                 "enemy_count": enemy_count,
                                 "boss_visible": boss_visible,
-                                "menu_mode": menu_mode,
                                 "player_pos": player_pos,
                                 "stage": stage,
                                 "biome": biome,
@@ -8593,6 +7838,12 @@ class WorkerService:
             "gameplay_started": bool(self._gameplay_started),
             "hud_present": bool(self._hud_present),
             "hud_phase": ("gameplay" if self._hud_present else "lobby"),
+            "observation_backend": str(getattr(self, "_obs_backend", "") or ""),
+            "observation_type": str(getattr(self, "_obs_backend", "") or ""),
+            "pixel_preprocess_backend": str(getattr(self, "_pixel_preprocess_backend", "") or "")
+            if bool(getattr(self, "_pixel_obs_enabled", False))
+            else None,
+            "vlm_hints_used": int(getattr(self, "_vlm_hints_used", 0) or 0),
             "phase_label": self._phase_label,
             "phase_conf": float(self._phase_conf or 0.0),
             "phase_source": self._phase_source,
@@ -8624,6 +7875,21 @@ class WorkerService:
             "launcher_last_pipewire_node": launcher_last_node,
             **self.trainer.metrics(),
         }
+        try:
+            ve = getattr(self, "_visual_exploration", None)
+            if ve is not None and hasattr(ve, "metrics"):
+                out.update(ve.metrics())
+        except Exception:
+            pass
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                out["gpu_memory_gb"] = float(torch.cuda.memory_allocated() / 1e9)
+            else:
+                out["gpu_memory_gb"] = None
+        except Exception:
+            out["gpu_memory_gb"] = None
         # Stream quality diagnostics (best-effort).
         try:
             src = getattr(self, "_latest_pixel_src_size", None)
@@ -8767,36 +8033,16 @@ class WorkerService:
             out["zero_copy"] = bool(zero_copy)
         except Exception:
             out["zero_copy"] = False
-        # System2/3 compatibility payload for validation harnesses.
+        # System2/3 compatibility payload (vision-only; no menu/scene labels).
         try:
             resp = getattr(self, "_system2_last_response", None)
             if isinstance(resp, dict) and resp:
-                phase = str(out.get("phase_effective") or out.get("phase_label") or "").strip().lower()
-                hud_phase = str(out.get("hud_phase") or "").strip().lower()
-                scene_type = "unknown"
-                if out.get("gameplay_started"):
-                    scene_type = "gameplay"
-                elif out.get("phase_gameplay") or ("game" in phase) or ("combat" in phase):
-                    scene_type = "gameplay"
-                elif phase in ("lobby", "menu", "main_menu"):
-                    scene_type = "menu"
-                elif phase:
-                    scene_type = phase
-                elif hud_phase:
-                    if hud_phase in ("lobby", "menu", "main_menu", "character_select"):
-                        scene_type = "menu"
-                    elif hud_phase in ("gameplay", "in_game", "combat") or ("game" in hud_phase):
-                        scene_type = "gameplay"
-                    else:
-                        scene_type = hud_phase
                 req_ts = None
                 try:
                     req_ts = float((self._system2_last_request or {}).get("timestamp") or 0.0)
                 except Exception:
                     req_ts = None
                 out["system2_reasoning"] = {
-                    "scene_type": scene_type,
-                    "scene_confidence": float(out.get("phase_conf") or 0.0),
                     "goal": str(resp.get("goal") or ""),
                     "confidence": float(resp.get("confidence") or 0.0),
                     "reasoning": str(resp.get("reasoning") or ""),

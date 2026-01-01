@@ -79,8 +79,8 @@ def build_key(features: Dict[str, Any]) -> str:
     hp = _bucket_hp_ratio(features.get("health_ratio"))
     enemies = _bucket_enemy_count(features.get("enemy_count"))
     boss = "1" if bool(features.get("boss_visible")) else "0"
-    menu = "1" if bool(features.get("menu_mode")) else "0"
-    parts = [f"hp{hp}", f"en{enemies}", f"boss{boss}", f"menu{menu}"]
+    stuck = "1" if bool(features.get("stuck")) else "0"
+    parts = [f"hp{hp}", f"en{enemies}", f"boss{boss}", f"stuck{stuck}"]
     cell = _cell_from_pos(features.get("player_pos"))
     if cell is not None:
         parts.append(f"cell{cell[0]},{cell[1]}")
@@ -212,4 +212,3 @@ class SurvivalModel:
                 for (k, s, d, p) in items[: max(1, int(topk))]
             ],
         }
-

@@ -504,9 +504,6 @@ def main() -> int:
     env.setdefault("METABONK_FRAME_STACK", "4")
     # Default to eval-aware PBT ranking (falls back to live scores when no eval data exists).
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
-    # Default menu classifier path (best-effort; ignored if file missing).
-    env.setdefault("METABONK_MENU_WEIGHTS", str(repo_root / "checkpoints" / "menu_classifier.pt"))
-    env.setdefault("METABONK_MENU_THRESH", "0.5")
     if float(args.loading_restart_s or 0.0) > 0.0:
         env["METABONK_PHASE_DATASET_LOADING_RESTART_S"] = str(float(args.loading_restart_s))
     if bool(args.optimize_5090):

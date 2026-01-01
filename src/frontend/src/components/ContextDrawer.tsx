@@ -181,8 +181,8 @@ export default function ContextDrawer() {
                 <div className="v">{schemaMismatch ? schemaMismatchLabel(instance?.heartbeat?.schema_version) : instance.heartbeat?.stream_ok ? "ok" : "stale"}</div>
                 <div className="k">bonk conf</div>
                 <div className="v">{instance.heartbeat?.bonk_confidence == null ? "—" : `${Math.round(Number(instance.heartbeat?.bonk_confidence) * 100)}%`}</div>
-                <div className="k">menu doom</div>
-                <div className="v">{instance.heartbeat?.menu_doom_spiral == null ? "—" : Math.round(Number(instance.heartbeat?.menu_doom_spiral))}</div>
+                <div className="k">stuck</div>
+                <div className="v">{instance.heartbeat?.stuck_score == null ? "—" : Math.round(Number(instance.heartbeat?.stuck_score))}</div>
                 <div className="k">chat influence</div>
                 <div className="v">{instance.heartbeat?.chat_influence == null ? "—" : `${Math.round(Number(instance.heartbeat?.chat_influence) * 100)}%`}</div>
               </div>

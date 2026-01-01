@@ -30,6 +30,12 @@ def resolve_device(want: Optional[str], *, context: str) -> str:
     if not s_lower:
         if req:
             if torch.cuda.is_available():
+                try:
+                    from src.common.cuda131 import assert_cuda131
+
+                    assert_cuda131(context=context)
+                except Exception as e:
+                    raise RuntimeError(str(e)) from e
                 return "cuda"
             raise RuntimeError(
                 f"{context}: CUDA required (METABONK_REQUIRE_CUDA=1) but torch.cuda.is_available() is False."
@@ -38,6 +44,13 @@ def resolve_device(want: Optional[str], *, context: str) -> str:
 
     if s_lower.startswith("cuda"):
         if torch.cuda.is_available():
+            if req:
+                try:
+                    from src.common.cuda131 import assert_cuda131
+
+                    assert_cuda131(context=context)
+                except Exception as e:
+                    raise RuntimeError(str(e)) from e
             return s
         if req:
             raise RuntimeError(f"{context}: CUDA device '{s}' requested but not available.")

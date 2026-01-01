@@ -88,6 +88,7 @@ Documentation
 - **Compositor Paradigms**: `docs/compositor_paradigms.md`
 - **Zero‑Copy Desktop RL (Smithay + PyTorch + Tauri)**: `docs/zero_copy_desktop_rl.md`
 - **Production AGI Platform Upgrade Plan**: `docs/production_agi_platform_plan.md`
+- **Pure Vision (Strict)**: `docs/pure_vision.md`
 
 Design Philosophy
 -----------------
@@ -108,15 +109,7 @@ Environment Variables
 - METABONK_INPUT_MOUSE_SCALE: Mouse delta scale for continuous actions (default 100.0)
 - METABONK_INPUT_MOUSE_MODE: "scaled" (default) or "direct" for mouse deltas
 - METABONK_INPUT_SCROLL_SCALE: Scroll scale for a_cont[2] (default 3.0)
-- METABONK_INPUT_MENU_BOOTSTRAP: Enable menu bootstrap macro (default 0)
-- METABONK_MENU_START_BONUS: Reward bonus for menu transitions (e.g., MainMenu->GeneratedMap)
 - METABONK_REWARD_LOG: Emit [REWARD] lines for non-zero rewards (default 0)
-- METABONK_MENU_LOG: Emit [MENU] lines on menu changes (default 0)
-- METABONK_MENU_ACTION_BIAS: Enable menu action bias (default 0)
-- METABONK_MENU_ACTION_BIAS_P: Probability to force biased menu actions (default 0.6)
-- METABONK_MENU_ACTION_BIAS_DECAY: Decay factor applied on each menu success (default 0.995)
-- METABONK_MENU_ACTION_BIAS_MIN: Minimum bias probability after decay (default 0.05)
-- METABONK_MENU_ACTION_BIAS_KEYS: Comma list of biased actions (default "SPACE,ENTER,RETURN,MOUSE_LEFT,LEFT")
 - METABONK_REWARD_HIT_FRAME_PATH: Directory or filename for reward-hit frame dumps (default temp/reward_hits)
 - METABONK_REWARD_HIT_ONCE: Save reward-hit frame only once per run (default 1)
 - METABONK_FRAME_RING: Enable non-black frame ring buffer for reward-hit evidence (default 1)
@@ -128,14 +121,18 @@ Environment Variables
 - METABONK_BONKLINK_DRAIN: Drain socket to latest BonkLink packet (default 0)
 - METABONK_PPO_CONTINUOUS_DIM: Override PPO continuous action dim (e.g., 3 for scroll)
 - METABONK_PPO_DISCRETE_BRANCHES: Override PPO discrete branches (e.g., "2,2,2,2,2")
-- METABONK_OBS_BACKEND: Policy observation backend ("detections" default, "pixels" for end-to-end vision RL, "hybrid")
+- METABONK_REQUIRE_CUDA: Enforce GPU-only contract (set 1 to hard-fail if CUDA missing)
+- METABONK_OBS_BACKEND: Observation backend ("detections", "pixels", "hybrid", "cutile")
 - METABONK_PIXEL_OBS_W: Pixel observation width when METABONK_OBS_BACKEND=pixels (default 128)
 - METABONK_PIXEL_OBS_H: Pixel observation height when METABONK_OBS_BACKEND=pixels (default 128)
+- METABONK_PIXEL_PREPROCESS_BACKEND: Pixel preprocess backend ("torch" or "cutile"; defaults to cutile when METABONK_OBS_BACKEND=cutile)
 - METABONK_PIXEL_ROLLOUT_MAX_SIZE: Steps per pixel rollout flush (default 256; keep small for HTTP payload size)
-- METABONK_PIXEL_UI_GRID: Grid spec for UI click candidates when no detections (e.g. "8x8"; default METABONK_MENU_GRID or 8x8)
+- METABONK_PIXEL_UI_GRID: Grid spec for click candidates when no detections (e.g. "8x8"; default "8x8")
 - METABONK_VISION_ENCODER_CKPT: Optional encoder pretrain ckpt to warm-start VisionActorCritic (from scripts/pretrain_vision_mae.py)
 - METABONK_VISION_AUG: Enable DrQ-style random shift augmentation for vision policies (default 1)
 - METABONK_VISION_AUG_SHIFT: Random shift padding in pixels (default 4)
+- METABONK_STREAM_FROZEN_DIFF: Stream frozen-frame threshold (mean abs luma diff; default 1.0)
+- METABONK_STREAM_FROZEN_S: Seconds frozen before self-heal (default 8.0)
 - METABONK_SYNTHETIC_EYE_LOCKSTEP: Lock-step Synthetic Eye (PING -> next FRAME), requires metabonk_smithay_eye --lockstep or METABONK_EYE_LOCKSTEP=1 (default 0)
 - METABONK_EYE_LOCKSTEP: Lock-step export mode on the Synthetic Eye producer (default 0)
 - METABONK_EYE_LOCKSTEP_WAIT_S: Producer wait time for next client DMA-BUF commit in lock-step (default 0.5)

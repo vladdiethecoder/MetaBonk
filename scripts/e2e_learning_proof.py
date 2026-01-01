@@ -439,7 +439,7 @@ def _build_env(cfg: ProofConfig) -> Dict[str, str]:
     env.setdefault("METABONK_FFMPEG_ENCODER", "h264_nvenc")
     env.setdefault("METABONK_REQUIRE_PIPEWIRE_STREAM", "1")
     env.setdefault("METABONK_USE_VLM_MENU", "0")
-    env.setdefault("METABONK_MENU_EPS", "0")
+    env.setdefault("METABONK_UI_EPS", "0")
     env.setdefault("METABONK_ACTION_GUARD", "1")
     env.setdefault("METABONK_ACTION_SOURCE", "policy")
     env.setdefault("METABONK_EVAL_HISTORY_PATH", str(cfg.output_dir / "eval_history.json"))

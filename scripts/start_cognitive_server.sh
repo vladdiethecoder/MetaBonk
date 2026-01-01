@@ -23,7 +23,7 @@ if [[ -n "${DOCKER_HOST:-}" ]] && [[ "${DOCKER_HOST}" == *podman* ]] && [[ -S /v
 fi
 
 # Verify GPU runtime is usable.
-if ! "${DOCKER_ENV[@]}" docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+if ! "${DOCKER_ENV[@]}" docker run --rm --gpus all nvidia/cuda:13.1.0-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1; then
   echo "❌ nvidia-container-toolkit not configured (docker --gpus all failed)."
   exit 1
 fi

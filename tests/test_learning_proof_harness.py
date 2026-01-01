@@ -35,16 +35,15 @@ def test_video_export_wrapper(tmp_path: Path):
 
 
 def test_gameplay_started_gate():
-    assert should_mark_gameplay_started(False, {"isPlaying": True}) is True
-    assert should_mark_gameplay_started(True, {"isPlaying": True}) is False
-    assert should_mark_gameplay_started(False, {"gameTime": 2.0}) is True
+    assert should_mark_gameplay_started({"isPlaying": True}) is True
+    assert should_mark_gameplay_started({"gameTime": 2.0}) is True
+    assert should_mark_gameplay_started({}) is False
 
 
 def test_action_source_guard():
     reason = action_guard_violation(
         gameplay_started=True,
         action_source="heuristic",
-        menu_override_active=False,
         forced_ui_click=None,
         input_bootstrap=False,
         sima2_action=None,
@@ -54,7 +53,6 @@ def test_action_source_guard():
     ok = action_guard_violation(
         gameplay_started=True,
         action_source="policy",
-        menu_override_active=False,
         forced_ui_click=None,
         input_bootstrap=False,
         sima2_action=None,

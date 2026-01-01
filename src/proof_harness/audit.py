@@ -10,7 +10,6 @@ ALLOWED_END = "PROOF_HARNESS_ALLOWED_MENU_AUTOMATION_END"
 
 DEFAULT_PATTERNS = (
     "menu_override_action =",
-    "_run_menu_bootstrap",
     "_input_send_menu_action",
     "_vlm_menu.infer_action",
     "random.choice(valid)",

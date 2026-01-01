@@ -760,7 +760,7 @@
       {
         "i": 58,
         "key": "menu_stuck",
-        "label": "Menu stuck",
+        "label": "Stuck",
         "hud": "state: recovery needed",
         "variants": [
           "normal",

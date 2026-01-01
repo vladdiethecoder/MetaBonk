@@ -107,6 +107,8 @@ class Heartbeat(MBBaseModel):
     stream_keyframe_count: Optional[int] = None
     stream_frame_var: Optional[float] = None
     stream_black_since_s: Optional[float] = None
+    stream_frame_diff: Optional[float] = None
+    stream_frozen_since_s: Optional[float] = None
     launcher_pid: Optional[int] = None
     launcher_alive: Optional[bool] = None
     game_restart_count: Optional[int] = None
@@ -158,7 +160,7 @@ class Heartbeat(MBBaseModel):
     act_hz: Optional[float] = None
     action_entropy: Optional[float] = None
     bonk_confidence: Optional[float] = None
-    menu_doom_spiral: Optional[float] = None
+    stuck_score: Optional[float] = None
     chat_influence: Optional[float] = None
     stuck: Optional[dict[str, Any]] = None
     errors_recent: Optional[list[dict[str, Any]]] = None

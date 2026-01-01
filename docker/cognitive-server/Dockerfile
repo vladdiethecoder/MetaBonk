@@ -1,7 +1,7 @@
 # Cognitive Server for MetaBonk.
 # Runs SGLang with Phi-3-Vision for multi-instance inference.
 
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

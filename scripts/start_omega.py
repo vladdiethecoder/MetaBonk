@@ -859,14 +859,14 @@ def _cuda_preflight_hint(torch_cuda: str) -> Optional[str]:
     joined = ", ".join(models)
     if any("5090" in m or "blackwell" in m.lower() for m in models):
         if not torch_cuda:
-            return f"Detected {joined}; install a CUDA-enabled PyTorch wheel (cu128+ recommended for Blackwell)."
-        if _cuda_version_lt(torch_cuda, "12.8"):
+            return f"Detected {joined}; install a CUDA-enabled PyTorch wheel (cu131+ recommended for Blackwell)."
+        if _cuda_version_lt(torch_cuda, "13.1"):
             return (
-                f"Detected {joined} with torch CUDA {torch_cuda}; install a cu128+ PyTorch wheel "
+                f"Detected {joined} with torch CUDA {torch_cuda}; install a cu131+ PyTorch wheel "
                 "for Blackwell support."
             )
         return (
-            f"Detected {joined}; CUDA {torch_cuda} should work for Blackwell (cu128+). "
+            f"Detected {joined}; CUDA {torch_cuda} should work for Blackwell (cu131+). "
             "NVFP4/FP4 still requires newer toolchains."
         )
     return f"Detected {joined}; verify CUDA toolkit/driver matches your PyTorch build."
@@ -896,6 +896,14 @@ def _cuda_preflight(
         count = int(torch.cuda.device_count() or 0)
     except Exception as e:
         return f"CUDA preflight: torch.cuda.device_count() failed ({e})."
+    if torch_cuda and _cuda_version_lt(torch_cuda, "13.1"):
+        return f"CUDA preflight: CUDA 13.1+ required (found torch CUDA {torch_cuda})."
+    try:
+        cc = torch.cuda.get_device_capability()
+        if int(cc[0]) < 9:
+            return f"CUDA preflight: compute capability 9.0+ required (found {cc[0]}.{cc[1]})."
+    except Exception:
+        pass
     if count < 1:
         return "CUDA preflight: no CUDA devices detected."
     if not stream_enabled:
@@ -1184,13 +1192,12 @@ def main() -> int:
 
     # Input + action space defaults:
     # - ensure learner and workers agree on discrete branch sizing
-    # - keep menu progression learnable (no hardcoded bootstraps by default)
+    # - keep menu progression learnable (no hardcoded bootstraps)
     libxdo_ok = _libxdo_available()
     # Prefer in-game action injection (BonkLink/UnityBridge) over OS-level X11 injection.
     # If a caller explicitly wants OS injection, they can set METABONK_INPUT_BACKEND=uinput|libxdo|xdotool.
     if str(env.get("METABONK_USE_BONKLINK", "1") or "1").strip().lower() in ("0", "false", "no", "off"):
         env.setdefault("METABONK_INPUT_BACKEND", "libxdo" if libxdo_ok else "xdotool")
-    env.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
     if not (
         env.get("METABONK_INPUT_BUTTONS")
         or env.get("METABONK_INPUT_KEYS")
@@ -1313,8 +1320,6 @@ def main() -> int:
     env.setdefault("METABONK_PPO_BURN_IN", "8")
     env.setdefault("METABONK_FRAME_STACK", "4")
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
-    env.setdefault("METABONK_MENU_WEIGHTS", str(repo_root / "checkpoints" / "menu_classifier.pt"))
-    env.setdefault("METABONK_MENU_THRESH", "0.5")
     env.setdefault("METABONK_UI_GRID_FALLBACK", "1")
     env.setdefault("METABONK_REPO_ROOT", str(repo_root))
     env.setdefault("METABONK_VISION_WEIGHTS", str(repo_root / "yolo11n.pt"))
@@ -2180,9 +2185,7 @@ def main() -> int:
                     wenv["GAMESCOPE_XWAYLAND_ARGS"] = (existing + " " + want).strip() if existing else want
                 if not wenv.get("METABONK_INPUT_XDO_WINDOW"):
                     wenv["METABONK_INPUT_XDO_WINDOW"] = "Megabonk"
-            # Do not hardcode menu progression: allow agents to discover routes via their own
-            # policy/exploration. (Bootstrap remains available via explicit env/CLI override.)
-            wenv.setdefault("METABONK_INPUT_MENU_BOOTSTRAP", "0")
+            # Do not hardcode menu progression: allow agents to discover routes via their own policy/exploration.
             if not (
                 wenv.get("METABONK_INPUT_BUTTONS")
                 or wenv.get("METABONK_INPUT_KEYS")
@@ -2302,10 +2305,10 @@ def main() -> int:
                 obs_backend = str(wenv.get("METABONK_OBS_BACKEND") or "").strip().lower()
                 if not obs_backend:
                     print(
-                        "[start_omega] 👁️  Synthetic Eye enabled: defaulting METABONK_OBS_BACKEND=pixels",
+                        "[start_omega] 👁️  Synthetic Eye enabled: defaulting METABONK_OBS_BACKEND=cutile",
                         flush=True,
                     )
-                    wenv["METABONK_OBS_BACKEND"] = "pixels"
+                    wenv["METABONK_OBS_BACKEND"] = "cutile"
                 # Prevent Unity/Unreal focus throttling (black/frozen frames) by ensuring the
                 # Synthetic Eye compositor keeps keyboard focus on the active capture surface.
                 wenv.setdefault("METABONK_EYE_FORCE_FOCUS", "1")

@@ -244,20 +244,75 @@ def build_grid_ui_elements(
 
     rows = max(1, int(rows))
     cols = max(1, int(cols))
+    max_elements = max(0, int(max_elements))
     cell_w = 1.0 / float(cols)
     cell_h = 1.0 / float(rows)
-    idx = 0
-    for r in range(rows):
-        for c in range(cols):
-            if idx >= max_elements:
-                break
-            cx = (c + 0.5) * cell_w
-            cy = (r + 0.5) * cell_h
-            ui.append([cx, cy, cell_w, cell_h, -2.0, 1.0])
-            mask[idx] = 1
-            idx += 1
-        if idx >= max_elements:
-            break
+
+    def linspace_int(lo: int, hi: int, n: int) -> List[int]:
+        if n <= 0:
+            return []
+        if n == 1:
+            return [int(round((lo + hi) / 2.0))]
+        step = float(hi - lo) / float(n - 1)
+        out: List[int] = []
+        for i in range(n):
+            v = int(round(lo + (step * float(i))))
+            out.append(max(lo, min(hi, v)))
+        # De-dup while preserving order.
+        deduped: List[int] = []
+        seen = set()
+        for v in out:
+            if v in seen:
+                continue
+            seen.add(v)
+            deduped.append(v)
+        return deduped
+
+    selected_cells: List[Tuple[int, int]] = []
+    total_cells = rows * cols
+    if max_elements <= 0:
+        selected_cells = []
+    elif total_cells <= max_elements:
+        selected_cells = [(r, c) for r in range(rows) for c in range(cols)]
+    else:
+        # When the full grid has more cells than our fixed action budget, sample
+        # across the *entire* grid so we don't bias toward the top-left region.
+        if rows <= max_elements:
+            sel_rows = rows
+            sel_cols = max(1, min(cols, max_elements // sel_rows))
+        else:
+            # Fallback: approximate a square-ish sampling.
+            sel_rows = max(1, int(round((float(max_elements) ** 0.5))))
+            sel_rows = min(rows, sel_rows)
+            sel_cols = max(1, min(cols, max_elements // sel_rows))
+
+        row_idxs = linspace_int(0, rows - 1, sel_rows)
+        col_idxs = linspace_int(0, cols - 1, sel_cols)
+        selected_cells = [(r, c) for r in row_idxs for c in col_idxs]
+
+        # If we still have room, fill remaining slots with unseen cells in
+        # row-major order. This keeps the candidate list dense without relying
+        # on any menu/game semantics.
+        if len(selected_cells) < max_elements:
+            chosen = set(selected_cells)
+            for r in range(rows):
+                for c in range(cols):
+                    if (r, c) in chosen:
+                        continue
+                    selected_cells.append((r, c))
+                    chosen.add((r, c))
+                    if len(selected_cells) >= max_elements:
+                        break
+                if len(selected_cells) >= max_elements:
+                    break
+
+    selected_cells = selected_cells[:max_elements]
+    for idx, (r, c) in enumerate(selected_cells):
+        cx = (c + 0.5) * cell_w
+        cy = (r + 0.5) * cell_h
+        # Keep cls=-1 for "unknown" targets; validity is expressed via the action mask.
+        ui.append([cx, cy, cell_w, cell_h, -1.0, 1.0])
+        mask[idx] = 1
 
     while len(ui) < max_elements:
         ui.append([0.0, 0.0, 0.0, 0.0, -1.0, 0.0])
@@ -265,38 +320,148 @@ def build_grid_ui_elements(
     return ui, mask
 
 
-def build_ui_candidates(
-    dets: List[ParsedDet],
-    frame_size: Optional[Tuple[int, int]] = None,
+def build_saliency_ui_elements(
+    frame_hwc: Any,
+    frame_size: Optional[Tuple[int, int]],
     *,
     max_elements: int = 32,
-    menu_hint: Optional[bool] = None,
-) -> Tuple[List[List[float]], List[int], int]:
-    """Return UI elements + action mask with a menu-mode fallback grid."""
-    ui, mask, interact_count = build_ui_elements(dets, frame_size, max_elements)
-    want_grid = bool(menu_hint)
-    if not want_grid:
-        want_grid = str(os.environ.get("METABONK_UI_GRID_FALLBACK", "0") or "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-    if want_grid and interact_count <= 0:
-        grid = str(os.environ.get("METABONK_MENU_GRID", "4x4") or "4x4").lower()
+    grid_rows: int = 8,
+    grid_cols: int = 4,
+    downsample_max_side: int = 160,
+) -> Tuple[List[List[float]], List[int]]:
+    """Build UI click targets from pixel saliency (game-agnostic).
+
+    This is a pure-vision alternative to detector-derived UI candidates. It does
+    **not** assume a specific game UI layout, class taxonomy, or "menu" concept.
+
+    Output format matches `build_ui_elements`: Kx6 [cx, cy, w, h, cls, conf] and
+    a mask of length K+1 (last entry is no-op).
+    """
+    ui: List[List[float]] = []
+    mask: List[int] = [0] * (max_elements + 1)
+
+    if frame_hwc is None or not frame_size or max_elements <= 0:
+        mask[-1] = 1
+        return ui, mask
+
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+
+        w, h = frame_size
+        arr = np.asarray(frame_hwc)
+        if arr.ndim != 3:
+            mask[-1] = 1
+            return ui, mask
+        # Normalize to HWC RGB uint8.
+        if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = np.transpose(arr, (1, 2, 0))
+        if arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        arr = np.asarray(arr, dtype=np.uint8)
+
+        # Downsample aggressively for speed.
+        ih, iw = int(arr.shape[0]), int(arr.shape[1])
+        if iw <= 0 or ih <= 0:
+            mask[-1] = 1
+            return ui, mask
+        scale = min(1.0, float(downsample_max_side) / float(max(iw, ih)))
+        if scale < 1.0:
+            sw = max(8, int(round(float(iw) * scale)))
+            sh = max(8, int(round(float(ih) * scale)))
+            small = cv2.resize(arr, (sw, sh), interpolation=cv2.INTER_AREA)
+        else:
+            small = arr
+
+        # Saliency cues: edge magnitude + saturation.
+        gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        mag = cv2.magnitude(gx, gy)
+        mag_max = float(mag.max()) if mag.size else 0.0
+        if mag_max <= 0.0:
+            mag_norm = mag
+        else:
+            mag_norm = mag / (mag_max + 1e-6)
+
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1].astype(np.float32) / 255.0
+        val = hsv[:, :, 2].astype(np.float32) / 255.0
+        # Edge energy finds boundaries; saturation/value help pick "button-like" regions.
+        sal = (0.55 * mag_norm) + (0.25 * sat) + (0.20 * val)
         try:
-            parts = grid.split("x")
-            rows = int(parts[0])
-            cols = int(parts[1]) if len(parts) > 1 else rows
+            sal = cv2.GaussianBlur(sal, (0, 0), sigmaX=1.0)
         except Exception:
-            rows, cols = 4, 4
-        ui, mask = build_grid_ui_elements(
-            frame_size,
-            max_elements=max_elements,
-            rows=rows,
-            cols=cols,
-        )
-    return ui, mask, interact_count
+            pass
+
+        rows = max(1, int(grid_rows))
+        cols = max(1, int(grid_cols))
+        sh, sw = int(sal.shape[0]), int(sal.shape[1])
+        cell_h = float(sh) / float(rows)
+        cell_w = float(sw) / float(cols)
+
+        peaks: List[Tuple[float, int, int]] = []
+        for r in range(rows):
+            y0 = int(round(cell_h * float(r)))
+            y1 = int(round(cell_h * float(r + 1)))
+            y0 = max(0, min(sh, y0))
+            y1 = max(0, min(sh, y1))
+            if y1 <= y0:
+                continue
+            for c in range(cols):
+                x0 = int(round(cell_w * float(c)))
+                x1 = int(round(cell_w * float(c + 1)))
+                x0 = max(0, min(sw, x0))
+                x1 = max(0, min(sw, x1))
+                if x1 <= x0:
+                    continue
+                patch = sal[y0:y1, x0:x1]
+                if patch.size <= 0:
+                    continue
+                flat_idx = int(patch.argmax())
+                py = int(flat_idx // int(patch.shape[1]))
+                px = int(flat_idx % int(patch.shape[1]))
+                score = float(patch[py, px])
+                peaks.append((score, x0 + px, y0 + py))
+
+        # Highest-saliency first; take up to K points. This naturally covers the UI
+        # button regions (high-contrast edges) without game-specific priors.
+        peaks.sort(key=lambda t: t[0], reverse=True)
+        chosen = peaks[: max_elements]
+
+        # Approximate box size from the attention grid cell size.
+        bw = 1.0 / float(cols)
+        bh = 1.0 / float(rows)
+
+        for i, (score, px, py) in enumerate(chosen):
+            # Map to original resolution, then to normalized [0,1].
+            if scale < 1.0:
+                denom = max(1e-6, float(scale))
+                fx = float(px) / denom
+                fy = float(py) / denom
+            else:
+                fx = float(px)
+                fy = float(py)
+            cx = max(0.0, min(1.0, fx / float(w)))
+            cy = max(0.0, min(1.0, fy / float(h)))
+            ui.append([cx, cy, bw, bh, -1.0, max(0.0, min(1.0, float(score)))])
+            mask[i] = 1
+
+        # If saliency is flat (rare), fall back to a uniform grid so action space
+        # remains usable. (Still game-agnostic: no semantics.)
+        if not ui:
+            ui, mask = build_grid_ui_elements(frame_size, max_elements=max_elements, rows=rows, cols=cols)
+
+    except Exception:
+        # Conservative fallback: no candidates (only no-op).
+        pass
+
+    # Pad ui matrix.
+    while len(ui) < max_elements:
+        ui.append([0.0, 0.0, 0.0, 0.0, -1.0, 0.0])
+
+    mask[-1] = 1
+    return ui, mask
 
 
 def derive_state_onehot(dets: List[ParsedDet], num_states: int = 4) -> List[float]:
@@ -329,7 +494,6 @@ def construct_observation(
     pixel_tensor: Optional[Any] = None,
     frame_size: Optional[Tuple[int, int]] = None,
     max_elements: int = 32,
-    menu_hint: Optional[bool] = None,
     ui_override: Optional[List[List[float]]] = None,
     action_mask_override: Optional[List[int]] = None,
 ) -> Tuple[Any, List[int]]:
@@ -349,20 +513,12 @@ def construct_observation(
         ui = ui_override
         mask = action_mask_override
     else:
-        ui, mask, _ = build_ui_candidates(
+        ui, mask, _ = build_ui_elements(
             dets,
             frame_size=frame_size,
             max_elements=max_elements,
-            menu_hint=menu_hint,
         )
     state_oh = derive_state_onehot(dets)
-    if menu_hint is not None:
-        mapping = {"menu": 0, "combat": 1, "level_up": 2, "dead": 3}
-        state = "menu" if menu_hint else "combat"
-        onehot = [0.0] * len(state_oh)
-        if state in mapping and mapping[state] < len(onehot):
-            onehot[mapping[state]] = 1.0
-        state_oh = onehot
 
     # Vision-first path: return pixel tensor directly as the observation but keep
     # the action mask (used by UI-index discrete action space).

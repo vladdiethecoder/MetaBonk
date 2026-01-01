@@ -139,8 +139,6 @@ def main() -> int:
     env.setdefault("METABONK_PPO_BURN_IN", "8")
     env.setdefault("METABONK_FRAME_STACK", "4")
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
-    env.setdefault("METABONK_MENU_WEIGHTS", str(Path(__file__).resolve().parent.parent / "checkpoints" / "menu_classifier.pt"))
-    env.setdefault("METABONK_MENU_THRESH", "0.5")
     env["OBS_DIM"] = env.get("OBS_DIM", "204")
     env.setdefault("METABONK_EXPERIMENT_ID", os.environ.get("METABONK_EXPERIMENT_ID", "exp-hive"))
     env.setdefault("METABONK_RUN_ID", os.environ.get("METABONK_RUN_ID", f"run-hive-{int(time.time())}"))

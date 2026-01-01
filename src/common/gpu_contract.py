@@ -371,6 +371,17 @@ def enforce_gpu_contract(*, context: str = "startup", env: Optional[Dict[str, st
     if status.errors:
         detail = "\n  - ".join(status.errors)
         raise SystemExit(f"[gpu_contract] {context} failed:\n  - {detail}")
+    # Also enforce the PyTorch CUDA build/version requirement when the repo is
+    # running in CUDA-required mode.
+    try:
+        from src.common.cuda131 import assert_cuda131, require_cuda131
+
+        if require_cuda131():
+            assert_cuda131(context=f"gpu_contract:{context}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"[gpu_contract] {context} failed:\n  - {e}") from e
 
 
 if __name__ == "__main__":

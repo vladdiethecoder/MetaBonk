@@ -76,7 +76,19 @@ def _sanitize_agent_state_for_prompt(agent_state: Dict[str, Any]) -> Dict[str, A
     # Keep only fields the prompt actually references. This materially reduces
     # token count (floats with long mantissas are especially expensive).
     state: Dict[str, Any] = {}
-    for key in ("menu_hint", "health_ratio", "enemies_nearby", "frame_w", "frame_h", "ui_elements"):
+    for key in (
+        "gameplay_started",
+        "stuck",
+        "stuck_score",
+        "visual_novelty",
+        "scene_hash",
+        "scenes_discovered",
+        "health_ratio",
+        "enemies_nearby",
+        "frame_w",
+        "frame_h",
+        "ui_elements",
+    ):
         if key in raw_state:
             state[key] = raw_state.get(key)
 
@@ -102,7 +114,7 @@ def _sanitize_agent_state_for_prompt(agent_state: Dict[str, Any]) -> Dict[str, A
         return val
 
     # Round top-level scalars for compactness.
-    for key in ("health_ratio", "enemies_nearby", "frame_w", "frame_h"):
+    for key in ("health_ratio", "enemies_nearby", "frame_w", "frame_h", "stuck_score", "visual_novelty", "scenes_discovered"):
         if key in state:
             state[key] = _round_num(state.get(key))
 
@@ -556,7 +568,9 @@ METABONK_PURE_SYSTEM_PROMPT = """You are a strategic assistant for a vision-only
 Return STRICT JSON only (one line), no extra keys, no prose:
 {"directive":{"action":"approach|retreat|explore|interact","target":[x,y],"duration_seconds":n,"priority":"low|medium|high|critical"},"confidence":0..1}
 
-If Agent State.menu_hint=true: action MUST be "interact" and target MUST be the primary advance button (PLAY/CONFIRM/CONTINUE/START/OK/NEXT/RESUME/RETRY).
+Do NOT rely on game-specific scene/menu labels. Use only pixels + Agent State signals.
+
+If Agent State.stuck=true: action SHOULD be "interact" and target SHOULD be a likely UI affordance.
 - Prefer Agent State.ui_elements centers (cx,cy) when available.
 - If unsure, target=[0.5,0.5] and confidence<=0.2.
 """
@@ -816,7 +830,7 @@ class CognitiveServer:
                 _ = self._run_inference_sglang(
                     frames=[warmup_frame_b64],
                     agent_state={
-                        "menu_hint": True,
+                        "stuck": True,
                         "ui_elements": [{"name": "CONFIRM", "cx": 0.5, "cy": 0.5, "w": 0.25, "h": 0.1, "conf": 0.9}],
                     },
                 )
@@ -924,7 +938,7 @@ class CognitiveServer:
         """Normalize incoming frames for the prompt image builder.
 
         By default we keep a 9-frame strip. When the server is configured to use
-        single-frame mode (or when menu_hint + single-frame menu path is active),
+        single-frame mode (or when the agent is stuck + single-frame path is active),
         we keep only the most recent frame to reduce decode overhead.
         """
         frames = list(frames or [])
@@ -935,14 +949,17 @@ class CognitiveServer:
             return [frames[-1]]
 
         agent_state = dict(agent_state or {})
-        menu_hint = agent_state.get("menu_hint")
-        if isinstance(menu_hint, str):
-            menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
-        if bool(menu_hint):
-            menu_single_frame = str(
-                os.environ.get("METABONK_COGNITIVE_MENU_SINGLE_FRAME", "1") or "1"
-            ).strip().lower() in ("1", "true", "yes", "on")
-            if menu_single_frame:
+        stuck = agent_state.get("stuck")
+        if isinstance(stuck, str):
+            stuck = stuck.strip().lower() in ("1", "true", "yes", "on")
+        if bool(stuck):
+            stuck_single_frame = str(os.environ.get("METABONK_COGNITIVE_STUCK_SINGLE_FRAME", "1") or "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if stuck_single_frame:
                 return [frames[-1]]
 
         # Ensure exactly 9 frames for the temporal grid.
@@ -957,10 +974,12 @@ class CognitiveServer:
     ) -> Image.Image:
         tile_edge = int(os.environ.get("METABONK_COGNITIVE_TILE_EDGE", "224") or 224)
         try:
-            menu_tile_edge = int(os.environ.get("METABONK_COGNITIVE_TILE_EDGE_MENU") or tile_edge)
+            stuck_tile_edge = int(
+                os.environ.get("METABONK_COGNITIVE_TILE_EDGE_STUCK") or tile_edge
+            )
         except Exception:
-            menu_tile_edge = tile_edge
-        menu_single_frame = str(os.environ.get("METABONK_COGNITIVE_MENU_SINGLE_FRAME", "1") or "1").strip().lower() in (
+            stuck_tile_edge = tile_edge
+        stuck_single_frame = str(os.environ.get("METABONK_COGNITIVE_STUCK_SINGLE_FRAME", "1") or "1").strip().lower() in (
             "1",
             "true",
             "yes",
@@ -991,19 +1010,19 @@ class CognitiveServer:
             img = _resize_max_edge(img, int(tile_edge))
             return img
 
-        menu_hint = agent_state.get("menu_hint")
-        if isinstance(menu_hint, str):
-            menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
-        if bool(menu_hint):
-            if menu_single_frame:
+        stuck = agent_state.get("stuck")
+        if isinstance(stuck, str):
+            stuck = stuck.strip().lower() in ("1", "true", "yes", "on")
+        if bool(stuck):
+            if stuck_single_frame:
                 try:
                     raw = base64.b64decode(str(frames_b64[-1] if frames_b64 else ""), validate=False)
                     img = Image.open(BytesIO(raw)).convert("RGB")
                 except Exception:
                     img = Image.new("RGB", (512, 512), (0, 0, 0))
-                img = _resize_max_edge(img, int(menu_tile_edge))
+                img = _resize_max_edge(img, int(stuck_tile_edge))
                 return img
-            tile_edge = int(menu_tile_edge)
+            tile_edge = int(stuck_tile_edge)
         tile_edge = max(64, min(1024, tile_edge))
 
         tiles: List[Image.Image] = []
@@ -1138,14 +1157,16 @@ class CognitiveServer:
                     except Exception:
                         tile_edge = 224
                     try:
-                        menu_edge = int(os.environ.get("METABONK_COGNITIVE_TILE_EDGE_MENU") or tile_edge)
+                        stuck_edge = int(
+                            os.environ.get("METABONK_COGNITIVE_TILE_EDGE_STUCK") or tile_edge
+                        )
                     except Exception:
-                        menu_edge = tile_edge
-                    menu_hint = dict(agent_state or {}).get("menu_hint")
-                    if isinstance(menu_hint, str):
-                        menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
-                    if bool(menu_hint) and int(menu_edge) > 0:
-                        tile_edge = int(menu_edge)
+                        stuck_edge = tile_edge
+                    stuck = dict(agent_state or {}).get("stuck")
+                    if isinstance(stuck, str):
+                        stuck = stuck.strip().lower() in ("1", "true", "yes", "on")
+                    if bool(stuck) and int(stuck_edge) > 0:
+                        tile_edge = int(stuck_edge)
                     tile_edge = max(64, min(1024, int(tile_edge)))
                     force_resize = _env_truthy("METABONK_COGNITIVE_FORCE_RESIZE")
 
@@ -1325,7 +1346,7 @@ class CognitiveServer:
         return float(best)
 
     @classmethod
-    def _pick_menu_advance_target(cls, ui_elements: Any) -> Optional[List[float]]:
+    def _pick_advance_target(cls, ui_elements: Any) -> Optional[List[float]]:
         if not isinstance(ui_elements, list) or not ui_elements:
             return None
 
@@ -1417,13 +1438,13 @@ class CognitiveServer:
         return None
 
     @classmethod
-    def _apply_menu_target_postproc(cls, strategy: Dict[str, Any], agent_state: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_stuck_target_postproc(cls, strategy: Dict[str, Any], agent_state: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(strategy, dict) or not isinstance(agent_state, dict):
             return strategy
-        menu_hint = agent_state.get("menu_hint")
-        if isinstance(menu_hint, str):
-            menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
-        if not bool(menu_hint):
+        stuck = agent_state.get("stuck")
+        if isinstance(stuck, str):
+            stuck = stuck.strip().lower() in ("1", "true", "yes", "on")
+        if not bool(stuck):
             return strategy
 
         ui_elements = agent_state.get("ui_elements")
@@ -1454,7 +1475,7 @@ class CognitiveServer:
         looks_default = abs(tx - 0.5) <= 0.12 and abs(ty - 0.5) <= 0.12
 
         if low_conf and looks_default:
-            picked = cls._pick_menu_advance_target(ui_elements)
+            picked = cls._pick_advance_target(ui_elements)
             if picked is not None:
                 directive["target"] = picked
                 strategy["confidence"] = float(max(conf_f, 0.25))
@@ -1587,7 +1608,7 @@ class CognitiveServer:
 
             # Extract JSON object from response.
             strategy = self._normalize_strategy(_extract_json_obj(response_text))
-            strategy = self._apply_menu_target_postproc(strategy, agent_state)
+            strategy = self._apply_stuck_target_postproc(strategy, agent_state)
 
             strategy["agent_id"] = agent_id
             strategy["inference_time_ms"] = (time.time() - start) * 1000.0

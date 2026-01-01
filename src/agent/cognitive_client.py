@@ -76,13 +76,6 @@ class CognitiveClient:
         except Exception:
             self.frames_per_request = 9
         self.frames_per_request = max(1, min(9, int(self.frames_per_request)))
-        try:
-            self.menu_frames_per_request = int(
-                os.environ.get("METABONK_SYSTEM2_MENU_FRAMES", str(self.frames_per_request)) or self.frames_per_request
-            )
-        except Exception:
-            self.menu_frames_per_request = int(self.frames_per_request)
-        self.menu_frames_per_request = max(1, min(9, int(self.menu_frames_per_request)))
 
         self.context = zmq.Context.instance()
         self.socket = self.context.socket(zmq.DEALER)
@@ -163,11 +156,7 @@ class CognitiveClient:
             return None
 
         state = dict(agent_state or {})
-        menu_hint = state.get("menu_hint")
-        if isinstance(menu_hint, str):
-            menu_hint = menu_hint.strip().lower() in ("1", "true", "yes", "on")
-        frames_to_send = self.menu_frames_per_request if bool(menu_hint) else self.frames_per_request
-        frames = self._build_temporal_strip(total_frames=int(frames_to_send))
+        frames = self._build_temporal_strip(total_frames=int(self.frames_per_request))
         if frames is None:
             return None
 

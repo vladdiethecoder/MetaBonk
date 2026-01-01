@@ -48,7 +48,7 @@ class Trainer:
             self.cfg.use_lstm = True
         net_cls: type[torch.nn.Module] = ActorCritic
         obs_backend = str(os.environ.get("METABONK_OBS_BACKEND", "detections") or "").strip().lower()
-        if obs_backend in ("pixels", "hybrid"):
+        if obs_backend in ("pixels", "hybrid", "cutile"):
             try:
                 from src.learner.vision_actor_critic import VisionActorCritic
 

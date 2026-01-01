@@ -141,8 +141,6 @@ def main() -> int:
     env.setdefault("METABONK_PPO_BURN_IN", "8")
     env.setdefault("METABONK_FRAME_STACK", "4")
     env.setdefault("METABONK_PBT_USE_EVAL", "1")
-    env.setdefault("METABONK_MENU_WEIGHTS", str(Path(repo_root) / "checkpoints" / "menu_classifier.pt"))
-    env.setdefault("METABONK_MENU_THRESH", "0.5")
 
     procs: List[Proc] = []
     try:

@@ -140,6 +140,9 @@ def _preprocess_cutile(frame: "cp.ndarray", cfg: PreprocessConfig) -> "cp.ndarra
     assert HAS_CUTILE and cp is not None and ct is not None and _cutile_kernel is not None
     h, w, _c = frame.shape
     out_h, out_w = cfg.out_size
+    # Kernel assumes full tiles (no partial edge handling).
+    if (int(out_h) % int(TILE_H)) != 0 or (int(out_w) % int(TILE_W)) != 0:
+        raise ValueError(f"cuTile out_size must be multiples of {TILE_H}x{TILE_W} (got {out_h}x{out_w})")
     # Only support integer downsample for now.
     scale_h = max(1, h // out_h)
     scale_w = max(1, w // out_w)

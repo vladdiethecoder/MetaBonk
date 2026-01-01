@@ -49,6 +49,10 @@ export type Heartbeat = {
   stream_fps?: number | null;
   stream_keyframe_ts?: number | null;
   stream_keyframe_count?: number | null;
+  stream_frame_var?: number | null;
+  stream_black_since_s?: number | null;
+  stream_frame_diff?: number | null;
+  stream_frozen_since_s?: number | null;
   fifo_stream_enabled?: boolean | null;
   fifo_stream_path?: string | null;
   fifo_stream_last_error?: string | null;
@@ -71,7 +75,7 @@ export type Heartbeat = {
   sponsor_user_id?: string | null;
   sponsor_avatar_url?: string | null;
   bonk_confidence?: number | null;
-  menu_doom_spiral?: number | null;
+  stuck_score?: number | null;
   chat_influence?: number | null;
   ts: number;
 };

@@ -73,7 +73,7 @@ export const ICON_MAP = {
     { i: 56, key: "training", label: "Training update / Step", hud: "pill: steps or upd/s" },
 
     { i: 57, key: "no_gpu_feed", label: "No GPU feed", hud: "state: feed offline" },
-    { i: 58, key: "menu_stuck", label: "Menu stuck", hud: "state: recovery needed" },
+    { i: 58, key: "menu_stuck", label: "Stuck", hud: "state: recovery needed" },
 
     { i: 59, key: "warning", label: "Warning / Alert", hud: "event: alert" },
     { i: 60, key: "info", label: "Info / Legend", hud: "tooltip/legend" },

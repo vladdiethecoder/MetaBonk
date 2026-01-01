@@ -701,7 +701,7 @@ function StreamTile({
   const streakCur = Number((w as any)?.streak_current ?? 0) || null;
   const streakBest = Number((w as any)?.streak_best ?? 0) || null;
   const status = String(w?.status ?? "").toLowerCase();
-  const menuStuck = status.includes("menu") || status.includes("stuck");
+  const stuckFlag = status.includes("stuck");
   const actionsPerMin = stepRate != null ? Math.max(0, stepRate) : null;
   const surprise = clamp(Number(w?.action_entropy ?? danger), 0, 1);
   const glitch = surprise > 0.75 || danger > 0.6;
@@ -893,7 +893,7 @@ function StreamTile({
               </span>
               </div>
             )}
-            {!standby && (overrun || menuStuck || (showLabels && (hype || shame || drops > 0 || legs > 0))) ? (
+            {!standby && (overrun || stuckFlag || (showLabels && (hype || shame || drops > 0 || legs > 0))) ? (
               <div className="stream-ov-alerts">
                 {showLabels && hype ? (
                   <span className="stream-ov-flag" title={`hype ${hype}`}>
@@ -919,10 +919,10 @@ function StreamTile({
                     </span>
                   </span>
                 ) : null}
-                {menuStuck ? (
-                  <span className="stream-ov-flag danger" title="menu stuck">
+                {stuckFlag ? (
+                  <span className="stream-ov-flag danger" title="stuck">
                     <SpriteIcon idx={sheetIcon("menu_stuck")} size={16} />
-                    <span className="stream-ov-flag-label">MENU STUCK</span>
+                    <span className="stream-ov-flag-label">STUCK</span>
                   </span>
                 ) : null}
                 {overrun ? (
@@ -1452,10 +1452,10 @@ export default function Stream() {
     const hype = workers.reduce((sum, w) => sum + Number((w as any)?.hype_score ?? 0), 0);
     const hypeAvg = workers.length ? hype / workers.length : 0;
     const confVals = workers.map((w) => Number((w as any)?.bonk_confidence)).filter((v) => Number.isFinite(v));
-    const doomVals = workers.map((w) => Number((w as any)?.menu_doom_spiral)).filter((v) => Number.isFinite(v));
+    const stuckVals = workers.map((w) => Number((w as any)?.stuck_score)).filter((v) => Number.isFinite(v));
     const chatVals = workers.map((w) => Number((w as any)?.chat_influence)).filter((v) => Number.isFinite(v));
     const conf = confVals.length ? confVals.reduce((a, b) => a + b, 0) / confVals.length : 0;
-    const doom = doomVals.length ? doomVals.reduce((a, b) => a + b, 0) / doomVals.length : 0;
+    const stuckScore = stuckVals.length ? stuckVals.reduce((a, b) => a + b, 0) / stuckVals.length : 0;
     const chat = chatVals.length ? chatVals.reduce((a, b) => a + b, 0) / chatVals.length : 0;
     return {
       bonksPerMin: bonks.length / 2,
@@ -1463,7 +1463,7 @@ export default function Stream() {
       borgars,
       hype: Math.round(hypeAvg * 100),
       bonkConfidence: Math.round(conf * 100),
-      menuDoom: Math.round(doom),
+      stuckScore: Math.round(stuckScore),
       chatInfluence: Math.round(chat * 100),
     };
   }, [events, workers]);
@@ -2021,8 +2021,8 @@ export default function Stream() {
         const recordChase =
           leaderTop.length > 1 && iid !== leaderId ? Math.max(0, 1 - scoreOf(w) / Math.max(1, scoreOf(leaderTop[0]))) : 0;
         const status = String(w?.status ?? "").toLowerCase();
-        const menu = status.includes("menu") || status.includes("stuck") ? 1 : 0;
-        const score = w1 * (combat ? 1 : 0) + w2 * delta + w3 * novelty + w4 * danger + w5 * recordChase - w6 * menu;
+        const stuck = status.includes("stuck") ? 1 : 0;
+        const score = w1 * (combat ? 1 : 0) + w2 * delta + w3 * novelty + w4 * danger + w5 * recordChase - w6 * stuck;
         if (!best || score > best.score) best = { iid, score };
       }
       if (!best) return;
@@ -2162,7 +2162,7 @@ export default function Stream() {
                 <div className="meme-pill">Deaths/2m {memeStats.deaths2m}</div>
                 <div className="meme-pill">Hype {memeStats.hype}</div>
                 <div className="meme-pill">Bonk Conf {memeStats.bonkConfidence}%</div>
-                <div className="meme-pill">Menu Doom {memeStats.menuDoom}</div>
+                <div className="meme-pill">Stuck {memeStats.stuckScore}</div>
                 <div className="meme-pill">Chat Influence {memeStats.chatInfluence}%</div>
               </div>
 
