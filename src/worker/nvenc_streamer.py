@@ -1026,6 +1026,32 @@ class NVENCStreamer:
         enc_opts: list[str] = []
         enc_props = _gst_element_properties(encoder)
         if encoder.startswith("nv"):
+            # High-quality encoder settings to prevent rainbow banding artifacts.
+            # These settings prioritize quality over minimal latency for smooth gradients.
+            gst_preset = str(os.environ.get("METABONK_GST_NVENC_PRESET", "hq")).strip() or "hq"
+            if "preset" in enc_props:
+                enc_opts.append(f"preset={gst_preset}")
+            # Rate control mode: cbr (constant bitrate) provides consistent quality.
+            gst_rc_mode = str(os.environ.get("METABONK_GST_NVENC_RC_MODE", "cbr")).strip() or "cbr"
+            if "rc-mode" in enc_props:
+                enc_opts.append(f"rc-mode={gst_rc_mode}")
+            # Quantization parameter bounds to prevent over-compression (banding).
+            # Lower qp = higher quality. qp-min=16, qp-max=23 ensures good gradient smoothness.
+            try:
+                gst_qp_min = int(os.environ.get("METABONK_GST_NVENC_QP_MIN", "16"))
+            except Exception:
+                gst_qp_min = 16
+            try:
+                gst_qp_max = int(os.environ.get("METABONK_GST_NVENC_QP_MAX", "23"))
+            except Exception:
+                gst_qp_max = 23
+            if "qp-min" in enc_props:
+                enc_opts.append(f"qp-min={gst_qp_min}")
+            if "qp-max" in enc_props:
+                enc_opts.append(f"qp-max={gst_qp_max}")
+            # Use higher default bitrate for better quality (8 Mbps for 720p).
+            if bitrate_kbps <= 0:
+                bitrate_kbps = int(os.environ.get("METABONK_GST_NVENC_BITRATE", "8000") or 8000)
             if bitrate_kbps > 0 and "bitrate" in enc_props:
                 enc_opts.append(f"bitrate={bitrate_kbps}")
             if gop > 0:
@@ -1543,6 +1569,17 @@ class NVENCStreamer:
                 cmd += ["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bufsize]
                 cmd += ["-g", str(gop), "-keyint_min", str(max(1, int(keyint_min))), "-bf", str(max(0, int(bf)))]
                 cmd += ["-forced-idr", "1" if forced_idr else "0", "-rc-lookahead", "0"]
+                # Add QP bounds to prevent rainbow banding artifacts (over-compression).
+                # Lower qp = higher quality. qmin=16, qmax=23 ensures smooth gradients.
+                try:
+                    ffmpeg_qp_min = int(os.environ.get("METABONK_STREAM_QP_MIN", "16"))
+                except Exception:
+                    ffmpeg_qp_min = 16
+                try:
+                    ffmpeg_qp_max = int(os.environ.get("METABONK_STREAM_QP_MAX", "23"))
+                except Exception:
+                    ffmpeg_qp_max = 23
+                cmd += ["-qmin", str(max(0, ffmpeg_qp_min)), "-qmax", str(max(1, ffmpeg_qp_max))]
             elif enc.endswith("_vaapi"):
                 # Note: VAAPI encoders typically expect hw frames; we still allow it but it may fall back/ fail.
                 try:

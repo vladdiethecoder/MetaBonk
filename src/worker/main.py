@@ -61,6 +61,7 @@ from .nvenc_streamer import NVENCConfig, NVENCStreamer, PixelFrame, CudaFrame
 from .fifo_publisher import FifoH264Publisher, FifoPublishConfig
 from .highlight_recorder import HighlightConfig, HighlightRecorder
 from .stream_health import jpeg_luma_thumbnail, luma_mean_abs_diff
+from .gameplay_detector import HybridGameplayDetector
 
 try:
     from src.agent.cognitive_client import CognitiveClient  # type: ignore
@@ -877,6 +878,23 @@ class WorkerService:
         self._last_valid_frame: Optional[dict] = None
         self._gameplay_started: bool = False
         self._gameplay_start_ts: float = 0.0
+        # Hybrid gameplay detector for robust game-agnostic detection.
+        # Prevents false positives when stuck in menus/loading screens.
+        # Higher variance threshold (2000) filters out animated menus.
+        # Higher confidence threshold (0.75) requires stronger signal.
+        try:
+            gd_variance = float(os.environ.get("METABONK_GAMEPLAY_VARIANCE_THRESHOLD", "2000"))
+        except Exception:
+            gd_variance = 2000.0
+        try:
+            gd_confidence = float(os.environ.get("METABONK_GAMEPLAY_MIN_CONFIDENCE", "0.90"))
+        except Exception:
+            gd_confidence = 0.90
+        self._gameplay_detector = HybridGameplayDetector(
+            variance_threshold=gd_variance,
+            min_confidence=gd_confidence,
+        )
+        self._gameplay_confidence: float = 0.0
         self._action_source = self._normalize_action_source(
             os.environ.get("METABONK_ACTION_SOURCE", "policy")
         )
@@ -2992,26 +3010,40 @@ class WorkerService:
         *,
         hud_present: bool = False,
         phase_gameplay: bool = False,
+        frame: "Any" = None,
+        step_increment: int = 0,
+        action_taken: bool = False,
     ) -> None:
         if self._gameplay_started:
             return
-        if phase_gameplay or hud_present:
-            self._gameplay_started = True
-            self._gameplay_start_ts = time.time()
-            return
-        # Pure-vision contract: do not mark gameplay based on game-state time counters.
-        # Some builds report `gameTime` while still in menus/lobbies, which would prematurely
-        # disable pre-gameplay UI advancement logic.
-        if bool(getattr(self, "_pure_vision_mode", False)):
-            return
-        try:
-            from src.proof_harness.guards import should_mark_gameplay_started
-
-            if should_mark_gameplay_started(game_state):
-                self._gameplay_started = True
-                self._gameplay_start_ts = time.time()
-        except Exception:
-            return
+        
+        # ONLY use hybrid detector for gameplay detection.
+        # No HUD boost, no legacy fallbacks - pure vision only.
+        if frame is not None and hasattr(self, "_gameplay_detector"):
+            try:
+                import numpy as np
+                # Ensure frame is numpy array
+                if hasattr(frame, "numpy"):
+                    frame_arr = frame.cpu().numpy() if hasattr(frame, "cpu") else frame.numpy()
+                elif hasattr(frame, "detach"):
+                    frame_arr = frame.detach().cpu().numpy()
+                elif isinstance(frame, np.ndarray):
+                    frame_arr = frame
+                else:
+                    frame_arr = np.asarray(frame)
+                
+                detected = self._gameplay_detector.update(
+                    frame=frame_arr,
+                    step_increment=step_increment,
+                    action_taken=action_taken,
+                )
+                self._gameplay_confidence = self._gameplay_detector.confidence
+                
+                if detected:
+                    self._gameplay_started = True
+                    self._gameplay_start_ts = time.time()
+            except Exception:
+                pass
 
     def _flag_action_guard_violation(self, reason: str) -> None:
         if self._action_guard_violation:
@@ -4371,6 +4403,7 @@ class WorkerService:
             "frame_w": int(w),
             "frame_h": int(h),
             "gameplay_started": bool(getattr(self, "_gameplay_started", False)),
+            "gameplay_confidence": float(getattr(self, "_gameplay_confidence", 0.0) or 0.0),
             "stuck": bool(stuck),
             "stuck_score": stuck_score,
             "visual_novelty": visual_novelty,
@@ -5870,12 +5903,7 @@ class WorkerService:
             )
             self._maybe_dump_phase_sample(now=now, label=dataset_label, game_state=game_state)
 
-            self._update_gameplay_state(
-                game_state,
-                hud_present=self._hud_present,
-                phase_gameplay=gameplay_now,
-            )
-
+            # Get pixel observations FIRST so we can feed them to the gameplay detector.
             pixel_tensor = None
             pixel_frame_id = None
             pixel_src_size = None
@@ -5924,6 +5952,17 @@ class WorkerService:
                         )
                     self._stop.wait(0.01)
                     continue
+
+            # Update gameplay state with frame data for hybrid detector.
+            # This is called AFTER we have pixel_tensor so the detector can analyze visuals.
+            self._update_gameplay_state(
+                game_state,
+                hud_present=self._hud_present,
+                phase_gameplay=gameplay_now,
+                frame=pixel_tensor,
+                step_increment=1,  # Each iteration is a step
+                action_taken=True,  # We're in the action loop
+            )
 
             # Optional System 2/3 centralized VLM loop (non-blocking).
             if self._cognitive_client is not None:
@@ -7986,6 +8025,7 @@ class WorkerService:
             "instance_id": self.instance_id,
             "policy_name": self.policy_name,
             "gameplay_started": bool(self._gameplay_started),
+            "gameplay_confidence": float(getattr(self, "_gameplay_confidence", 0.0) or 0.0),
             "hud_present": bool(self._hud_present),
             "hud_phase": ("gameplay" if self._hud_present else "lobby"),
             "observation_backend": str(getattr(self, "_obs_backend", "") or ""),
