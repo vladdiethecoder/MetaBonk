@@ -1,0 +1,10 @@
+Crash Recovery Test
+═══════════════════
+
+Worker Tested: 2
+Port: 5002
+Initial PID: 2379251
+Recovery Time: 30 seconds
+Status: PASS
+
+Notes: Worker process was SIGKILLed; supervise loop should respawn it.

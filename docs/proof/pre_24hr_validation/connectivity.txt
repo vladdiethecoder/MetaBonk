@@ -1,0 +1,11 @@
+Network Connectivity Check
+══════════════════════════
+
+✅ http://127.0.0.1:8040/workers (HTTP 200)
+✅ http://127.0.0.1:5000/status (HTTP 200)
+✅ http://127.0.0.1:5001/status (HTTP 200)
+✅ http://127.0.0.1:5002/status (HTTP 200)
+✅ http://127.0.0.1:5003/status (HTTP 200)
+✅ http://127.0.0.1:5004/status (HTTP 200)
+
+Status: PASS

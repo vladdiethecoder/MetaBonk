@@ -1,0 +1,5 @@
+
+System2 Benchmark
+================
+mode=infer server=tcp://127.0.0.1:5555 workers=5 requests=10 time=10.03s
+errors=10/10

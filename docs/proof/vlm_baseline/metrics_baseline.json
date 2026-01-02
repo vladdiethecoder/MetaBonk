@@ -1,0 +1,8 @@
+{
+  "timestamp": "2026-01-01T18:17:43-05:00",
+  "workers": 5,
+  "vlm_hints_total": 135,
+  "vlm_hints_applied_total": 108,
+  "scenes_total": 7,
+  "avg_exploration": 1.003780
+}

@@ -1,0 +1,11 @@
+{
+  "name": "phi3_full_transformers",
+  "config_file": "/tmp/launch_model_phi3_full_transformers.json",
+  "timestamp": "2026-01-01T18:35:34-05:00",
+  "duration_s": 300,
+  "hints_delta": 294,
+  "scenes_delta": 5,
+  "hints_per_minute": 58.8,
+  "scenes_per_minute": 1.0,
+  "infer_ms_avg": "0.0"
+}

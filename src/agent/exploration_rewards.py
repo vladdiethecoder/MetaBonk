@@ -168,3 +168,94 @@ def exploration_weight(step: int) -> float:
     return float(1.0 * (1.0 - t) + 0.5 * t)
 
 __all__ = ["ExplorationReward", "ExplorationRewardConfig", "ExplorationRewardModule", "exploration_weight"]
+
+
+class ExplorationRewards:
+    """Pure-vision exploration rewards (compatibility wrapper).
+
+    The implementation plan and some validation harnesses refer to a pixel-based
+    `ExplorationRewards` helper that tracks novelty, transitions, and new-scene
+    discovery. The production worker uses `VisualExplorationReward`; this class
+    wraps it behind the original plan's API (`compute_reward`, `get_metrics`).
+    """
+
+    def __init__(
+        self,
+        novelty_weight: float = 0.5,
+        transition_weight: float = 2.0,
+        new_scene_weight: float = 5.0,
+        diversity_weight: float = 0.0,
+        *,
+        transition_novelty_thresh: float = 0.25,
+    ) -> None:
+        try:
+            from src.agent.visual_exploration_reward import (  # type: ignore
+                VisualExplorationConfig,
+                VisualExplorationReward,
+            )
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("VisualExplorationReward is unavailable") from e
+
+        cfg = VisualExplorationConfig(
+            novelty_weight=float(novelty_weight),
+            transition_bonus=float(transition_weight),
+            new_scene_bonus=float(new_scene_weight),
+            transition_novelty_thresh=float(transition_novelty_thresh),
+        )
+        self._core = VisualExplorationReward(cfg)
+        self.diversity_weight = float(diversity_weight)
+        self.action_history: list[object] = []
+
+        # Mirror plan-style metric names for introspection.
+        self.last_reward: float = 0.0
+        self.last_novelty: float = 0.0
+        self.last_transition: bool = False
+        self.last_new_scene: bool = False
+
+    def _is_different_action(self, a1: object, a2: object) -> bool:
+        try:
+            if not isinstance(a1, dict) or not isinstance(a2, dict):
+                return a1 != a2
+            if a1.get("type") != a2.get("type"):
+                return True
+            if a1.get("type") == "click":
+                dx = abs(float(a1.get("x", 0.0)) - float(a2.get("x", 0.0)))
+                dy = abs(float(a1.get("y", 0.0)) - float(a2.get("y", 0.0)))
+                return (dx > 0.05) or (dy > 0.05)
+            return a1.get("key") != a2.get("key")
+        except Exception:
+            return True
+
+    def compute_reward(self, obs: object, action: object) -> float:
+        """Compute exploration reward from pixels (obs) and action (best-effort)."""
+        base = float(self._core.update(obs))
+        bonus = 0.0
+        if self.diversity_weight > 0.0 and self.action_history:
+            if self._is_different_action(action, self.action_history[-1]):
+                bonus = float(self.diversity_weight)
+        self.action_history.append(action)
+        reward = float(base + bonus)
+
+        # Keep plan-style fields up to date.
+        self.last_reward = reward
+        self.last_novelty = float(getattr(self._core, "last_novelty", 0.0))
+        self.last_transition = bool(getattr(self._core, "last_transition", False))
+        self.last_new_scene = bool(getattr(self._core, "last_new_scene", False))
+        return reward
+
+    def get_metrics(self) -> dict:
+        m = {}
+        try:
+            m = dict(self._core.metrics() or {})
+        except Exception:
+            m = {}
+        # Ensure plan/harness keys exist.
+        m.setdefault("exploration_reward", float(self.last_reward))
+        m.setdefault("visual_novelty", float(self.last_novelty))
+        m.setdefault("screen_transition", bool(self.last_transition))
+        m.setdefault("new_scene", bool(self.last_new_scene))
+        m.setdefault("scenes_discovered", int(getattr(self._core, "scenes_discovered", lambda: 0)()))
+        m.setdefault("actions_taken", int(len(self.action_history)))
+        if "scene_fingerprint" not in m:
+            m["scene_fingerprint"] = m.get("scene_hash")
+        return m

@@ -92,22 +92,34 @@ def main() -> int:
     print("MetaBonk Deployment Validation")
     print("=" * 32)
 
-    metrics = _zmq_get_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
-    if metrics is None:
-        ok = False
-        if zmq is None:
-            print("❌ Cognitive server: pyzmq not installed (cannot validate ZMQ)")
-        else:
-            print(f"❌ Cognitive server: no response from {args.cognitive_url}")
+    # If workers are reachable and explicitly report System2 disabled, treat the
+    # cognitive server check as skipped (this script is best-effort and should
+    # not fail deployments that intentionally run without System2).
+    system2_enabled = None
+    if int(args.workers) > 0 and requests is not None:
+        st0 = _probe_worker_status(int(args.worker_base_port), timeout_s=float(args.timeout_s))
+        if isinstance(st0, dict) and "system2_enabled" in st0:
+            system2_enabled = bool(st0.get("system2_enabled", False))
+
+    if system2_enabled is False:
+        print("✅ Cognitive server: skipped (System2 disabled by worker config)")
     else:
-        print(f"✅ Cognitive server: {args.cognitive_url}")
-        try:
-            req = int(metrics.get("request_count") or 0)
-            agents = int(metrics.get("active_agents") or 0)
-            avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
-            print(f"   requests={req} agents={agents} avg_latency_ms={avg_ms:.1f}")
-        except Exception:
-            pass
+        metrics = _zmq_get_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
+        if metrics is None:
+            ok = False
+            if zmq is None:
+                print("❌ Cognitive server: pyzmq not installed (cannot validate ZMQ)")
+            else:
+                print(f"❌ Cognitive server: no response from {args.cognitive_url}")
+        else:
+            print(f"✅ Cognitive server: {args.cognitive_url}")
+            try:
+                req = int(metrics.get("request_count") or 0)
+                agents = int(metrics.get("active_agents") or 0)
+                avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
+                print(f"   requests={req} agents={agents} avg_latency_ms={avg_ms:.1f}")
+            except Exception:
+                pass
 
     if int(args.workers) > 0:
         if requests is None:

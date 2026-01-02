@@ -1,0 +1,5 @@
+GPU UTILIZATION
+Timestamp: Thu Jan  1 18:18:55 EST 2026
+
+index, name, utilization.gpu [%], utilization.memory [%], memory.used [MiB], memory.total [MiB]
+0, NVIDIA GeForce RTX 5090, 68 %, 19 %, 23457 MiB, 32607 MiB

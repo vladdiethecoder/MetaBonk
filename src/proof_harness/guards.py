@@ -9,18 +9,13 @@ from typing import Optional
 
 
 def should_mark_gameplay_started(game_state: dict, *, min_game_time: float = 1.0) -> bool:
+    # IMPORTANT: Do NOT treat generic time counters (e.g., engine uptime) as "gameplay".
+    # Some builds report `gameTime` even in menus/lobbies, which breaks pre-gameplay
+    # UI advancement by prematurely disabling it.
     try:
-        if bool(game_state.get("isPlaying")):
-            return True
-    except Exception:
-        pass
-    try:
-        game_time = float(game_state.get("gameTime") or 0.0)
-        if game_time > float(min_game_time):
-            return True
+        return bool(game_state.get("isPlaying"))
     except Exception:
         return False
-    return False
 
 
 def action_guard_violation(

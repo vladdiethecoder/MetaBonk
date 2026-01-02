@@ -47,19 +47,13 @@ def test_gpu_preflight_required():
 
     # CUDA 13.1+ enforcement (per MetaBonk spec).
     try:
-        import torch  # type: ignore
+        from src.common.cuda131 import assert_cuda131
     except Exception as e:
-        raise AssertionError(f"METABONK_REQUIRE_CUDA=1 but torch import failed: {e}") from e
-    torch_cuda = str(getattr(getattr(torch, "version", None), "cuda", "") or "").strip()
-    assert torch_cuda, "METABONK_REQUIRE_CUDA=1 but torch.version.cuda is empty"
+        raise AssertionError(f"Failed to import CUDA preflight helpers: {e}") from e
     try:
-        from src.common.cuda131 import cuda_version_lt
+        assert_cuda131(context="pytest:gpu_preflight_required")
     except Exception as e:
-        raise AssertionError(f"Failed to import CUDA version helpers: {e}") from e
-    assert not cuda_version_lt(torch_cuda, "13.1"), f"CUDA 13.1+ required, found torch CUDA {torch_cuda}"
-    if torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        assert cc[0] >= 9, f"Compute capability 9.0+ required, found {cc[0]}.{cc[1]}"
+        raise AssertionError(str(e)) from e
 
     stream_enabled = _truthy(os.environ.get("METABONK_STREAM", "1"))
     if not stream_enabled:

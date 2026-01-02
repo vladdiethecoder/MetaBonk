@@ -36,7 +36,8 @@ def test_video_export_wrapper(tmp_path: Path):
 
 def test_gameplay_started_gate():
     assert should_mark_gameplay_started({"isPlaying": True}) is True
-    assert should_mark_gameplay_started({"gameTime": 2.0}) is True
+    # `gameTime` can advance in menus/lobbies; it must not imply gameplay.
+    assert should_mark_gameplay_started({"gameTime": 2.0}) is False
     assert should_mark_gameplay_started({}) is False
 
 

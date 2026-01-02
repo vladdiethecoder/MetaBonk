@@ -4,6 +4,7 @@
 FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 # System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,8 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python deps
 # sglang pins a compatible torch/transformers/flashinfer stack for Blackwell (sm_120) GPUs.
-RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    python3 -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir \
       sglang==0.5.6.post2
 
 # Prefer a newer Transformers build so Phi-3-Vision can take advantage of faster

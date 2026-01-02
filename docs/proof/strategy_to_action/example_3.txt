@@ -1,0 +1,62 @@
+═══════════════════════════════════════════════════════════════
+STRATEGY-TO-ACTION EXAMPLE 3
+═══════════════════════════════════════════════════════════════
+
+Run: run-launch-1767311073
+Worker: omega-2 (port 5002)
+Timestamp: 2026-01-01 19:00:14
+
+SYSTEM2 REASONING (from /status):
+{
+  "confidence": 0.0,
+  "directive": {
+    "action": "explore",
+    "duration_seconds": 2.0,
+    "priority": "medium",
+    "target": [
+      0.5,
+      0.5
+    ]
+  },
+  "goal": "survive",
+  "inference_time_ms": 441.93506240844727,
+  "last_request_ts": 1767312010.4137502,
+  "last_response_ts": 1767312005.8879864
+}
+
+STATUS BEFORE (summary):
+{
+  "exploration_reward": 5.006332834251225,
+  "fps": 60.0,
+  "frames": 54450,
+  "scenes_discovered": 31,
+  "step": 196.0,
+  "stuck_score": 0.0,
+  "vlm_hints_applied": 166,
+  "vlm_hints_used": 166
+}
+
+STATUS AFTER (summary):
+{
+  "exploration_reward": 5.000918739417102,
+  "fps": 60.0,
+  "frames": 55035,
+  "scenes_discovered": 32,
+  "step": 198.0,
+  "stuck_score": 0.0,
+  "vlm_hints_applied": 168,
+  "vlm_hints_used": 168
+}
+
+DELTAS:
+  scenes_discovered: 31 -> 32 (Δ +1)
+  stuck_score: 0.0000 -> 0.0000 (Δ +0.0000)
+  vlm_hints_used: 166 -> 168 (Δ +2)
+  vlm_hints_applied: 166 -> 168 (Δ +2)
+
+ACTION TRACE (from worker log):
+docs/proof/strategy_to_action/action_trace_3.txt
+
+[worker:omega-2] action step=60 src=policy+system2 label=disc:14 stuck=False cont=[-0.041, -0.212] disc=[]
+[worker:omega-2] action step=120 src=policy+system2 label=disc:21 stuck=False cont=[0.05, -0.245] disc=[]
+[worker:omega-2] action step=180 src=policy+system2 label=disc:22 stuck=False cont=[-0.494, -0.475] disc=[]

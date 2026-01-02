@@ -1,0 +1,11 @@
+METABONK WORKER STATUS (ALL)
+
+Timestamp: Thu Jan  1 18:18:55 EST 2026
+
+Worker   FPS   stream_ok  zero_copy  scenes stuck  vlm_used  vlm_app  
+------   ---   --------   --------   -----  -----  --------  -------  
+0        60.0  true       true       2      0.060000000000000005 44        44       
+1        60.0  true       true       0      0.0    44        44       
+2        60.0  true       true       0      0.0    44        44       
+3        60.0  true       true       0      0.0    44        0        
+4        60.0  N/A        true       8      0.0    44        44       

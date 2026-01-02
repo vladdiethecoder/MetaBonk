@@ -1,0 +1,13 @@
+=== Resource Profile Summary (10 samples @30s) ===
+Samples: 10
+
+GPU util %: avg=55.1 min=31.0 max=78.0
+GPU mem MiB: avg=24473.7 min=24089.0 max=25365.0
+CPU user %: avg=16.6 min=12.7 max=26.0
+RAM used GiB: avg=12.2 min=12.0 max=13.0
+
+Worker 0 FPS: avg=60.0 min=60.0 max=60.0
+Worker 1 FPS: avg=60.0 min=60.0 max=60.0
+Worker 2 FPS: avg=60.0 min=60.0 max=60.0
+Worker 3 FPS: avg=60.0 min=60.0 max=60.0
+Worker 4 FPS: avg=60.0 min=60.0 max=60.0

@@ -1,0 +1,38 @@
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║                    STREAM HEALTH STATUS                       ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Timestamp: Thu Jan  1 18:18:16 EST 2026
+
+Worker 0:
+  stream_ok: true
+  stream_frozen: N/A
+  stream_diff: 3.6642112731933594
+  zero_copy: true
+
+Worker 1:
+  stream_ok: true
+  stream_frozen: N/A
+  stream_diff: 2.4562478065490723
+  zero_copy: true
+
+Worker 2:
+  stream_ok: true
+  stream_frozen: N/A
+  stream_diff: 1.2617498636245728
+  zero_copy: true
+
+Worker 3:
+  stream_ok: true
+  stream_frozen: N/A
+  stream_diff: 2.0803420543670654
+  zero_copy: true
+
+Worker 4:
+  stream_ok: N/A
+  stream_frozen: true
+  stream_diff: 0.1469981074333191
+  zero_copy: true
+

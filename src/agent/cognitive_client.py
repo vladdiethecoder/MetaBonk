@@ -72,7 +72,21 @@ class CognitiveClient:
         self.jpeg_quality = int(max(1, min(95, jpeg_quality)))
         self.max_edge = int(max(0, max_edge))
         try:
-            self.frames_per_request = int(os.environ.get("METABONK_SYSTEM2_FRAMES", "9") or 9)
+            default_frames = "9"
+            try:
+                pure = str(os.environ.get("METABONK_PURE_VISION_MODE", "") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            except Exception:
+                pure = False
+            if pure:
+                # Pure-vision runs default to a single frame to reduce CPU JPEG encode overhead and
+                # keep the rollout loop responsive. The server still supports 1..9 frames.
+                default_frames = "1"
+            self.frames_per_request = int(os.environ.get("METABONK_SYSTEM2_FRAMES", default_frames) or default_frames)
         except Exception:
             self.frames_per_request = 9
         self.frames_per_request = max(1, min(9, int(self.frames_per_request)))
@@ -146,7 +160,8 @@ class CognitiveClient:
             return False
         if self.pending_request:
             return False
-        if len(self.frame_buffer) < 2:
+        min_frames = 1 if int(getattr(self, "frames_per_request", 2) or 2) <= 1 else 2
+        if len(self.frame_buffer) < int(min_frames):
             return False
         return True
 
@@ -216,16 +231,21 @@ class CognitiveClient:
 
         The server accepts 1..9 frames. Default remains 9 for maximum temporal context.
         """
-        if len(self.frame_buffer) < 2:
+        if len(self.frame_buffer) < 1:
             return None
         total_frames = max(1, min(9, int(total_frames)))
 
         past = list(self.frame_buffer)
         current = past[-1]
-        all_frames: List[np.ndarray] = list(past)
-        if len(all_frames) < total_frames:
-            future = self.future_predictor.predict(current, past[-2])
-            all_frames.extend(future)
+        if total_frames <= 1:
+            all_frames: List[np.ndarray] = [current]
+        else:
+            if len(past) < 2:
+                return None
+            all_frames = list(past)
+            if len(all_frames) < total_frames:
+                future = self.future_predictor.predict(current, past[-2])
+                all_frames.extend(future)
 
         # Pad/clip to requested frame count.
         while len(all_frames) < total_frames:

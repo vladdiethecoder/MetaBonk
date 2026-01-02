@@ -1,0 +1,108 @@
+[96m
+╔════════════════════════════════════════════════════════════╗
+║                         METABONK                           ║
+║                 Unified Training Launcher                  ║
+╚════════════════════════════════════════════════════════════╝
+[0m
+[1mPrerequisites[0m
+  [92m✓[0m GPU detected (nvidia-smi)
+  [92m✓[0m docker available
+  [92m✓[0m docker GPU runtime ok
+  [92m✓[0m game dir: /run/media/vdubrov/Active Storage/SteamLibrary/steamapps/common/Megabonk
+[1mCleanup[0m
+time="2026-01-01T18:29:27-05:00" level=warning msg="Warning: No resource found to remove for project \"metabonk-go2rtc\"."
+time="2026-01-01T18:29:27-05:00" level=warning msg="Warning: No resource found to remove for project \"metabonk-go2rtc\"."
+[stop] no detected MetaBonk process groups
+[stop] ok: no remaining MetaBonk PIDs detected
+[1mCognitive Server[0m
+╔════════════════════════════════════════════════════════════╗
+║  MetaBonk Centralized Cognitive Server                    ║
+╚════════════════════════════════════════════════════════════╝
+
+⚠️  DOCKER_HOST points to Podman; using system Docker daemon for this script.
+
+🏗️  Building cognitive server container...
+ Image metabonk-cognitive-server:latest Building 
+ Image metabonk-cognitive-server:latest Building 
+Sending build context to Docker daemon  54.41kB
+Step 1/16 : FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
+ ---> 7f32ae6e575a
+Step 2/16 : ENV DEBIAN_FRONTEND=noninteractive
+ ---> Using cache
+ ---> 9674aba66aa5
+Step 3/16 : ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ ---> Using cache
+ ---> 2b39b62aaee4
+Step 4/16 : RUN apt-get update && apt-get install -y --no-install-recommends     python3     python3-dev     python3-pip     git     wget     ca-certificates     libzmq3-dev     && rm -rf /var/lib/apt/lists/*
+ ---> Using cache
+ ---> d05d6125c824
+Step 5/16 : RUN python3 -m pip install --no-cache-dir       sglang==0.5.6.post2
+ ---> Using cache
+ ---> bb41aa299f23
+Step 6/16 : RUN python3 -m pip install --no-cache-dir       transformers==4.57.1
+ ---> Using cache
+ ---> dfc2e1f758f0
+Step 7/16 : RUN apt-get update && apt-get install -y --no-install-recommends     libnuma1     && rm -rf /var/lib/apt/lists/*
+ ---> Using cache
+ ---> 89fb13c53974
+Step 8/16 : WORKDIR /app
+ ---> Using cache
+ ---> 1e19111225ec
+Step 9/16 : COPY cognitive_server.py /app/
+ ---> Using cache
+ ---> 72d9d6dad7ea
+Step 10/16 : COPY temporal_processor.py /app/
+ ---> Using cache
+ ---> b83ac0cdc9a0
+Step 11/16 : COPY zmq_bridge.py /app/
+ ---> Using cache
+ ---> f487f1fbd19b
+Step 12/16 : COPY rl_integration.py /app/
+ ---> Using cache
+ ---> 023654eebde2
+Step 13/16 : COPY pyairports /app/pyairports
+ ---> Using cache
+ ---> dde4ce43524b
+Step 14/16 : EXPOSE 5555
+ ---> Using cache
+ ---> 8b15bc035d10
+Step 15/16 : CMD ["python3", "cognitive_server.py",      "--model-path", "/models/Phi-3-vision-128k-instruct",      "--tp-size", "1",      "--sglang-port", "30000",      "--max-running-requests", "64",      "--zmq-port", "5555"]
+ ---> Using cache
+ ---> 5f428fc9f787
+Step 16/16 : LABEL com.docker.compose.image.builder=classic
+ ---> Using cache
+ ---> 2bcfb6d89690
+Successfully built 2bcfb6d89690
+Successfully tagged metabonk-cognitive-server:latest
+ Image metabonk-cognitive-server:latest Built 
+ Image metabonk-cognitive-server:latest Built 
+
+🚀 Starting cognitive server...
+time="2026-01-01T18:29:27-05:00" level=warning msg="No services to build"
+ Container metabonk-cognitive-server Creating 
+ Container metabonk-cognitive-server Created 
+ Container metabonk-cognitive-server Starting 
+ Container metabonk-cognitive-server Started 
+
+⏳ Waiting for server to initialize...
+✅ Cognitive server running!
+   ZMQ: tcp://127.0.0.1:5555
+   Logs: docker logs -f metabonk-cognitive-server
+[1mOmega + UI[0m
+[launch] starting: /usr/bin/python3 -u /mnt/5da59c95-9aac-48f9-bc21-48c043812e8c/MetaBonk/scripts/start.py --mode train --workers 5 --gamescope-width 1280 --gamescope-height 720 --stream-profile rtx5090_webrtc_8 --no-ui --go2rtc --optimize-5090
+[launch] logs: /mnt/5da59c95-9aac-48f9-bc21-48c043812e8c/MetaBonk/runs/run-launch-1767310173/logs/launch.log
+[1mValidation[0m
+MetaBonk Deployment Validation
+================================
+✅ Cognitive server: tcp://127.0.0.1:5555
+   requests=0 agents=5 avg_latency_ms=0.0
+✅ Workers: 5/5 /status endpoints reachable
+time="2026-01-01T18:35:37-05:00" level=warning msg="Warning: No resource found to remove for project \"metabonk-go2rtc\"."
+time="2026-01-01T18:35:37-05:00" level=warning msg="Warning: No resource found to remove for project \"metabonk-go2rtc\"."
+[stop] killing last job process group 2358529
+[stop] no detected MetaBonk process groups
+[stop] ok: no remaining MetaBonk PIDs detected
+ Container metabonk-cognitive-server Stopping 
+ Container metabonk-cognitive-server Stopped 
+ Container metabonk-cognitive-server Removing 
+ Container metabonk-cognitive-server Removed 

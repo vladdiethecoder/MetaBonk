@@ -1,0 +1,18 @@
+Log Status Check
+════════════════
+
+Total runs/ size: 9.2GiB
+Large logs (>100MB): 9 files
+
+Large logs:
+- runs/run-omega-1767069418/logs/synthetic_eye_0.log (178.1MiB)
+- runs/run-omega-1767058861/logs/synthetic_eye_0.log (127.8MiB)
+- runs/run-omega-1767074797/logs/synthetic_eye_2.log (123.4MiB)
+- runs/run-omega-1767074797/logs/synthetic_eye_1.log (123.4MiB)
+- runs/run-omega-1767074797/logs/synthetic_eye_0.log (123.4MiB)
+- runs/run-omega-1767084640/logs/worker_0.log (108.1MiB)
+- runs/run-omega-1767023502/logs/synthetic_eye_0.log (106.2MiB)
+- runs/run-omega-1767023502/logs/synthetic_eye_1.log (104.9MiB)
+- runs/run-omega-1767066265/logs/synthetic_eye_0.log (101.6MiB)
+
+Status: ⚠️  Review recommended

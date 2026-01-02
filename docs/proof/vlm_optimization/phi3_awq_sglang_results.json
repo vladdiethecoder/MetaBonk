@@ -1,0 +1,11 @@
+{
+  "name": "phi3_awq_sglang",
+  "config_file": "/tmp/launch_model_phi3_awq_sglang.json",
+  "timestamp": "2026-01-01T18:29:06-05:00",
+  "duration_s": 300,
+  "hints_delta": 315,
+  "scenes_delta": 16,
+  "hints_per_minute": 63.0,
+  "scenes_per_minute": 3.2,
+  "infer_ms_avg": ""
+}

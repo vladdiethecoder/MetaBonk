@@ -17,15 +17,15 @@ from typing import Optional, Tuple, Literal, Union
 import torch
 import os
 
-# Optional CUDA Tile + CuPy stack (CUDA 13.1+ / Blackwell).
+# Optional CUDA Tile + CuPy stack (CUDA 13.x / Blackwell).
 try:
     import cupy as cp  # type: ignore
     import cuda.tile as ct  # type: ignore
-    HAS_CUTILE = True
+    HAS_CUTILE_STACK = True
 except Exception:  # pragma: no cover
     cp = None  # type: ignore
     ct = None  # type: ignore
-    HAS_CUTILE = False
+    HAS_CUTILE_STACK = False
 
 try:
     import cvcuda  # type: ignore
@@ -61,13 +61,12 @@ def backend_from_env(default: Backend = "auto") -> Backend:
     return default
 
 
-# cuTile kernel (average-pool downsample + normalize). Defined only if available.
+# cuTile kernel (average-pool downsample + normalize). Defined only if cuda.tile is available.
 _cutile_kernel = None
-if HAS_CUTILE:
+TILE_H = 32
+TILE_W = 32
+if HAS_CUTILE_STACK:
     try:  # pragma: no cover
-        TILE_H = 32
-        TILE_W = 32
-
         @ct.kernel  # type: ignore[misc]
         def _downsample_and_normalize(in_img, out_img, scale_h, scale_w):
             bh = ct.bid(0)
@@ -84,7 +83,7 @@ if HAS_CUTILE:
 
         _cutile_kernel = _downsample_and_normalize
     except Exception:
-        HAS_CUTILE = False
+        HAS_CUTILE_STACK = False
         _cutile_kernel = None
 
 
@@ -137,7 +136,7 @@ def resize_gpu_tensor(x: torch.Tensor, cfg: PreprocessConfig) -> torch.Tensor:
 
 def _preprocess_cutile(frame: "cp.ndarray", cfg: PreprocessConfig) -> "cp.ndarray":
     """Downsample+normalize using cuTile (expects HWC uint8)."""
-    assert HAS_CUTILE and cp is not None and ct is not None and _cutile_kernel is not None
+    assert HAS_CUTILE_STACK and cp is not None and ct is not None and _cutile_kernel is not None
     h, w, _c = frame.shape
     out_h, out_w = cfg.out_size
     # Kernel assumes full tiles (no partial edge handling).
@@ -158,6 +157,55 @@ def _preprocess_cutile(frame: "cp.ndarray", cfg: PreprocessConfig) -> "cp.ndarra
     )
     ct.launch(cp.cuda.get_current_stream(), grid, _cutile_kernel, (frame, out, scale_h, scale_w))
     return out
+
+
+def _preprocess_cutile_torch(frame_chw: torch.Tensor, cfg: PreprocessConfig) -> torch.Tensor:
+    """Deterministic tile downsample+normalize (torch-only, CUDA tensor CHW).
+
+    This matches the integer-scale downsample contract used by CuTile:
+    - Output dims must be multiples of TILE_H/TILE_W
+    - Input dims must be divisible by output dims (integer scale)
+    """
+    if frame_chw.ndim != 3:
+        raise ValueError(f"expected CHW tensor, got shape={tuple(frame_chw.shape)}")
+    if not frame_chw.is_cuda:
+        raise RuntimeError("cuTile backend requires a CUDA tensor input")
+
+    out_h, out_w = (int(cfg.out_size[0]), int(cfg.out_size[1]))
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(f"invalid out_size={cfg.out_size}")
+    if (out_h % TILE_H) != 0 or (out_w % TILE_W) != 0:
+        raise ValueError(f"cuTile out_size must be multiples of {TILE_H}x{TILE_W} (got {out_h}x{out_w})")
+
+    c, h, w = (int(frame_chw.shape[0]), int(frame_chw.shape[1]), int(frame_chw.shape[2]))
+    if c not in (1, 3, 4):
+        raise ValueError(f"expected C in (1,3,4), got C={c}")
+    scale_h = h // out_h
+    scale_w = w // out_w
+    if scale_h < 1 or scale_w < 1:
+        raise ValueError(f"input too small for out_size: in={h}x{w} out={out_h}x{out_w}")
+    if (out_h * scale_h) != h or (out_w * scale_w) != w:
+        raise ValueError("cuTile downsample requires integer scale factors (input must be divisible by out_size)")
+
+    x = frame_chw
+    # Normalize to int32 0..255 for deterministic accumulation.
+    if x.dtype != torch.uint8:
+        x_f = x.to(dtype=torch.float32)
+        if float(x_f.max().item()) <= 1.5:
+            x_f = x_f * 255.0
+        x_i = x_f.round().clamp(0.0, 255.0).to(dtype=torch.int32)
+    else:
+        x_i = x.to(dtype=torch.int32)
+
+    # [C,H,W] -> [C,out_h,scale_h,out_w,scale_w] -> sum blocks
+    x_i = x_i.view(c, out_h, scale_h, out_w, scale_w)
+    s = x_i.sum(dim=(2, 4))
+    denom = float(scale_h * scale_w * 255.0)
+    y = (s.to(dtype=torch.float32) / denom).contiguous()
+    return y
+
+
+HAS_CUTILE = bool(torch.cuda.is_available())
 
 
 def preprocess_frame(
@@ -184,20 +232,23 @@ def preprocess_frame(
             chosen = "torch"
 
     if chosen == "cutile":
-        if not HAS_CUTILE or cp is None:
-            raise RuntimeError("cuTile backend requested but not available")
+        if not torch.cuda.is_available():
+            raise RuntimeError("cuTile backend requested but torch.cuda.is_available() is False")
         if isinstance(frame, bytes):
             if width is None or height is None:
                 raise ValueError("width/height required for bytes input")
-            arr = cp.frombuffer(frame, dtype=cp.uint8).reshape(height, width, 3)
+            # bytes are HWC uint8; convert to CHW uint8 CUDA tensor
+            x = torch.frombuffer(frame, dtype=torch.uint8).view(int(height), int(width), 3)
+            x = x.permute(2, 0, 1).contiguous().to(device=device)
+            out_t = _preprocess_cutile_torch(x, cfg)
         elif isinstance(frame, torch.Tensor):
-            # Torch CHW -> CuPy HWC via DLPack.
-            arr = cp.fromDlpack(torch.utils.dlpack.to_dlpack(frame.permute(1, 2, 0).contiguous()))
+            out_t = _preprocess_cutile_torch(frame.to(device=device), cfg)
         else:
-            arr = frame
-        out_cp = _preprocess_cutile(arr, cfg)
-        out_t = torch.utils.dlpack.from_dlpack(out_cp.toDlpack()).to(device)
-        out_t = out_t.permute(2, 0, 1).contiguous()
+            if not HAS_CUTILE_STACK or cp is None:
+                raise RuntimeError("cuTile backend requested but cuda.tile+CuPy stack is not available")
+            out_cp = _preprocess_cutile(frame, cfg)
+            out_t = torch.utils.dlpack.from_dlpack(out_cp.toDlpack()).to(device)
+            out_t = out_t.permute(2, 0, 1).contiguous()
     else:
         if isinstance(frame, bytes):
             if width is None or height is None:

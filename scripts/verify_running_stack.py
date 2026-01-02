@@ -8,7 +8,8 @@ to validate that the core surfaces are alive:
 
 - Orchestrator is reachable and N workers registered
 - Workers respond on /status
-- Workers can serve /frame.jpg (variance check when deps available)
+- Workers report stream health via /status
+- Optional /frame.jpg sanity check (skipped in strict zero-copy mode)
 - go2rtc exposes expected streams (if enabled)
 - Cognitive server responds to ZMQ metrics (if enabled)
 - Frontend routes respond (best-effort HTTP check)
@@ -113,6 +114,17 @@ def main() -> int:
     ap.add_argument("--go2rtc-url", default=os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984"))
     ap.add_argument("--ui-base", default=os.environ.get("METABONK_UI_BASE", "http://127.0.0.1:5173"))
     ap.add_argument("--timeout-s", type=float, default=2.5)
+    ap.add_argument(
+        "--require-gameplay-started",
+        action="store_true",
+        help="Fail if any worker reports gameplay_started=false (use after startup warmup).",
+    )
+    ap.add_argument(
+        "--require-act-hz",
+        type=float,
+        default=0.0,
+        help="Fail if any worker reports act_hz below this threshold (0=skip).",
+    )
     ap.add_argument("--skip-go2rtc", action="store_true", help="Skip go2rtc API check")
     ap.add_argument("--skip-cognitive", action="store_true", help="Skip cognitive server ZMQ metrics check")
     ap.add_argument("--skip-ui", action="store_true", help="Skip frontend HTTP checks")
@@ -146,7 +158,11 @@ def main() -> int:
     fps_fail = 0
     status_fail = 0
     frame_fail = 0
+    gameplay_fail = 0
+    act_hz_fail = 0
     frame_var_checked = 0
+    system2_enabled_known = False
+    system2_enabled_any = False
     for w in workers[:expected_workers] if expected_workers else workers:
         if not isinstance(w, dict):
             continue
@@ -157,20 +173,46 @@ def main() -> int:
             continue
         try:
             st = _get_json(f"http://127.0.0.1:{port}/status", timeout_s=float(args.timeout_s))
+            if "system2_enabled" in st:
+                system2_enabled_known = True
+                system2_enabled_any = system2_enabled_any or bool(st.get("system2_enabled", False))
             fps = float(st.get("frames_fps") or 0.0)
+            act_hz = float(st.get("act_hz") or 0.0)
+            gameplay_started = bool(st.get("gameplay_started", False))
             backend = str(st.get("stream_backend") or "").strip()
+            require_zero_copy = bool(st.get("stream_require_zero_copy", False))
+            stream_ok = st.get("stream_ok", None)
+            ok_status = True
+            detail = f"fps={fps:.0f} act_hz={act_hz:.1f} gameplay_started={str(gameplay_started).lower()} backend={backend or 'n/a'}"
             if fps <= 1.0:
                 fps_fail += 1
+                ok_status = False
             if not backend:
                 status_fail += 1
-            else:
-                results.append(CheckResult(f"{iid} /status", True, f"fps={fps:.0f} backend={backend}"))
+                ok_status = False
+            if stream_ok is False:
+                status_fail += 1
+                ok_status = False
+                detail += " stream_ok=false"
+            if bool(args.require_gameplay_started) and not gameplay_started:
+                gameplay_fail += 1
+                ok_status = False
+                detail += " gameplay_started=false"
+            if float(args.require_act_hz) > 0.0 and act_hz < float(args.require_act_hz):
+                act_hz_fail += 1
+                ok_status = False
+                detail += f" act_hz<{float(args.require_act_hz):.1f}"
+            results.append(CheckResult(f"{iid} /status", ok_status, detail))
         except Exception as e:
             results.append(CheckResult(f"{iid} /status", False, str(e)))
             status_fail += 1
             continue
 
         # frame.jpg is a lightweight sanity check that we are not serving blank streams.
+        # In strict zero-copy mode, this endpoint is intentionally disabled.
+        if require_zero_copy:
+            results.append(CheckResult(f"{iid} /frame.jpg", True, "skipped (strict zero-copy mode)"))
+            continue
         frame_url = f"http://127.0.0.1:{port}/frame.jpg"
         try:
             data = _fetch_bytes(frame_url, timeout_s=float(args.timeout_s), max_bytes=1_000_000)
@@ -204,7 +246,13 @@ def main() -> int:
         results.append(CheckResult("FPS", False, f"{fps_fail} worker(s) reported fps<=1"))
     if status_fail:
         ok = False
-        results.append(CheckResult("Worker status", False, f"{status_fail} worker(s) missing/failed /status"))
+        results.append(CheckResult("Worker health", False, f"{status_fail} worker(s) missing backend or unhealthy stream"))
+    if gameplay_fail:
+        ok = False
+        results.append(CheckResult("Gameplay", False, f"{gameplay_fail} worker(s) not in gameplay"))
+    if act_hz_fail:
+        ok = False
+        results.append(CheckResult("Action cadence", False, f"{act_hz_fail} worker(s) below act_hz threshold"))
     if frame_fail:
         ok = False
         results.append(CheckResult("Frame sanity", False, f"{frame_fail} worker(s) failed /frame.jpg"))
@@ -236,18 +284,21 @@ def main() -> int:
 
     # 4) cognitive server
     if not bool(args.skip_cognitive):
-        metrics = _zmq_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
-        if metrics is None:
-            ok = False
-            results.append(CheckResult("System2", False, f"no metrics response from {args.cognitive_url}"))
+        if system2_enabled_known and not system2_enabled_any:
+            results.append(CheckResult("System2", True, "skipped (disabled by worker config)"))
         else:
-            try:
-                req = int(metrics.get("request_count") or 0)
-                agents = int(metrics.get("active_agents") or 0)
-                avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
-                results.append(CheckResult("System2", True, f"agents={agents} requests={req} avg={avg_ms:.1f}ms"))
-            except Exception:
-                results.append(CheckResult("System2", True, "metrics received"))
+            metrics = _zmq_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
+            if metrics is None:
+                ok = False
+                results.append(CheckResult("System2", False, f"no metrics response from {args.cognitive_url}"))
+            else:
+                try:
+                    req = int(metrics.get("request_count") or 0)
+                    agents = int(metrics.get("active_agents") or 0)
+                    avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
+                    results.append(CheckResult("System2", True, f"agents={agents} requests={req} avg={avg_ms:.1f}ms"))
+                except Exception:
+                    results.append(CheckResult("System2", True, "metrics received"))
 
     # 5) UI routes (best-effort HTTP reachability)
     if not bool(args.skip_ui):

@@ -1,0 +1,52 @@
+WORKER 0 (SYSTEM2 BASELINE)
+Timestamp: Thu Jan  1 18:18:55 EST 2026
+
+{
+  "instance_id": "omega-0",
+  "system2_enabled": true,
+  "vlm_hints_used": 44,
+  "vlm_hints_applied": 44,
+  "fps": 60.0,
+  "scenes_discovered": 2,
+  "exploration_reward": 0.0003559216856956482,
+  "stuck_score": 0.060000000000000005,
+  "system2_reasoning": {
+    "goal": "survive",
+    "confidence": 0.0,
+    "reasoning": "",
+    "directive": {
+      "action": "explore",
+      "priority": "medium",
+      "target": [
+        0.5,
+        0.5
+      ],
+      "duration_seconds": 2.0
+    },
+    "inference_time_ms": 381.55078887939453,
+    "last_request_ts": 1767309534.8677912,
+    "last_response_ts": 1767309530.5680742,
+    "reasoning_trace": [
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)",
+      "survive (conf=0.00)"
+    ]
+  }
+}

@@ -1,0 +1,3 @@
+[worker:omega-0] action step=60 src=policy+system2 label=disc:9 stuck=False cont=[0.086, 0.469] disc=[]
+[worker:omega-0] action step=120 src=policy+system2 label=disc:9 stuck=False cont=[0.018, -0.429] disc=[]
+[worker:omega-0] action step=180 src=policy+system2 label=disc:18 stuck=False cont=[0.178, 0.065] disc=[]

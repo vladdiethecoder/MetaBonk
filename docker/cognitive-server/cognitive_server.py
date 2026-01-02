@@ -23,6 +23,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -570,9 +571,14 @@ Return STRICT JSON only (one line), no extra keys, no prose:
 
 Do NOT rely on game-specific scene/menu labels. Use only pixels + Agent State signals.
 
+If Agent State.gameplay_started=false: action SHOULD be "interact" and target SHOULD be a likely "advance/proceed" UI affordance.
+- Prefer Agent State.ui_elements centers (cx,cy) when available.
+- If you pick a target from Agent State.ui_elements, set confidence>=0.6.
+
 If Agent State.stuck=true: action SHOULD be "interact" and target SHOULD be a likely UI affordance.
 - Prefer Agent State.ui_elements centers (cx,cy) when available.
-- If unsure, target=[0.5,0.5] and confidence<=0.2.
+
+If unsure, target=[0.5,0.5] and confidence<=0.2.
 """
 
 METABONK_GAME_SYSTEM_PROMPT = """You are a strategic AI agent playing MetaBonk, a fast-paced roguelike game.
@@ -617,6 +623,7 @@ class CognitiveServer:
         self.sglang_port = int(sglang_port)
         self.tp_size = int(tp_size)
         self.quantization = str(quantization or "").strip()
+        self.max_running_requests = int(max_running_requests)
         self.start_ts = float(time.time())
         # Requests sent before the backend is ready are treated as stale (common after restarts).
         self._ready_ts = float(self.start_ts)
@@ -628,9 +635,15 @@ class CognitiveServer:
         self._hf_processor = None
         self._sglang_proc: Optional[subprocess.Popen] = None
         self._sglang_backend = None
+        self._backend_init_thread: Optional[threading.Thread] = None
+        self._backend_init_error: Optional[str] = None
+        self._backend_init_lock = threading.Lock()
         if not self.mock:
             if self.backend == "sglang":
-                self._start_sglang_server(max_running_requests=int(max_running_requests))
+                # IMPORTANT: Do not block the ZMQ server startup on long-running model
+                # initialization. Launchers and health checks depend on a quick metrics
+                # response, and the model warmup can take several minutes.
+                self._start_sglang_server_async(max_running_requests=self.max_running_requests)
             elif self.backend == "transformers":
                 self.model_path = _prepare_model_path_for_transformers(self.model_path)
                 logger.info("Initializing Transformers backend...")
@@ -1444,15 +1457,31 @@ class CognitiveServer:
         stuck = agent_state.get("stuck")
         if isinstance(stuck, str):
             stuck = stuck.strip().lower() in ("1", "true", "yes", "on")
-        if not bool(stuck):
+        gameplay_started = agent_state.get("gameplay_started")
+        if isinstance(gameplay_started, str):
+            gameplay_started = gameplay_started.strip().lower() in ("1", "true", "yes", "on")
+
+        needs_advance = (not bool(gameplay_started)) or bool(stuck)
+        if not needs_advance:
             return strategy
 
         ui_elements = agent_state.get("ui_elements")
         directive = strategy.get("directive")
         if not isinstance(directive, dict):
-            return strategy
+            directive = {}
+            strategy["directive"] = directive
         action = str(directive.get("action") or "").strip().lower()
-        if action != "interact":
+        if not bool(gameplay_started):
+            # Before gameplay, bias toward clicking visible affordances to advance UI flows.
+            if action not in ("interact", "click", "confirm", "select"):
+                directive["action"] = "interact"
+                action = "interact"
+            if action != "interact":
+                # Normalize synonyms to "interact" for downstream handling.
+                directive["action"] = "interact"
+                action = "interact"
+        elif action != "interact":
+            # During gameplay, only postprocess explicit interact directives.
             return strategy
 
         target = directive.get("target")
@@ -1471,14 +1500,17 @@ class CognitiveServer:
             conf_f = float(conf)
         except Exception:
             conf_f = 0.0
-        low_conf = conf_f <= 0.25
+        low_conf = conf_f <= (0.45 if not bool(gameplay_started) else 0.25)
         looks_default = abs(tx - 0.5) <= 0.12 and abs(ty - 0.5) <= 0.12
 
-        if low_conf and looks_default:
+        if looks_default or low_conf:
             picked = cls._pick_advance_target(ui_elements)
             if picked is not None:
                 directive["target"] = picked
-                strategy["confidence"] = float(max(conf_f, 0.25))
+                # When the agent hasn't reached gameplay yet, we want the downstream worker to
+                # actually execute the click (workers may gate on confidence for safety).
+                bump = 0.6 if not bool(gameplay_started) else 0.25
+                strategy["confidence"] = float(max(conf_f, bump))
                 if not str(strategy.get("reasoning") or "").strip():
                     strategy["reasoning"] = "click advance"
                 return strategy
@@ -1522,6 +1554,9 @@ class CognitiveServer:
                 "avg_latency_ms": (lat_s / max(1, int(cnt))) * 1000.0,
                 "last_ts": float(self._agent_last_ts.get(aid, 0.0)),
             }
+        backend_ready = True
+        if self.backend == "sglang":
+            backend_ready = self._sglang_backend is not None
         return {
             "type": "metrics",
             "timestamp": float(time.time()),
@@ -1531,7 +1566,36 @@ class CognitiveServer:
             "active_agents": int(len(self.active_agents)),
             "avg_latency_ms": float(avg_ms),
             "per_agent": per_agent,
+            "backend": str(self.backend),
+            "backend_ready": bool(backend_ready),
+            "backend_error": str(self._backend_init_error) if self._backend_init_error else None,
         }
+
+    def _start_sglang_server_async(self, *, max_running_requests: int) -> None:
+        if self.backend != "sglang" or self.mock:
+            return
+        # Avoid starting multiple times.
+        with self._backend_init_lock:
+            if self._sglang_backend is not None:
+                return
+            th = self._backend_init_thread
+            if th is not None and th.is_alive():
+                return
+
+            def _runner() -> None:
+                try:
+                    self._start_sglang_server(max_running_requests=int(max_running_requests))
+                except Exception as e:
+                    self._backend_init_error = str(e)
+                    logger.exception("❌ SGLang backend failed to start: %s", e)
+
+            self._backend_init_error = None
+            self._backend_init_thread = threading.Thread(
+                target=_runner,
+                name="metabonk-sglang-start",
+                daemon=True,
+            )
+            self._backend_init_thread.start()
 
     async def process_request(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         start = time.time()
@@ -1542,6 +1606,35 @@ class CognitiveServer:
 
         agent_id = str(request_data.get("agent_id") or "unknown")
         self.active_agents.add(agent_id)
+
+        # If the backend is still warming up, do not hard-fail agent requests. Instead
+        # return a low-confidence directive and let the rollout proceed.
+        if not self.mock and self.backend == "sglang" and self._sglang_backend is None:
+            self._start_sglang_server_async(max_running_requests=int(self.max_running_requests))
+            err = str(self._backend_init_error or "").strip()
+            if err:
+                return {
+                    "agent_id": agent_id,
+                    "reasoning": f"System2 backend failed to start: {err}",
+                    "goal": "survive",
+                    "strategy": "explore",
+                    "directive": {"action": "explore", "target": [0.5, 0.5], "duration_seconds": 1.0, "priority": "low"},
+                    "confidence": 0.0,
+                    "error": True,
+                    "inference_time_ms": (time.time() - start) * 1000.0,
+                    "timestamp": time.time(),
+                }
+            return {
+                "agent_id": agent_id,
+                "reasoning": "System2 backend warming up.",
+                "goal": "survive",
+                "strategy": "explore",
+                "directive": {"action": "explore", "target": [0.5, 0.5], "duration_seconds": 1.0, "priority": "low"},
+                "confidence": 0.0,
+                "warming": True,
+                "inference_time_ms": (time.time() - start) * 1000.0,
+                "timestamp": time.time(),
+            }
 
         # Ignore stale requests (commonly delivered after server restart) so we don't skew metrics.
         sent_ts = request_data.get("timestamp")

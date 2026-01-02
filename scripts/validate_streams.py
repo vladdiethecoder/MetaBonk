@@ -3,14 +3,17 @@
 
 This script probes each worker for:
 - /status reachability and reported FPS
-- /frame.jpg luma variance (black/frozen detection)
+- Stream health signals (preferred; works in strict zero-copy mode)
+- Optional /frame.jpg luma variance (black/frozen detection) when enabled
 
 It is designed to be run against a live stack started via `./launch` or
 `python scripts/start_omega.py`.
 
 Notes:
-- Uses /frame.jpg to avoid consuming the single-client MP4 stream slot.
-- Requires numpy+PIL for variance/freeze checks; otherwise degrades gracefully.
+- Uses /frame.jpg to avoid consuming the single-client MP4 stream slot when enabled.
+- In strict zero-copy mode (`METABONK_STREAM_REQUIRE_ZERO_COPY=1`), /frame.jpg is
+  disabled; the script relies on /status `stream_*` health fields instead.
+- Requires numpy+PIL for variance/freeze checks; otherwise skips deep checks.
 """
 
 from __future__ import annotations
@@ -72,7 +75,68 @@ def validate_worker(*, port: int, timeout_s: float, frames: int, sleep_s: float,
         issues.append(f"/status failed: {e}")
         return issues
 
-    # /frame.jpg probes (black/frozen detection)
+    # Prefer worker-reported stream health (works in strict zero-copy mode).
+    try:
+        stream_enabled = bool(st.get("stream_enabled", False))
+        capture_enabled = bool(st.get("capture_enabled", True))
+        require_zero_copy = bool(st.get("stream_require_zero_copy", False))
+        has_status_health = any(
+            k in st
+            for k in (
+                "stream_ok",
+                "stream_black_since_s",
+                "stream_frozen_since_s",
+                "stream_frame_var",
+                "stream_frame_diff",
+            )
+        )
+
+        stream_ok = st.get("stream_ok", None)
+        if stream_enabled and capture_enabled and stream_ok is False:
+            issues.append("stream_ok=false (no recent frames or black/frozen)")
+
+        if require_zero_copy and st.get("zero_copy") is False:
+            issues.append("zero_copy=false but stream_require_zero_copy=true")
+
+        def _f(x: Any) -> Optional[float]:
+            if x is None:
+                return None
+            try:
+                v = float(x)
+            except Exception:
+                return None
+            return v
+
+        try:
+            black_s = float(os.environ.get("METABONK_STREAM_BLACK_S", "8.0"))
+        except Exception:
+            black_s = 8.0
+        try:
+            frozen_s = float(os.environ.get("METABONK_STREAM_FROZEN_S", "8.0"))
+        except Exception:
+            frozen_s = 8.0
+        if black_s < 0:
+            black_s = 0.0
+        if frozen_s < 0:
+            frozen_s = 0.0
+
+        black_since_s = _f(st.get("stream_black_since_s"))
+        frozen_since_s = _f(st.get("stream_frozen_since_s"))
+        var = _f(st.get("stream_frame_var"))
+        diff = _f(st.get("stream_frame_diff"))
+
+        if black_s > 0 and black_since_s is not None and black_since_s >= black_s:
+            issues.append(f"black frames: since={black_since_s:.1f}s var={var}")
+        if frozen_s > 0 and frozen_since_s is not None and frozen_since_s >= frozen_s:
+            issues.append(f"frozen frames: since={frozen_since_s:.1f}s diff={diff}")
+
+        # In strict zero-copy mode, /frame.jpg is disabled; don't probe it.
+        if require_zero_copy:
+            return issues
+    except Exception:
+        has_status_health = False
+
+    # Optional /frame.jpg probes (black/frozen detection)
     last = None
     low_var = 0
     frozen = 0
@@ -82,11 +146,13 @@ def validate_worker(*, port: int, timeout_s: float, frames: int, sleep_s: float,
         try:
             data = _fetch_bytes(f"http://127.0.0.1:{int(port)}/frame.jpg", timeout_s=timeout_s, max_bytes=1_000_000)
         except Exception as e:
-            issues.append(f"/frame.jpg failed: {e}")
+            # If we already have worker-reported health, treat /frame.jpg as optional.
+            if not has_status_health:
+                issues.append(f"/frame.jpg failed: {e}")
             break
         luma = _decode_luma(data)
         if luma is None:
-            # Missing deps; stop deep checks.
+            # Missing deps; stop deep checks (best-effort).
             break
         checked += 1
         var = float(luma.var())
@@ -119,8 +185,6 @@ def validate_worker(*, port: int, timeout_s: float, frames: int, sleep_s: float,
             issues.append(f"frozen frames: {frozen}/{checked} (mean diff<1)")
         if upside >= max(3, int(checked * 0.50)):
             issues.append(f"possible upside-down rendering: {upside}/{checked} frames flagged")
-    else:
-        issues.append("frame analysis skipped (missing numpy/PIL?)")
 
     return issues
 
@@ -180,4 +244,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

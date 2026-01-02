@@ -1,0 +1,58 @@
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║         METABONK VLM/SYSTEM2 BASELINE VALIDATION              ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Timestamp: Thu Jan  1 18:17:43 EST 2026
+
+Workers: 5/5
+VLM hints total: 135 (applied: 108)
+Scenes total: 7
+Avg exploration: 1.003780
+
+═══════════════════════════════════════════════════════════════
+WORKER STATUS
+═══════════════════════════════════════════════════════════════
+
+Worker 0 (port 5000):
+  system2_enabled: true
+  vlm_hints_used: 27
+  vlm_hints_applied: 27
+  scenes_discovered: 2
+  exploration_reward: 0.00039185426430776715
+  fps: 60.0
+
+Worker 1 (port 5001):
+  system2_enabled: true
+  vlm_hints_used: 27
+  vlm_hints_applied: 27
+  scenes_discovered: 0
+  exploration_reward: 0.0
+  fps: 60.0
+
+Worker 2 (port 5002):
+  system2_enabled: true
+  vlm_hints_used: 27
+  vlm_hints_applied: 27
+  scenes_discovered: 0
+  exploration_reward: 0.0
+  fps: 60.0
+
+Worker 3 (port 5003):
+  system2_enabled: true
+  vlm_hints_used: 27
+  vlm_hints_applied: 0
+  scenes_discovered: 0
+  exploration_reward: 0.0
+  fps: 60.0
+
+Worker 4 (port 5004):
+  system2_enabled: true
+  vlm_hints_used: 27
+  vlm_hints_applied: 27
+  scenes_discovered: 5
+  exploration_reward: 5.018507927656174
+  fps: 60.0
+
+═══════════════════════════════════════════════════════════════

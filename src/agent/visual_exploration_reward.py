@@ -35,6 +35,20 @@ def _to_uint8_rgb(frame_hwc: Any) -> Optional["np.ndarray"]:
         return None
 
 
+def compute_scene_fingerprint(frame_hwc: Any) -> Optional[str]:
+    """Compute a stable, game-agnostic visual fingerprint for a frame.
+
+    This is a compatibility alias for validation harnesses/docs that refer to
+    "scene_fingerprint". The implementation reuses the same dHash used by
+    `VisualExplorationReward`.
+    """
+    rgb = _to_uint8_rgb(frame_hwc)
+    if rgb is None:
+        return None
+    gray = _downsample_gray(rgb, size=(96, 54))
+    return dhash_hex(gray)
+
+
 def _downsample_gray(
     frame_rgb_u8: "np.ndarray",
     *,
@@ -98,11 +112,17 @@ class VisualExplorationConfig:
     transition_novelty_thresh: float = 0.25
 
     # "Stuck" score increases when novelty is low for a long time.
-    stuck_novelty_thresh: float = 0.02
-    stuck_inc: float = 2.0
-    stuck_dec: float = 3.0
-    stuck_max: float = 100.0
-    stuck_active_thresh: float = 25.0
+    #
+    # In practice, `visual_novelty` for real gameplay tends to be on the order of ~1e-3..1e-2
+    # (mean abs luma delta / 255 at a small downsample). Use a lower threshold than the
+    # transition detector so we don't classify normal gameplay as "stuck".
+    #
+    # Contract: `stuck_score` is normalized (0..1), where lower is better.
+    stuck_novelty_thresh: float = 0.001
+    stuck_inc: float = 0.01
+    stuck_dec: float = 0.03
+    stuck_max: float = 1.0
+    stuck_active_thresh: float = 0.8
 
     # Downsample resolution for novelty computation.
     novelty_size: Tuple[int, int] = (96, 54)
@@ -183,6 +203,7 @@ class VisualExplorationReward:
             "exploration_reward": float(self.last_reward),
             "visual_novelty": float(self.last_novelty),
             "scene_hash": self.last_scene_hash,
+            "scene_fingerprint": self.last_scene_hash,
             "new_scene": bool(self.last_new_scene),
             "screen_transition": bool(self.last_transition),
             "scenes_discovered": int(len(self._scene_hashes)),
@@ -194,6 +215,6 @@ class VisualExplorationReward:
 __all__ = [
     "VisualExplorationConfig",
     "VisualExplorationReward",
+    "compute_scene_fingerprint",
     "dhash_hex",
 ]
-

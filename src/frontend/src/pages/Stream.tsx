@@ -1457,16 +1457,16 @@ export default function Stream() {
     const conf = confVals.length ? confVals.reduce((a, b) => a + b, 0) / confVals.length : 0;
     const stuckScore = stuckVals.length ? stuckVals.reduce((a, b) => a + b, 0) / stuckVals.length : 0;
     const chat = chatVals.length ? chatVals.reduce((a, b) => a + b, 0) / chatVals.length : 0;
-    return {
-      bonksPerMin: bonks.length / 2,
-      deaths2m: deaths.length,
-      borgars,
-      hype: Math.round(hypeAvg * 100),
-      bonkConfidence: Math.round(conf * 100),
-      stuckScore: Math.round(stuckScore),
-      chatInfluence: Math.round(chat * 100),
-    };
-  }, [events, workers]);
+      return {
+        bonksPerMin: bonks.length / 2,
+        deaths2m: deaths.length,
+        borgars,
+        hype: Math.round(hypeAvg * 100),
+        bonkConfidence: Math.round(conf * 100),
+        stuckScore: Math.round(stuckScore * 100),
+        chatInfluence: Math.round(chat * 100),
+      };
+    }, [events, workers]);
 
   useEffect(() => {
     const latest = events[events.length - 1];

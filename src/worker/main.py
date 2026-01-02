@@ -216,6 +216,8 @@ class WorkerService:
         self._system2_last_ui_click_ts = 0.0
         self._system2_last_ui_click_resp_ts = 0.0
         self._vlm_hints_used: int = 0
+        self._vlm_hints_applied: int = 0
+        self._system2_active_applied: bool = False
         self._system2_override_cont = str(os.environ.get("METABONK_SYSTEM2_OVERRIDE_CONT", "1") or "").strip().lower() not in (
             "0",
             "false",
@@ -624,6 +626,8 @@ class WorkerService:
         self._last_policy_warn_ts: float = 0.0
         self._last_stream_ok_ts: float = 0.0
         self._last_stream_heal_ts: float = 0.0
+        self._stream_health_checks: int = 0
+        self._stream_heals: int = 0
         self._last_frame_var_ts: float = 0.0
         self._last_frame_var: Optional[float] = None
         self._black_frame_since: float = 0.0
@@ -632,6 +636,10 @@ class WorkerService:
         self._last_frame_luma_diff: Optional[float] = None
         self._obs_frame_times: Deque[float] = deque(maxlen=120)
         self._obs_fps: Optional[float] = None
+        # Action cadence telemetry (independent of "meaningful" step_count).
+        self._act_times: Deque[float] = deque(maxlen=240)
+        self._act_hz: Optional[float] = None
+        self._actions_total: int = 0
         self._pipewire_health_ts: float = 0.0
         self._pipewire_daemon_ok: Optional[bool] = None
         self._pipewire_session_ok: Optional[bool] = None
@@ -884,10 +892,10 @@ class WorkerService:
         self._visual_exploration = VisualExplorationReward() if VisualExplorationReward is not None else None
         try:
             self._visual_exploration_interval_s = float(
-                os.environ.get("METABONK_VISUAL_EXPLORATION_INTERVAL_S", "0") or 0.0
+                os.environ.get("METABONK_VISUAL_EXPLORATION_INTERVAL_S", "0.5") or 0.0
             )
         except Exception:
-            self._visual_exploration_interval_s = 0.0
+            self._visual_exploration_interval_s = 0.5
         self._visual_exploration_last_update_ts: float = 0.0
         self._visual_exploration_last_scene_hash: Optional[str] = None
         self._visual_exploration_last_scene_change_ts: float = 0.0
@@ -2991,6 +2999,11 @@ class WorkerService:
             self._gameplay_started = True
             self._gameplay_start_ts = time.time()
             return
+        # Pure-vision contract: do not mark gameplay based on game-state time counters.
+        # Some builds report `gameTime` while still in menus/lobbies, which would prematurely
+        # disable pre-gameplay UI advancement logic.
+        if bool(getattr(self, "_pure_vision_mode", False)):
+            return
         try:
             from src.proof_harness.guards import should_mark_gameplay_started
 
@@ -4300,6 +4313,34 @@ class WorkerService:
                     except Exception:
                         ui_elements = ui_elements
 
+        # Always provide System2 with at least a coarse, game-agnostic UI candidate list so it
+        # can localize an "advance/proceed" click even when detectors/OCR are unavailable.
+        if (not ui_elements) and frame_size is not None:
+            try:
+                from .perception import build_grid_ui_elements
+
+                grid, mask = build_grid_ui_elements(frame_size, max_elements=16, rows=4, cols=4)
+                candidates: list[dict[str, float | str]] = []
+                for i, row in enumerate(grid):
+                    if i >= len(mask) or int(mask[i]) != 1:
+                        continue
+                    candidates.append(
+                        {
+                            "name": "",
+                            "cx": float(row[0]),
+                            "cy": float(row[1]),
+                            "w": float(row[2]),
+                            "h": float(row[3]),
+                            "conf": float(row[5]),
+                        }
+                    )
+                    if len(candidates) >= 12:
+                        break
+                if candidates:
+                    ui_elements = candidates
+            except Exception:
+                pass
+
         # Vision-only exploration context (pure signals, no scene labels).
         scene_hash = None
         visual_novelty = None
@@ -4344,12 +4385,22 @@ class WorkerService:
 
         self._system2_active_reward_sum = 0.0
         self._system2_active_started_ts = float(now)
+        # New directive: clear "applied" latch so we count at most once.
+        try:
+            self._system2_active_applied = False
+        except Exception:
+            pass
         try:
             self._system2_last_response = dict(response or {})
             self._system2_last_response_ts = float(now)
         except Exception:
             self._system2_last_response = None
             self._system2_last_response_ts = 0.0
+        # Count responses for external validation harnesses (even if the directive is later ignored).
+        try:
+            self._vlm_hints_used = int(getattr(self, "_vlm_hints_used", 0) or 0) + 1
+        except Exception:
+            self._vlm_hints_used = 1
         try:
             goal = str((response or {}).get("goal") or "").strip()
             reasoning = str((response or {}).get("reasoning") or "").strip()
@@ -4458,12 +4509,24 @@ class WorkerService:
         self,
         a_cont: List[float],
         a_disc: List[int],
+        forced_ui_click: Optional[tuple[int, int]],
         ui_elements: Optional[List[List[float]]],
         action_mask: Optional[List[int]],
         frame_size: Optional[tuple[int, int]],
     ):
         if not self.bridge or not self._bridge_loop:
             return
+
+        # Forced click (System2/UI bootstrap) takes precedence.
+        if forced_ui_click is not None and frame_size is not None:
+            try:
+                w, h = frame_size
+                x = max(0, min(int(w - 1), int(forced_ui_click[0]))) if w > 0 else int(forced_ui_click[0])
+                y = max(0, min(int(h - 1), int(forced_ui_click[1]))) if h > 0 else int(forced_ui_click[1])
+                self._bridge_loop.run_until_complete(self.bridge.send_mouse_click(int(x), int(y), 0))
+                return
+            except Exception:
+                pass
 
         # Discrete UI click on rising edge.
         if (
@@ -4705,12 +4768,49 @@ class WorkerService:
             quality_check_s = min(quality_intervals) if quality_intervals else 0.0
             if quality_check_s > 0 and (now - self._last_frame_var_ts) >= quality_check_s:
                 self._last_frame_var_ts = now
-                thumb = jpeg_luma_thumbnail(self._latest_jpeg_bytes or b"")
-                var = float(thumb.var()) if thumb is not None else None
-                diff = luma_mean_abs_diff(thumb, self._last_frame_luma) if thumb is not None else None
+                self._stream_health_checks += 1
+                thumb = None
+                var = None
+                diff = None
+
+                # Prefer a GPU-derived luma thumbnail when possible (works in strict zero-copy).
+                try:
+                    import torch  # type: ignore
+
+                    pix, _fid, _ts, _src = self._get_latest_pixel_obs()
+                    if isinstance(pix, torch.Tensor) and bool(getattr(pix, "is_cuda", False)) and pix.ndim == 3:
+                        t = pix
+                        if int(t.shape[0]) >= 3:
+                            r = t[0].to(dtype=torch.float32)
+                            g = t[1].to(dtype=torch.float32)
+                            b = t[2].to(dtype=torch.float32)
+                            luma_t = (0.299 * r) + (0.587 * g) + (0.114 * b)
+                        else:
+                            luma_t = t[0].to(dtype=torch.float32)
+                        prev_t = self._last_frame_luma if isinstance(self._last_frame_luma, torch.Tensor) else None
+                        try:
+                            var = float(luma_t.var(unbiased=False).item())
+                        except Exception:
+                            var = None
+                        if prev_t is not None and getattr(prev_t, "shape", None) == getattr(luma_t, "shape", None):
+                            try:
+                                diff = float((luma_t - prev_t).abs().mean().item())
+                            except Exception:
+                                diff = None
+                        self._last_frame_luma = luma_t
+                        thumb = "gpu"
+                except Exception:
+                    thumb = None
+
+                # Fallback to cached JPEG thumbnail (best-effort).
+                if thumb is None:
+                    thumb = jpeg_luma_thumbnail(self._latest_jpeg_bytes or b"")
+                    var = float(thumb.var()) if thumb is not None else None
+                    diff = luma_mean_abs_diff(thumb, self._last_frame_luma) if thumb is not None else None
+                    self._last_frame_luma = thumb
+
                 self._last_frame_var = var
                 self._last_frame_luma_diff = diff
-                self._last_frame_luma = thumb
 
                 if black_var > 0 and black_s > 0 and var is not None and var <= black_var:
                     if self._black_frame_since <= 0:
@@ -4732,7 +4832,6 @@ class WorkerService:
             if (
                 heal_s > 0
                 and self._stream_enabled
-                and self._require_pipewire_stream
                 and self.streamer is not None
             ):
                 err_ts = float(getattr(self.streamer, "last_error_ts", 0.0) or 0.0)
@@ -4760,18 +4859,31 @@ class WorkerService:
                 ):
                     reason = f"stream frozen frames (diff={self._last_frame_luma_diff})"
                     should_heal = True
-                # Never tear down/recreate the streamer while a client is actively consuming it.
-                # Doing so causes visible "cut out" flapping for the UI and can fight go2rtc/FIFO readers.
-                if should_heal and active_clients <= 0 and (now - self._last_stream_heal_ts) >= heal_s:
+                # Avoid tearing down/recreating the streamer while multiple clients are actively consuming it.
+                # In go2rtc FIFO mode there is typically a persistent reader; allow healing with a single
+                # client so frozen streams can recover automatically.
+                max_clients_for_heal = 0
+                try:
+                    raw_max = str(os.environ.get("METABONK_STREAM_SELF_HEAL_MAX_ACTIVE_CLIENTS", "") or "").strip()
+                    if raw_max:
+                        max_clients_for_heal = int(raw_max)
+                    else:
+                        max_clients_for_heal = 1 if bool(getattr(self, "_fifo_stream_enabled", False)) else 0
+                except Exception:
+                    max_clients_for_heal = 1 if bool(getattr(self, "_fifo_stream_enabled", False)) else 0
+
+                if should_heal and active_clients <= max_clients_for_heal and (now - self._last_stream_heal_ts) >= heal_s:
                     self._last_stream_heal_ts = now
+                    self._stream_heals += 1
                     self._stream_error = reason
                     self.streamer = None
                     try:
-                        # Force PipeWire target rediscovery on heal; gamescope often recreates
-                        # nodes/ports when it stalls ("out of buffers") or restarts internally.
-                        os.environ.pop("PIPEWIRE_NODE", None)
-                        self._pipewire_node_ok = False
-                        self._pipewire_node = None
+                        if self._require_pipewire_stream:
+                            # Force PipeWire target rediscovery on heal; gamescope often recreates
+                            # nodes/ports when it stalls ("out of buffers") or restarts internally.
+                            os.environ.pop("PIPEWIRE_NODE", None)
+                            self._pipewire_node_ok = False
+                            self._pipewire_node = None
                         self._ensure_streamer()
                     except Exception:
                         pass
@@ -4949,6 +5061,11 @@ class WorkerService:
                 step_age_s=step_age_s,
                 control_url=self.control_url(),
                 obs_fps=self._obs_fps,
+                act_hz=self._act_hz,
+                gameplay_started=bool(getattr(self, "_gameplay_started", False)),
+                actions_total=int(getattr(self, "_actions_total", 0) or 0),
+                vlm_hints_used=int(getattr(self, "_vlm_hints_used", 0) or 0),
+                vlm_hints_applied=int(getattr(self, "_vlm_hints_applied", 0) or 0),
                 action_entropy=action_entropy,
                 bonk_confidence=bonk_confidence,
                 stuck_score=stuck_score,
@@ -6182,24 +6299,35 @@ class WorkerService:
             # Optional UI exploration: epsilon-greedy UI clicks when the screen has been static
             # for a long time ("stuck"). This is game-agnostic: no scene/menu labels, just
             # "change the screen" exploration pressure.
+            pre_gameplay_click = False
+            try:
+                if not bool(getattr(self, "_gameplay_started", False)):
+                    grace_s = float(os.environ.get("METABONK_UI_PRE_GAMEPLAY_GRACE_S", "2.0") or 2.0)
+                    pre_gameplay_click = (float(now) - float(loop_t0)) >= max(0.0, float(grace_s))
+            except Exception:
+                pre_gameplay_click = False
             if (
-                bool(stuck)
+                (bool(stuck) or pre_gameplay_click)
                 and action_mask
                 and self._input_backend is None
                 and (forced_ui_click is None)
                 and (not suppress_policy_clicks)
             ):
                 try:
-                    eps = float(str(os.environ.get("METABONK_UI_EPS", "0") or "0").strip() or 0.0)
+                    if pre_gameplay_click:
+                        eps = float(str(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0") or "0").strip() or 0.0)
+                    else:
+                        eps = float(str(os.environ.get("METABONK_UI_EPS", "0") or "0").strip() or 0.0)
                 except Exception:
                     eps = 0.0
                 if eps <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)):
-                    eps = 0.5
+                    eps = 0.7 if pre_gameplay_click else 0.5
                 if eps > 0.0 and random.random() < eps:
                     try:
                         valid = [i for i, m in enumerate(action_mask[:-1]) if int(m) == 1]
                         if valid and a_disc:
                             a_disc[0] = int(random.choice(valid))
+                            action_source = f"{action_source}+ui_eps" if action_source else "ui_eps"
                     except Exception:
                         pass
 
@@ -6336,9 +6464,12 @@ class WorkerService:
                                         self._system2_last_ui_click_ts = float(now)
                                         self._system2_last_ui_click_resp_ts = float(last_resp_ts)
                                         try:
-                                            self._vlm_hints_used = int(getattr(self, "_vlm_hints_used", 0) or 0) + 1
+                                            if not bool(getattr(self, "_system2_active_applied", False)):
+                                                self._vlm_hints_applied = int(getattr(self, "_vlm_hints_applied", 0) or 0) + 1
+                                                self._system2_active_applied = True
                                         except Exception:
-                                            self._vlm_hints_used = 1
+                                            self._vlm_hints_applied = 1
+                                            self._system2_active_applied = True
                                         action_source = f"{action_source}+system2_click" if action_source else "system2_click"
                 except Exception:
                     pass
@@ -6358,6 +6489,13 @@ class WorkerService:
                             directive=directive,
                             frame_size=frame_size,
                         )
+                        try:
+                            if not bool(getattr(self, "_system2_active_applied", False)):
+                                self._vlm_hints_applied = int(getattr(self, "_vlm_hints_applied", 0) or 0) + 1
+                                self._system2_active_applied = True
+                        except Exception:
+                            self._vlm_hints_applied = 1
+                            self._system2_active_applied = True
                         action_source = f"{action_source}+system2" if action_source else "system2"
                 except Exception:
                     pass
@@ -6392,6 +6530,17 @@ class WorkerService:
                 input_bootstrap=input_bootstrap,
                 sima2_action=sima2_action,
             )
+
+            # Action cadence telemetry (for readiness checks / debugging "slow actions" reports).
+            try:
+                self._actions_total = int(getattr(self, "_actions_total", 0) or 0) + 1
+                self._act_times.append(float(now))
+                if len(self._act_times) >= 2:
+                    dt = float(self._act_times[-1]) - float(self._act_times[0])
+                    if dt > 0:
+                        self._act_hz = float((len(self._act_times) - 1) / dt)
+            except Exception:
+                pass
 
             # Flight recorder: store last actions + thumbnails for Context Drawer.
             try:
@@ -6727,6 +6876,7 @@ class WorkerService:
                 self._bridge_send_actions(
                     a_cont,
                     a_disc,
+                    forced_ui_click,
                     ui_elements,
                     action_mask_bridge if action_mask_bridge is not None else action_mask,
                     frame_size,
@@ -7844,6 +7994,9 @@ class WorkerService:
             if bool(getattr(self, "_pixel_obs_enabled", False))
             else None,
             "vlm_hints_used": int(getattr(self, "_vlm_hints_used", 0) or 0),
+            "vlm_hints_applied": int(getattr(self, "_vlm_hints_applied", 0) or 0),
+            "act_hz": float(getattr(self, "_act_hz", 0.0) or 0.0),
+            "actions_total": int(getattr(self, "_actions_total", 0) or 0),
             "phase_label": self._phase_label,
             "phase_conf": float(self._phase_conf or 0.0),
             "phase_source": self._phase_source,
@@ -8077,6 +8230,61 @@ class WorkerService:
                 out["metabonk2"] = self._metabonk2_controller.get_status()
             except Exception:
                 out["metabonk2"] = {"enabled": True}
+        # Stream health/quality (best-effort; mirrors heartbeat fields).
+        try:
+            now = time.time()
+            out["stream_frame_var"] = getattr(self, "_last_frame_var", None)
+            try:
+                black_since = float(getattr(self, "_black_frame_since", 0.0) or 0.0)
+            except Exception:
+                black_since = 0.0
+            out["stream_black_since_s"] = (now - black_since) if black_since > 0 else None
+            out["stream_frame_diff"] = getattr(self, "_last_frame_luma_diff", None)
+            try:
+                frozen_since = float(getattr(self, "_frozen_frame_since", 0.0) or 0.0)
+            except Exception:
+                frozen_since = 0.0
+            out["stream_frozen_since_s"] = (now - frozen_since) if frozen_since > 0 else None
+
+            # Derive a stable stream_ok flag similar to the heartbeat loop.
+            try:
+                last = float(getattr(self, "_latest_frame_ts", 0.0) or 0.0)
+            except Exception:
+                last = 0.0
+            try:
+                enc_last = float(getattr(self.streamer, "last_chunk_ts", 0.0) or 0.0) if self.streamer else 0.0
+            except Exception:
+                enc_last = 0.0
+            try:
+                ok_ttl = float(os.environ.get("METABONK_STREAM_OK_TTL_S", "10.0"))
+            except Exception:
+                ok_ttl = 10.0
+            stream_ok_age = bool((last > 0 and (now - last) <= ok_ttl) or (enc_last > 0 and (now - enc_last) <= ok_ttl))
+            quality_ok = bool(black_since <= 0 and frozen_since <= 0)
+            out["stream_ok"] = bool(stream_ok_age and quality_ok) if bool(out.get("stream_enabled", False)) else None
+        except Exception:
+            out.setdefault("stream_frame_var", None)
+            out.setdefault("stream_black_since_s", None)
+            out.setdefault("stream_frame_diff", None)
+            out.setdefault("stream_frozen_since_s", None)
+            out.setdefault("stream_ok", None)
+
+        # Compatibility aliases for external validation harnesses (and older docs):
+        # - frames/steps/fps
+        # - stream_frozen/stream_diff/stream_frozen_checks/stream_heals
+        try:
+            out.setdefault("worker_id", out.get("instance_id"))
+            out.setdefault("steps", out.get("step"))
+            out.setdefault("frames", out.get("frames_ok"))
+            out.setdefault("fps", out.get("frames_fps"))
+            out.setdefault("streaming", out.get("stream_enabled"))
+            out.setdefault("stream_diff", out.get("stream_frame_diff"))
+            out.setdefault("stream_frozen", bool(out.get("stream_frozen_since_s") is not None))
+            out.setdefault("stream_frozen_checks", int(getattr(self, "_stream_health_checks", 0)))
+            out.setdefault("stream_heals", int(getattr(self, "_stream_heals", 0)))
+            out.setdefault("system2_enabled", bool(getattr(self, "_system2_enabled", False)))
+        except Exception:
+            pass
         return out
 
     def get_config(self) -> InstanceConfig:
@@ -8089,13 +8297,22 @@ class WorkerService:
         )
 
     def set_config(self, cfg: InstanceConfig):
+        prev_policy = str(getattr(self, "policy_name", "") or "")
+        prev_version = getattr(self, "_policy_version", None)
+
         self.policy_name = cfg.policy_name
         self.hparams = cfg.hparams
         self.trainer.policy_name = cfg.policy_name
         self.trainer.hparams = cfg.hparams
         self.rollout.policy_name = cfg.policy_name
         self.rollout.hparams = cfg.hparams
-        self._policy_version = None
+        # Do not reset the cached policy version unless the policy identity changes.
+        # Resetting on every config poll forces full-weight pulls (`since_version=-1`),
+        # which can stall action cadence.
+        if str(cfg.policy_name or "") != prev_policy:
+            self._policy_version = None
+        else:
+            self._policy_version = prev_version
         caps: dict = {}
         reg_obs_dim: Optional[int] = self.trainer.obs_dim
         if bool(getattr(self, "_pixel_obs_enabled", False)):

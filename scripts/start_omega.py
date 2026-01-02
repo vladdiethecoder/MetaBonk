@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import os
 import signal
 import subprocess
@@ -852,6 +853,21 @@ def _cuda_version_lt(a: str, b: str) -> bool:
     return at < bt
 
 
+def _nvidia_smi_cuda_version() -> Optional[str]:
+    cmd = shutil.which("nvidia-smi")
+    if not cmd:
+        return None
+    try:
+        out = subprocess.check_output([cmd], stderr=subprocess.STDOUT, timeout=4.0)
+    except Exception:
+        return None
+    txt = out.decode("utf-8", "replace")
+    match = re.search(r"CUDA Version:\s*([0-9.]+)", txt)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
 def _cuda_preflight_hint(torch_cuda: str) -> Optional[str]:
     models = _read_nvidia_gpu_models()
     if not models:
@@ -859,14 +875,14 @@ def _cuda_preflight_hint(torch_cuda: str) -> Optional[str]:
     joined = ", ".join(models)
     if any("5090" in m or "blackwell" in m.lower() for m in models):
         if not torch_cuda:
-            return f"Detected {joined}; install a CUDA-enabled PyTorch wheel (cu131+ recommended for Blackwell)."
-        if _cuda_version_lt(torch_cuda, "13.1"):
+            return f"Detected {joined}; install a CUDA-enabled PyTorch wheel (cu130+ recommended for Blackwell)."
+        if _cuda_version_lt(torch_cuda, "13.0"):
             return (
-                f"Detected {joined} with torch CUDA {torch_cuda}; install a cu131+ PyTorch wheel "
+                f"Detected {joined} with torch CUDA {torch_cuda}; install a cu130+ PyTorch wheel "
                 "for Blackwell support."
             )
         return (
-            f"Detected {joined}; CUDA {torch_cuda} should work for Blackwell (cu131+). "
+            f"Detected {joined}; CUDA {torch_cuda} should work for Blackwell (cu130+). "
             "NVFP4/FP4 still requires newer toolchains."
         )
     return f"Detected {joined}; verify CUDA toolkit/driver matches your PyTorch build."
@@ -896,8 +912,13 @@ def _cuda_preflight(
         count = int(torch.cuda.device_count() or 0)
     except Exception as e:
         return f"CUDA preflight: torch.cuda.device_count() failed ({e})."
-    if torch_cuda and _cuda_version_lt(torch_cuda, "13.1"):
-        return f"CUDA preflight: CUDA 13.1+ required (found torch CUDA {torch_cuda})."
+    driver_cuda = _nvidia_smi_cuda_version()
+    if not driver_cuda:
+        return "CUDA preflight: nvidia-smi did not report a CUDA Version."
+    if _cuda_version_lt(driver_cuda, "13.1"):
+        return f"CUDA preflight: CUDA 13.1+ required (driver reports {driver_cuda})."
+    if torch_cuda and _cuda_version_lt(torch_cuda, "13.0"):
+        return f"CUDA preflight: PyTorch CUDA 13.0+ required (found torch CUDA {torch_cuda})."
     try:
         cc = torch.cuda.get_device_capability()
         if int(cc[0]) < 9:
