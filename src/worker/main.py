@@ -4403,6 +4403,7 @@ class WorkerService:
             "frame_w": int(w),
             "frame_h": int(h),
             "gameplay_started": bool(getattr(self, "_gameplay_started", False)),
+            "in_menu": not bool(getattr(self, "_gameplay_started", False)),
             "gameplay_confidence": float(getattr(self, "_gameplay_confidence", 0.0) or 0.0),
             "stuck": bool(stuck),
             "stuck_score": stuck_score,
@@ -6360,7 +6361,7 @@ class WorkerService:
                 except Exception:
                     eps = 0.0
                 if eps <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)):
-                    eps = 0.7 if pre_gameplay_click else 0.5
+                    eps = float(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0.9")) if pre_gameplay_click else 0.5
                 if eps > 0.0 and random.random() < eps:
                     try:
                         valid = [i for i, m in enumerate(action_mask[:-1]) if int(m) == 1]
