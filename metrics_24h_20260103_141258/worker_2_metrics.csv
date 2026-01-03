@@ -9,3 +9,4 @@ elapsed,worker,episode,step,gameplay,dynamic_state,dynamic_eps,dynamic_actions,d
 2700,2,0,45.0,false,uncertain,0.0,0,0,0,0.0,0.0,1.0,menu_ui,0.0,0.0,45,0,0.225419776
 3000,2,0,57.0,false,uncertain,0.0,0,0,0,0.0,0.0,1.0,menu_ui,0.0,0.0,57,0,0.2260096
 3600,2,0,993.0,false,uncertain,0.0,0,0,0,0,0,0,,0,0,0,0,0.109958144
+3900,2,0,3642.0,false,uncertain,0.0,0,0,0,0,0,0,,0,0,0,0,0.101889024

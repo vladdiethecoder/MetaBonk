@@ -6547,13 +6547,13 @@ class WorkerService:
 
             # Optional meta-learning: reuse historically successful UI clicks for similar scenes.
             meta_applied = False
+            ui_click_idx: Optional[int] = None
             try:
                 meta = getattr(self, "_meta_learner", None)
                 if (
                     meta is not None
                     and action_mask
                     and ui_elements_cache is not None
-                    and self._input_backend is None
                     and (forced_ui_click is None)
                     and (not suppress_policy_clicks)
                     and (a_disc is not None)
@@ -6605,6 +6605,7 @@ class WorkerService:
                                     follow = True
                                 if follow and len(a_disc) >= 1:
                                     a_disc[0] = int(sug.index)
+                                    ui_click_idx = int(sug.index)
                                     action_source = f"{action_source}+ui_meta" if action_source else "ui_meta"
                                     try:
                                         meta.note_suggestion_applied(similarity=float(sug.similarity), reason=str(sug.reason))
@@ -6619,7 +6620,6 @@ class WorkerService:
             if (
                 should_ui_explore
                 and action_mask
-                and self._input_backend is None
                 and (forced_ui_click is None)
                 and (not suppress_policy_clicks)
                 and (not meta_applied)
@@ -6739,8 +6739,10 @@ class WorkerService:
 
                         if chosen_idx is None and valid:
                             chosen_idx = int(random.choice(valid))
-                        if chosen_idx is not None and a_disc:
-                            a_disc[0] = int(chosen_idx)
+                        if chosen_idx is not None:
+                            if a_disc:
+                                a_disc[0] = int(chosen_idx)
+                            ui_click_idx = int(chosen_idx)
                             try:
                                 self._dynamic_ui_exploration_actions = int(
                                     getattr(self, "_dynamic_ui_exploration_actions", 0) or 0
@@ -7017,6 +7019,39 @@ class WorkerService:
                             ) + 1
                     except Exception:
                         pass
+                # Map discrete UI click indices into input backend click_at() calls.
+                elif (
+                    ui_click_idx is not None
+                    and ui_elements_cache is not None
+                    and action_mask
+                    and hasattr(self._input_backend, "click_at")
+                ):
+                    try:
+                        idx = int(ui_click_idx)
+                    except Exception:
+                        idx = -1
+                    noop_idx = len(action_mask) - 1 if action_mask else -1
+                    try:
+                        last_idx = int(getattr(self, "_last_disc_action", -999999))
+                    except Exception:
+                        last_idx = -999999
+                    if (
+                        0 <= idx < len(action_mask)
+                        and idx != noop_idx
+                        and int(action_mask[idx]) == 1
+                        and idx != last_idx
+                        and idx < len(ui_elements_cache)
+                    ):
+                        row = ui_elements_cache[idx]
+                        if isinstance(row, (list, tuple)) and len(row) >= 2:
+                            try:
+                                self._input_backend.click_at(float(row[0]), float(row[1]))
+                            except Exception:
+                                pass
+                    try:
+                        self._last_disc_action = int(idx)
+                    except Exception:
+                        self._last_disc_action = idx
 
             self._action_guard_check(
                 action_source=action_source,
