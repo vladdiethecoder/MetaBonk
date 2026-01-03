@@ -1,5 +1,8 @@
 # MetaBonk: VLM/System2 Validation & Optimization Report
 
+> **Deprecated (2026-01-03):** SGLang-based System2 has been removed from the active stack.
+> This report is retained for historical context only.
+
 **Date**: 2026-01-01  
 **Agent**: ChatGPT 5.2 xhigh (Codex CLI)  
 **Repo**: https://github.com/vladdiethecoder/MetaBonk  
@@ -119,4 +122,3 @@ A full live-stack E2E validation report (including stream probes and test output
 ## Verdict
 
 ✅ **READY FOR 24-HOUR STABILITY TEST** (with log-growth monitoring recommended).
-

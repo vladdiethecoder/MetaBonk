@@ -1,6 +1,6 @@
 # MetaBonk Unified Launcher
 
-One command to run the full stack (cognitive server + Omega + UI):
+One command to run the full stack (Omega + UI):
 
 ```bash
 ./launch
@@ -11,7 +11,7 @@ One command to run the full stack (cognitive server + Omega + UI):
 ```bash
 ./launch                 # start (default profile)
 ./launch start           # start (explicit)
-./launch stop            # stop omega + go2rtc + cognitive server
+./launch stop            # stop omega + go2rtc
 ```
 
 ## Profiles
@@ -32,9 +32,9 @@ Override a couple common fields without editing JSON:
 
 ## What It Starts
 
-- Cognitive server via `scripts/start_cognitive_server.sh` (docker compose)
 - Omega + Vite UI via `scripts/start.py`
-- Terminal dashboard (optional) with GPU/worker/System2 metrics
+- Terminal dashboard (optional) with GPU/worker metrics
+- System2 uses Ollama when enabled (no centralized cognitive server)
 
 The launcher reuses existing scripts so it stays stable as MetaBonk evolves.
 
@@ -75,5 +75,5 @@ Run preflight + (if running) live stack checks:
 
 ## Notes
 
-- Some environments export `DOCKER_HOST` pointing to a rootless Podman socket. The launcher (and `scripts/start_cognitive_server.sh`) will prefer the system Docker daemon when `/var/run/docker.sock` exists.
-- MetaBonk is GPU-only; launcher hard-fails if `nvidia-smi` or `docker --gpus all` is not working.
+- Some environments export `DOCKER_HOST` pointing to a rootless Podman socket. The launcher prefers the system Docker daemon when `/var/run/docker.sock` exists.
+- MetaBonk is GPU-only; launcher hard-fails if `nvidia-smi` is not working.

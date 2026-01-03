@@ -1,0 +1,42 @@
+*** Begin Patch
+*** Update File: src/worker/state_classifier.py
+@@
+-import logging
++import logging
++import os
+@@
+ def classify_state_with_metrics(screenshot: Any, frame_history: Sequence[Any]) -> StateClassification:
++    # Allow env-tuned thresholds while keeping conservative defaults.
++    def _f(key: str, default: float) -> float:
++        try:
++            return float(str(os.environ.get(key, str(default)) or str(default)).strip())
++        except Exception:
++            return float(default)
++
++    def _i(key: str, default: int) -> int:
++        try:
++            return int(str(os.environ.get(key, str(default)) or str(default)).strip())
++        except Exception:
++            return int(default)
++
++    text_density_thresh = _f("METABONK_STATE_TEXT_DENSITY_THRESH", 0.15)
++    motion_thresh = _f("METABONK_STATE_MOTION_THRESH", 0.05)
++    ui_shape_thresh = _i("METABONK_STATE_UI_SHAPE_THRESH", 5)
++
++    # Log thresholds once for debugging.
++    if not getattr(classify_state_with_metrics, "_logged_thresholds", False):
++        logger.info(
++            "State classifier thresholds: text_density=%.3f motion=%.3f ui_shapes=%d",
++            text_density_thresh,
++            motion_thresh,
++            ui_shape_thresh,
++        )
++        setattr(classify_state_with_metrics, "_logged_thresholds", True)
+@@
+-    if (text_density > 0.15) and (motion < 0.05) and bool(has_centered_panel):
++    if (text_density > float(text_density_thresh)) and (motion < float(motion_thresh)) and bool(has_centered_panel):
+         return StateClassification("menu_ui", metrics, "text_dense+static+centered_panel")
+-    if (ui_shape_count > 5.0) and (motion < 0.10):
++    if (ui_shape_count > float(ui_shape_thresh)) and (motion < float(motion_thresh)):
+         return StateClassification("menu_ui", metrics, "many_ui_shapes+low_motion")
+*** End Patch

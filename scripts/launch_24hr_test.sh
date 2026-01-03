@@ -134,7 +134,7 @@ if [[ "$REQUIRE_GAMEPLAY_STARTED" =~ ^(1|true|yes|on)$ ]]; then
   last_out=""
   while true; do
     set +e
-    out="$(python3 scripts/verify_running_stack.py --workers 5 --skip-ui --skip-go2rtc --require-gameplay-started --require-act-hz "${min_act_hz}" 2>&1)"
+    out="$(python3 scripts/verify_running_stack.py --workers 5 --skip-go2rtc --require-gameplay-started --require-act-hz "${min_act_hz}" 2>&1)"
     rc=$?
     set -e
     last_out="$out"

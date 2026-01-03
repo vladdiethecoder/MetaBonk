@@ -52,6 +52,7 @@ def _spawn(
     job_pgid: Optional[int] = None,
     stdout_path: Optional[Path] = None,
     stderr_path: Optional[Path] = None,
+    stdin: Optional[int] = None,
 ) -> subprocess.Popen:
     print(f"[start] starting {name}: {' '.join(cmd)}")
     preexec_fn = None
@@ -86,6 +87,7 @@ def _spawn(
         preexec_fn=preexec_fn,
         stdout=stdout_target,
         stderr=stderr_target,
+        stdin=stdin,
     )
 
 
@@ -243,7 +245,7 @@ def main() -> int:
         "--bonklink-port",
         type=int,
         default=int(os.environ.get("METABONK_BONKLINK_PORT", "5560")),
-        help="BonkLink base TCP port (per-worker ports increment from this). Avoid 5555 (used by the cognitive server ZMQ by default).",
+        help="BonkLink base TCP port (per-worker ports increment from this).",
     )
     parser.add_argument("--reward-ckpt", default=os.environ.get("METABONK_VIDEO_REWARD_CKPT", "checkpoints/video_reward_model.pt"))
     parser.add_argument("--game-dir", default=os.environ.get("MEGABONK_GAME_DIR", ""), help="Path to Megabonk install dir (contains Megabonk.exe)")
@@ -672,8 +674,7 @@ def main() -> int:
             ]
         if args.mode == "train":
             omega_cmd += ["--workers", str(int(args.workers))]
-            # Avoid synchronized System2/VLM request bursts: stagger request schedule across
-            # workers when using a centralized cognitive server.
+            # Avoid synchronized System2/VLM request bursts: stagger request schedule across workers.
             try:
                 workers_n = max(1, int(args.workers))
                 env.setdefault("METABONK_SYSTEM2_JITTER_BUCKETS", str(int(workers_n)))
@@ -739,7 +740,15 @@ def main() -> int:
                 subprocess.check_call(["npm", "install"], cwd=str(frontend), env=env)
             ui_cmd = ["npm", "run", "dev", "--", "--host", args.ui_host, "--port", str(args.ui_port)]
             ui_log = logs_dir / "ui.log"
-            ui = _spawn("ui", ui_cmd, cwd=frontend, env=env, job_pgid=job_pgid, stdout_path=ui_log)
+            ui = _spawn(
+                "ui",
+                ui_cmd,
+                cwd=frontend,
+                env=env,
+                job_pgid=job_pgid,
+                stdout_path=ui_log,
+                stdin=subprocess.PIPE,
+            )
             procs.append(ui)
             print(f"[start] ui -> http://{args.ui_host}:{args.ui_port}")
             print(f"[start] ui logs -> {ui_log}")
@@ -816,6 +825,14 @@ def main() -> int:
                         except Exception:
                             pass
                         watch = None
+                        break
+                    if p is ui:
+                        print(f"[start] ui exited with {int(ret)}; keeping omega running (Ctrl+C to stop).")
+                        try:
+                            procs.remove(ui)
+                        except Exception:
+                            pass
+                        ui = None
                         break
                     name = "omega" if p is omega else ("ui" if p is ui else ("watch" if p is watch else "proc"))
                     print(f"[start] {name} exited with {int(ret)}; shutting down...")

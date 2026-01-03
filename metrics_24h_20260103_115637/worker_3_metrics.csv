@@ -1,0 +1,4 @@
+elapsed,worker,episode,step,gameplay,dynamic_state,dynamic_eps,dynamic_actions,dynamic_text_density,dynamic_motion,intrinsic_reward,intrinsic_reward_total,system2_engage,system2_reason,meta_success_sequences,meta_suggestions_applied,vlm_hints_used,vlm_hints_applied,gpu_memory_gb
+0,3,0,7.0,false,menu_ui,0.8,4,0.1257866753472222,0.0,0.0,0.0,0,,0.0,0.0,0,0,0.096387072
+300,3,0,121.0,false,uncertain,0.8,95,0.12101236979166667,0.0012425108870957047,0.0,0.0,0,,0.0,0.0,0,0,0.1019904
+600,3,0,157.0,false,uncertain,0.8,126,0.11900499131944445,0.005056281748693436,0.0,0.0,0,,0.0,0.0,0,0,0.103759872

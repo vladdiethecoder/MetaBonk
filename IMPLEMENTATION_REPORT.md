@@ -11,10 +11,9 @@
 ## Design Notes
 
 - Reuses existing, battle-tested entrypoints:
-  - Cognitive server: `scripts/start_cognitive_server.sh`
   - Omega + UI: `scripts/start.py`
   - Cleanup: `scripts/stop.py --all`
-- Terminal dashboard is best-effort (requires `requests`/`pyzmq`; otherwise it degrades gracefully).
+- Terminal dashboard is best-effort (requires `requests`; otherwise it degrades gracefully).
 
 ## Usage
 

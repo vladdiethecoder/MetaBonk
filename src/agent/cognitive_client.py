@@ -1,12 +1,11 @@
-"""
-Cognitive Client for MetaBonk game instances.
+"""Cognitive Client for MetaBonk game instances.
 
-Connects to the centralized cognitive server via ZeroMQ (DEALER socket).
+Ollama-only System2 backend.
 
 Responsibilities:
 - Frame buffering (last 5 frames)
 - Temporal strip generation (past + present + predicted future)
-- Asynchronous (non-blocking) strategy request/response
+- Synchronous strategy request/response over Ollama
 """
 
 from __future__ import annotations
@@ -21,16 +20,72 @@ import zlib
 from collections import deque
 from io import BytesIO
 from typing import Any, Deque, Dict, List, Optional
+import threading
 
 import numpy as np
 from PIL import Image
 
 try:
-    import zmq  # type: ignore
+    import ollama  # type: ignore
 except Exception:  # pragma: no cover
-    zmq = None  # type: ignore
+    ollama = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_json(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    if "```" in raw:
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw.strip(), flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        raw = raw.replace("```", "").strip()
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+
+    def _balanced_block(s: str, open_ch: str, close_ch: str) -> Optional[str]:
+        start = s.find(open_ch)
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    esc = True
+                    continue
+                if ch == "\"":
+                    in_str = False
+                continue
+            if ch == "\"":
+                in_str = True
+                continue
+            if ch == open_ch:
+                depth += 1
+                continue
+            if ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
+        return None
+
+    block = _balanced_block(raw, "{", "}")
+    if block:
+        try:
+            obj = json.loads(block)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 
 class SimpleFramePredictor:
@@ -52,22 +107,23 @@ class SimpleFramePredictor:
 
 
 class CognitiveClient:
-    """Non-blocking ZeroMQ client for System 2 strategic directives."""
+    """Ollama-backed System2 client for strategic directives."""
 
     def __init__(
         self,
         *,
         agent_id: str,
-        server_url: str = "tcp://127.0.0.1:5555",
         request_frequency_s: float = 2.0,
         jpeg_quality: int = 85,
         max_edge: int = 512,
     ) -> None:
-        if zmq is None:  # pragma: no cover
-            raise RuntimeError("pyzmq is not installed; CognitiveClient unavailable")
+        backend = str(os.environ.get("METABONK_SYSTEM2_BACKEND", "ollama") or "ollama").strip().lower()
+        if backend != "ollama":  # pragma: no cover
+            raise RuntimeError(f"Unsupported System2 backend: {backend}")
+        if ollama is None:  # pragma: no cover
+            raise RuntimeError("ollama python package not installed; System2 unavailable")
 
         self.agent_id = str(agent_id)
-        self.server_url = str(server_url)
         self.request_frequency_s = float(request_frequency_s)
         self.jpeg_quality = int(max(1, min(95, jpeg_quality)))
         self.max_edge = int(max(0, max_edge))
@@ -91,11 +147,11 @@ class CognitiveClient:
             self.frames_per_request = 9
         self.frames_per_request = max(1, min(9, int(self.frames_per_request)))
 
-        self.context = zmq.Context.instance()
-        self.socket = self.context.socket(zmq.DEALER)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.setsockopt_string(zmq.IDENTITY, self.agent_id)
-        self.socket.connect(self.server_url)
+        self._ollama_model = str(
+            os.environ.get("METABONK_SYSTEM2_MODEL", os.environ.get("METABONK_VLM_HINT_MODEL", "llava:7b") or "")
+        ).strip()
+        if not self._ollama_model:
+            self._ollama_model = "llava:7b"
 
         self.frame_buffer: Deque[np.ndarray] = deque(maxlen=5)
         self.future_predictor = SimpleFramePredictor()
@@ -103,6 +159,8 @@ class CognitiveClient:
         self.current_directive: Optional[Dict[str, Any]] = None
         self.directive_timestamp: float = 0.0
         self.pending_request = False
+        self._pending_response: Optional[Dict[str, Any]] = None
+        self._request_thread: Optional[threading.Thread] = None
         # Stagger requests across workers to avoid synchronized bursts that create
         # artificial queueing latency on the centralized VLM server.
         now = time.time()
@@ -135,7 +193,57 @@ class CognitiveClient:
             # If phase=0 -> wait ~freq; if phase~1 -> send almost immediately.
             self.last_request_time = float(now) - float(phase) * float(freq)
 
-        logger.info("%s: CognitiveClient connected to %s", self.agent_id, self.server_url)
+        logger.info("%s: System2 backend=ollama model=%s", self.agent_id, self._ollama_model)
+
+    def _request_ollama(self, *, agent_state: Dict[str, Any], image_jpeg: bytes) -> Dict[str, Any]:
+        """Send an Ollama chat request and parse JSON response."""
+        if ollama is None:  # pragma: no cover
+            raise RuntimeError("ollama is not available")
+
+        ctx_json = json.dumps(agent_state or {}, ensure_ascii=False)
+        system_prompt = (
+            "You are System2 for a game agent. Provide a JSON response with keys: "
+            "goal, reasoning, confidence (0-1), directive{action,target,duration_seconds}. "
+            "Action must be one of: click, move, retreat, idle. "
+            "Target must be [x,y] normalized to [0,1] in screen coordinates. "
+            "If unsure, output action=idle and target=[0.5,0.5]. "
+            "Return ONLY JSON."
+        )
+        user_prompt = (
+            "Use the image and the context JSON below to decide the next UI interaction. "
+            "Prefer clicking an obvious UI element that advances progress (menu navigation). "
+            f"Context: {ctx_json}"
+        )
+        b64 = base64.b64encode(image_jpeg).decode("utf-8")
+        resp = ollama.chat(
+            model=self._ollama_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt, "images": [b64]},
+            ],
+            options={
+                "temperature": 0.0,
+                "num_predict": int(os.environ.get("METABONK_SYSTEM2_MAX_TOKENS", "256") or 256),
+            },
+            stream=False,
+        )
+        if isinstance(resp, dict):
+            content = (resp.get("message") or {}).get("content", "") or resp.get("response", "") or ""
+        else:
+            msg = getattr(resp, "message", None)
+            if isinstance(msg, dict):
+                content = msg.get("content", "") or ""
+            else:
+                content = getattr(msg, "content", "") if msg is not None else getattr(resp, "response", "") or ""
+        payload = _extract_json(str(content or ""))
+        if not payload:
+            payload = {
+                "goal": "",
+                "reasoning": "",
+                "confidence": 0.0,
+                "directive": {"action": "idle", "target": [0.5, 0.5], "duration_seconds": 3.0},
+            }
+        return payload
 
     def add_frame(self, frame: np.ndarray) -> None:
         """Add a new RGB frame [H,W,3] uint8 to the buffer."""
@@ -166,7 +274,7 @@ class CognitiveClient:
         return True
 
     def request_strategy(self, *, agent_state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Send a strategic reasoning request (non-blocking). Returns the request dict if sent."""
+        """Send a strategic reasoning request (async). Returns the request dict if sent."""
         if not self.should_request_strategy():
             return None
 
@@ -176,40 +284,45 @@ class CognitiveClient:
             return None
 
         try:
-            frames_b64: List[str] = []
-            for frame in frames:
-                buf = BytesIO()
-                frame.save(buf, format="JPEG", quality=self.jpeg_quality)
-                frames_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
-
             request = {
                 "agent_id": self.agent_id,
-                "frames": frames_b64,
+                "frames": ["ollama"],
                 "state": state,
                 "timestamp": time.time(),
             }
-            self.socket.send(json.dumps(request).encode("utf-8"), flags=zmq.NOBLOCK)
+            img = frames[-1]
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=self.jpeg_quality)
+            payload = buf.getvalue()
             self.last_request_time = time.time()
             self.pending_request = True
+
+            def _worker() -> None:
+                try:
+                    response = self._request_ollama(agent_state=state, image_jpeg=payload)
+                    if isinstance(response, dict):
+                        self.current_directive = response
+                        self.directive_timestamp = time.time()
+                        self._pending_response = response
+                except Exception as e:
+                    logger.error("%s: System2 request failed: %s", self.agent_id, e)
+                finally:
+                    self.pending_request = False
+
+            self._request_thread = threading.Thread(target=_worker, name=f"system2-{self.agent_id}", daemon=True)
+            self._request_thread.start()
             return request
         except Exception as e:
             logger.error("%s: error sending cognitive request: %s", self.agent_id, e)
             return None
 
     def poll_response(self) -> Optional[Dict[str, Any]]:
-        """Poll for a server response (non-blocking)."""
-        try:
-            if self.socket.poll(timeout=0):
-                resp_bytes = self.socket.recv(flags=zmq.NOBLOCK)
-                resp = json.loads(resp_bytes.decode("utf-8"))
-                if isinstance(resp, dict):
-                    self.current_directive = resp
-                    self.directive_timestamp = time.time()
-                    self.pending_request = False
-                    return resp
-        except Exception:
+        """Return the most recent response, if any (non-blocking)."""
+        if self._pending_response is None:
             return None
-        return None
+        resp = self._pending_response
+        self._pending_response = None
+        return resp
 
     def get_current_directive(self) -> Optional[Dict[str, Any]]:
         if self.current_directive is None:
@@ -221,10 +334,7 @@ class CognitiveClient:
         return self.current_directive
 
     def cleanup(self) -> None:
-        try:
-            self.socket.close(0)
-        except Exception:
-            pass
+        self._pending_response = None
 
     def _build_temporal_strip(self, *, total_frames: int = 9) -> Optional[List[Image.Image]]:
         """Build a temporal strip: past (<=5) + predicted future (<=3) + padding.

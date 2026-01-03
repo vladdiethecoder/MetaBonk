@@ -21,8 +21,9 @@ frames stay on GPU until encode/inference, and missing GPU prerequisites hard-fa
   - Tracks worker heartbeats, exposes `/workers`, and powers the dashboard.
   - Provides health/diagnostics endpoints used by validation scripts.
 
-- **Cognitive Server (System2 / VLM Hive)** (`docker/cognitive-server/`)
-  - Centralized ZeroMQ server used by workers for low-frequency strategic directives.
+- **System2 + VLM Hints (Ollama)** (`src/worker/vlm_hint_generator.py`)
+  - On-device VLM hints (llava:7b) for UI understanding and navigation cues.
+  - System2 directives are generated locally via Ollama (no centralized server).
 
 ## Data Flow (High Level)
 
@@ -48,4 +49,3 @@ Spectator (optional)
 - Start full stack: `./launch`
 - Verify running stack: `python3 scripts/verify_running_stack.py --workers 5`
 - Validate streams: `python3 scripts/validate_streams.py --use-orch`
-

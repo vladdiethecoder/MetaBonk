@@ -1,6 +1,9 @@
 # MetaBonk Issue Resolution Instructions
 **Based on Video Analysis: Screencast_20251231_161736.webm**
 
+> **Deprecated (2026-01-03):** SGLang references in this document are historical.
+> The active stack is Ollama-only.
+
 ---
 
 ## 🔍 ISSUES IDENTIFIED

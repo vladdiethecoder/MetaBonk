@@ -11,7 +11,6 @@ to validate that the core surfaces are alive:
 - Workers report stream health via /status
 - Optional /frame.jpg sanity check (skipped in strict zero-copy mode)
 - go2rtc exposes expected streams (if enabled)
-- Cognitive server responds to ZMQ metrics (if enabled)
 - Frontend routes respond (best-effort HTTP check)
 """
 
@@ -21,7 +20,6 @@ import argparse
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -56,44 +54,6 @@ def _fetch_bytes(url: str, *, timeout_s: float, max_bytes: int = 2_000_000) -> b
         return resp.read(max_bytes)
 
 
-def _zmq_metrics(server_url: str, *, timeout_s: float) -> Optional[Dict[str, Any]]:
-    try:
-        import zmq  # type: ignore
-    except Exception:
-        return None
-
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.DEALER)
-    sock.linger = 0
-    sock.setsockopt_string(zmq.IDENTITY, "metabonk-verify")
-    sock.connect(server_url)
-    poller = zmq.Poller()
-    poller.register(sock, zmq.POLLIN)
-    try:
-        try:
-            sock.send_json({"type": "metrics", "timestamp": time.time()}, flags=zmq.NOBLOCK)
-        except Exception:
-            return None
-
-        deadline = time.time() + max(0.1, float(timeout_s))
-        while time.time() < deadline:
-            socks = dict(poller.poll(timeout=50))
-            if sock not in socks:
-                continue
-            try:
-                data = sock.recv(flags=zmq.NOBLOCK)
-                obj = json.loads(data.decode("utf-8"))
-                return obj if isinstance(obj, dict) else None
-            except Exception:
-                return None
-        return None
-    finally:
-        try:
-            sock.close(0)
-        except Exception:
-            pass
-
-
 @dataclass
 class CheckResult:
     name: str
@@ -110,7 +70,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Verify a running MetaBonk stack (non-destructive).")
     ap.add_argument("--workers", type=int, default=int(os.environ.get("METABONK_WORKERS", "5") or "5"))
     ap.add_argument("--orch-url", default=os.environ.get("METABONK_ORCH_URL", "http://127.0.0.1:8040"))
-    ap.add_argument("--cognitive-url", default=os.environ.get("METABONK_COGNITIVE_SERVER_URL", "tcp://127.0.0.1:5555"))
     ap.add_argument("--go2rtc-url", default=os.environ.get("METABONK_GO2RTC_URL", "http://127.0.0.1:1984"))
     ap.add_argument("--ui-base", default=os.environ.get("METABONK_UI_BASE", "http://127.0.0.1:5173"))
     ap.add_argument("--timeout-s", type=float, default=2.5)
@@ -126,7 +85,6 @@ def main() -> int:
         help="Fail if any worker reports act_hz below this threshold (0=skip).",
     )
     ap.add_argument("--skip-go2rtc", action="store_true", help="Skip go2rtc API check")
-    ap.add_argument("--skip-cognitive", action="store_true", help="Skip cognitive server ZMQ metrics check")
     ap.add_argument("--skip-ui", action="store_true", help="Skip frontend HTTP checks")
     args = ap.parse_args()
 
@@ -161,8 +119,6 @@ def main() -> int:
     gameplay_fail = 0
     act_hz_fail = 0
     frame_var_checked = 0
-    system2_enabled_known = False
-    system2_enabled_any = False
     for w in workers[:expected_workers] if expected_workers else workers:
         if not isinstance(w, dict):
             continue
@@ -173,9 +129,6 @@ def main() -> int:
             continue
         try:
             st = _get_json(f"http://127.0.0.1:{port}/status", timeout_s=float(args.timeout_s))
-            if "system2_enabled" in st:
-                system2_enabled_known = True
-                system2_enabled_any = system2_enabled_any or bool(st.get("system2_enabled", False))
             fps = float(st.get("frames_fps") or 0.0)
             act_hz = float(st.get("act_hz") or 0.0)
             gameplay_started = bool(st.get("gameplay_started", False))
@@ -282,25 +235,7 @@ def main() -> int:
         results.append(CheckResult("go2rtc", ok_go2, detail))
         ok &= ok_go2
 
-    # 4) cognitive server
-    if not bool(args.skip_cognitive):
-        if system2_enabled_known and not system2_enabled_any:
-            results.append(CheckResult("System2", True, "skipped (disabled by worker config)"))
-        else:
-            metrics = _zmq_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
-            if metrics is None:
-                ok = False
-                results.append(CheckResult("System2", False, f"no metrics response from {args.cognitive_url}"))
-            else:
-                try:
-                    req = int(metrics.get("request_count") or 0)
-                    agents = int(metrics.get("active_agents") or 0)
-                    avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
-                    results.append(CheckResult("System2", True, f"agents={agents} requests={req} avg={avg_ms:.1f}ms"))
-                except Exception:
-                    results.append(CheckResult("System2", True, "metrics received"))
-
-    # 5) UI routes (best-effort HTTP reachability)
+    # 4) UI routes (best-effort HTTP reachability)
     if not bool(args.skip_ui):
         for path in ("/stream", "/neural/broadcast", "/lab/instances"):
             ok_http, detail = _http_ok(ui_base + path, timeout_s=float(args.timeout_s))

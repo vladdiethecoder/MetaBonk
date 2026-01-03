@@ -1152,35 +1152,6 @@ def main() -> int:
     # Train/play: start services and optionally spawn workers.
     env = os.environ.copy()
 
-    # Guardrail: BonkLink defaults used to collide with the cognitive server's ZMQ port (5555),
-    # which prevents the plugin from binding and silently breaks menu interaction.
-    disable_bonklink_env = str(env.get("METABONK_DISABLE_BONKLINK", "0") or "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-    if not disable_bonklink_env and int(getattr(args, "workers", 0) or 0) > 0:
-        cognitive_port: Optional[int] = None
-        raw_url = str(env.get("METABONK_COGNITIVE_SERVER_URL") or "").strip()
-        if raw_url.startswith("tcp://") and ":" in raw_url:
-            try:
-                cognitive_port = int(raw_url.rsplit(":", 1)[-1])
-            except Exception:
-                cognitive_port = None
-        if cognitive_port is None:
-            try:
-                cognitive_port = int(str(env.get("METABONK_COGNITIVE_ZMQ_PORT", "5555") or "5555").strip())
-            except Exception:
-                cognitive_port = 5555
-        bonk_start = int(getattr(args, "bonklink_base_port", 0) or 0)
-        bonk_end = bonk_start + max(0, int(getattr(args, "workers", 0) or 0) - 1)
-        if bonk_start <= cognitive_port <= bonk_end:
-            raise SystemExit(
-                "[start_omega] ERROR: BonkLink port range "
-                f"{bonk_start}-{bonk_end} overlaps cognitive server port {cognitive_port}. "
-                "Pick a different --bonklink-base-port (e.g. 5560) or change METABONK_COGNITIVE_ZMQ_PORT."
-            )
     # Avoid leaking a stale PipeWire target from the user's shell environment.
     # Gamescope recreates nodes/ports frequently; the worker will auto-discover the
     # current target unless the user explicitly pins an override.

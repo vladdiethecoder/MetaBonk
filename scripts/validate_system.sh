@@ -21,9 +21,9 @@ echo "[validate_system] pure vision enforcement..."
 
 echo "[validate_system] checking live stack (best-effort)..."
 if command -v curl >/dev/null 2>&1 && curl -fsS "$ORCH_URL/status" >/dev/null 2>&1; then
-  # UI is a viewer, not a dependency. Default to headless validation unless explicitly requested.
+  # UI should be exercised in validation unless explicitly disabled.
   VERIFY_ARGS=(--workers "$WORKERS" --orch-url "$ORCH_URL")
-  if [[ "${METABONK_VALIDATE_UI:-0}" != "1" ]]; then
+  if [[ "${METABONK_VALIDATE_UI:-1}" == "0" ]]; then
     VERIFY_ARGS+=(--skip-ui)
   fi
   "$PYTHON_BIN" scripts/verify_running_stack.py "${VERIFY_ARGS[@]}"

@@ -218,6 +218,96 @@ class WorkerService:
         self._system2_last_ui_click_resp_ts = 0.0
         self._vlm_hints_used: int = 0
         self._vlm_hints_applied: int = 0
+        self._system2_reasoner = None
+
+        # Optional dynamic UI exploration (game-agnostic). This is guarded behind an env
+        # flag to avoid changing default training behavior.
+        self._dynamic_ui_exploration_enabled = str(os.environ.get("METABONK_DYNAMIC_UI_EXPLORATION", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._dynamic_ui_use_vlm_hints = str(os.environ.get("METABONK_DYNAMIC_UI_USE_VLM_HINTS", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        try:
+            self._ui_vlm_hint_interval_s = float(os.environ.get("METABONK_UI_VLM_HINTS_INTERVAL_S", "1.0") or 1.0)
+        except Exception:
+            self._ui_vlm_hint_interval_s = 1.0
+        self._ui_vlm_hint_interval_s = max(0.25, float(self._ui_vlm_hint_interval_s))
+        self._ui_vlm_hint_cache: Optional[list[dict]] = None
+        self._ui_vlm_hint_cache_ts: float = 0.0
+        self._last_ui_vlm_hint_warn_ts: float = 0.0
+        self._dynamic_exploration_policy = None
+        self._dynamic_state_classifier = None
+        self._dynamic_ui_state_type: str = "uncertain"
+        self._dynamic_ui_state_metrics: dict = {}
+        self._dynamic_ui_exploration_actions: int = 0
+        self._dynamic_ui_epsilon: float = 0.0
+        if bool(self._dynamic_ui_exploration_enabled):
+            try:
+                from src.worker.exploration_policy import DynamicExplorationPolicy
+                from src.worker.state_classifier import classify_state_with_metrics
+
+                self._dynamic_exploration_policy = DynamicExplorationPolicy()
+                self._dynamic_state_classifier = classify_state_with_metrics
+            except Exception as e:
+                self._dynamic_ui_exploration_enabled = False
+                self._dynamic_exploration_policy = None
+                self._dynamic_state_classifier = None
+                print(
+                    f"[worker:{self.instance_id}] WARN: dynamic UI exploration unavailable ({e}); disabling",
+                    flush=True,
+                )
+
+        # Optional intrinsic reward shaping for UI progression (game-agnostic).
+        self._intrinsic_reward_enabled = str(os.environ.get("METABONK_INTRINSIC_REWARD", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._intrinsic_reward_shaper = None
+        if bool(self._intrinsic_reward_enabled):
+            try:
+                from src.worker.reward_shaper import IntrinsicRewardShaper
+
+                self._intrinsic_reward_shaper = IntrinsicRewardShaper()
+            except Exception as e:
+                self._intrinsic_reward_enabled = False
+                self._intrinsic_reward_shaper = None
+                print(
+                    f"[worker:{self.instance_id}] WARN: intrinsic reward shaper unavailable ({e}); disabling",
+                    flush=True,
+                )
+
+        # Optional UI meta-learning: record successful menu click sequences and reuse them
+        # when similar screens reappear (game-agnostic, vision-only).
+        self._meta_learning_enabled = str(os.environ.get("METABONK_META_LEARNING", "0") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._meta_learner = None
+        self._meta_reached_gameplay: bool = False
+        self._meta_episode_idx: Optional[int] = None
+        if bool(self._meta_learning_enabled):
+            try:
+                from src.worker.meta_learner import UINavigationMetaLearner
+
+                self._meta_learner = UINavigationMetaLearner()
+            except Exception as e:
+                self._meta_learning_enabled = False
+                self._meta_learner = None
+                print(
+                    f"[worker:{self.instance_id}] WARN: meta-learning unavailable ({e}); disabling",
+                    flush=True,
+                )
         self._system2_active_applied: bool = False
         self._system2_override_cont = str(os.environ.get("METABONK_SYSTEM2_OVERRIDE_CONT", "1") or "").strip().lower() not in (
             "0",
@@ -227,13 +317,11 @@ class WorkerService:
         )
         if self._system2_enabled and CognitiveClient is not None:
             try:
-                server_url = os.environ.get("METABONK_COGNITIVE_SERVER_URL", "tcp://127.0.0.1:5555")
                 freq_s = float(os.environ.get("METABONK_STRATEGY_FREQUENCY", "2.0"))
                 jpeg_q = int(os.environ.get("METABONK_SYSTEM2_JPEG_QUALITY", "85"))
                 max_edge = int(os.environ.get("METABONK_SYSTEM2_MAX_EDGE", "512"))
                 self._cognitive_client = CognitiveClient(
                     agent_id=self.instance_id,
-                    server_url=server_url,
                     request_frequency_s=freq_s,
                     jpeg_quality=jpeg_q,
                     max_edge=max_edge,
@@ -246,15 +334,30 @@ class WorkerService:
                 )
                 if rl_on and RLLogger is not None:
                     self._system2_rl_logger = RLLogger(os.environ.get("METABONK_RL_LOG_DIR"))
+                backend = str(os.environ.get("METABONK_SYSTEM2_BACKEND", "ollama") or "ollama").strip().lower()
+                model = str(
+                    os.environ.get(
+                        "METABONK_SYSTEM2_MODEL", os.environ.get("METABONK_VLM_HINT_MODEL", "llava:7b") or ""
+                    )
+                    or ""
+                ).strip() or "llava:7b"
                 print(
-                    f"[worker:{self.instance_id}] System2 enabled "
-                    f"(server={server_url}, freq={freq_s:.2f}s)",
+                    f"[worker:{self.instance_id}] System2 enabled (backend={backend}, model={model}, freq={freq_s:.2f}s)",
                     flush=True,
                 )
             except Exception as e:
                 self._cognitive_client = None
                 self._system2_enabled = False
                 print(f"[worker:{self.instance_id}] WARN: System2 disabled (init failed): {e}", flush=True)
+
+        # Optional System2 trigger/gating (default preserves legacy behavior).
+        if self._system2_enabled:
+            try:
+                from src.worker.system2 import System2Reasoner
+
+                self._system2_reasoner = System2Reasoner()
+            except Exception:
+                self._system2_reasoner = None
 
         # Optional stream overlay text file (used by ffmpeg drawtext). We create it early so
         # the encoder can reference it even before the first thought packet arrives.
@@ -5183,6 +5286,19 @@ class WorkerService:
 
         while not self._stop.is_set():
             now = time.time()
+            # Meta-learning episode tracking: reset local traces when the episode index changes
+            # (covers normal done-based boundaries and Synthetic Eye reset boundaries).
+            try:
+                meta = getattr(self, "_meta_learner", None)
+                if meta is not None:
+                    cur_ep = int(getattr(self, "_episode_idx", 0) or 0)
+                    prev_ep = getattr(self, "_meta_episode_idx", None)
+                    if prev_ep is None or int(prev_ep) != int(cur_ep):
+                        meta.reset_episode()
+                        self._meta_episode_idx = int(cur_ep)
+                        self._meta_reached_gameplay = False
+            except Exception:
+                pass
             if self._use_bonklink and self._bonklink is None:
                 if (now - float(getattr(self, "_bonklink_last_attempt", 0.0))) >= float(
                     getattr(self, "_bonklink_retry_s", 5.0)
@@ -6112,16 +6228,61 @@ class WorkerService:
                     pass
                 try:
                     if self._cognitive_client.should_request_strategy():
-                        agent_state = self._system2_build_agent_state(
-                            game_state=game_state,
-                            detections=detections,
-                            frame_size=frame_size,
-                            stuck=stuck,
-                            now=now,
-                        )
-                        req = self._cognitive_client.request_strategy(agent_state=agent_state)
-                        if req is not None:
-                            self._system2_last_request = req
+                        engage = True
+                        trigger_reason = "legacy"
+                        gameplay_started = bool(getattr(self, "_gameplay_started", False))
+                        # Best-effort state type for System2 gating. Prefer the dynamic classifier
+                        # when available; otherwise default to menu before gameplay starts.
+                        state_type = str(getattr(self, "_dynamic_ui_state_type", "") or "").strip().lower()
+                        if (not state_type) or (state_type == "uncertain"):
+                            state_type = "menu_ui" if not gameplay_started else "gameplay"
+
+                        reasoner = getattr(self, "_system2_reasoner", None)
+                        if reasoner is not None:
+                            try:
+                                step_i = int(getattr(self.trainer, "step_count", 0) or 0)
+                            except Exception:
+                                step_i = 0
+                            ve = getattr(self, "_visual_exploration", None)
+                            scene_hash = getattr(ve, "last_scene_hash", None) if ve is not None else None
+                            new_scene = bool(getattr(ve, "last_new_scene", False)) if ve is not None else False
+                            screen_transition = bool(getattr(ve, "last_transition", False)) if ve is not None else False
+                            has_active = False
+                            try:
+                                has_active = self._cognitive_client.get_current_directive() is not None
+                            except Exception:
+                                has_active = False
+                            directive_applied = bool(getattr(self, "_system2_active_applied", False))
+                            engage, trigger_reason = reasoner.should_engage(
+                                now=float(now),
+                                step=int(step_i),
+                                gameplay_started=bool(gameplay_started),
+                                state_type=str(state_type),
+                                stuck=bool(stuck),
+                                scene_hash=str(scene_hash) if scene_hash is not None else None,
+                                new_scene=bool(new_scene),
+                                screen_transition=bool(screen_transition),
+                                has_active_directive=bool(has_active),
+                                directive_applied=bool(directive_applied),
+                            )
+
+                        if engage:
+                            agent_state = self._system2_build_agent_state(
+                                game_state=game_state,
+                                detections=detections,
+                                frame_size=frame_size,
+                                stuck=stuck,
+                                now=now,
+                            )
+                            # Attach trigger/gating context (compact; server may ignore).
+                            try:
+                                agent_state["state_type"] = str(state_type)
+                                agent_state["system2_trigger_reason"] = str(trigger_reason)
+                            except Exception:
+                                pass
+                            req = self._cognitive_client.request_strategy(agent_state=agent_state)
+                            if req is not None:
+                                self._system2_last_request = req
                 except Exception:
                     pass
 
@@ -6220,6 +6381,12 @@ class WorkerService:
                 except Exception:
                     action_mask_for_policy = None
             action_source = self._action_source if self._gameplay_started else "policy"
+            # Meta-learning success flag: record whether we reached gameplay this episode.
+            try:
+                if getattr(self, "_meta_learner", None) is not None and bool(getattr(self, "_gameplay_started", False)):
+                    self._meta_reached_gameplay = True
+            except Exception:
+                pass
             if self._gameplay_started and action_source == "random":
                 a_cont, a_disc = self._sample_random_action(action_mask_for_policy or action_mask)
                 lp = 0.0
@@ -6346,28 +6513,244 @@ class WorkerService:
                     pre_gameplay_click = (float(now) - float(loop_t0)) >= max(0.0, float(grace_s))
             except Exception:
                 pre_gameplay_click = False
+
+            dyn_enabled = bool(getattr(self, "_dynamic_ui_exploration_enabled", False)) and (
+                getattr(self, "_dynamic_exploration_policy", None) is not None and getattr(self, "_dynamic_state_classifier", None) is not None
+            )
+            dyn_state_type = "uncertain"
+            if dyn_enabled:
+                try:
+                    policy_dyn = getattr(self, "_dynamic_exploration_policy", None)
+                    classifier_dyn = getattr(self, "_dynamic_state_classifier", None)
+                    frame_for_dyn = reward_frame_hwc
+                    if frame_for_dyn is None and latest_image_bytes is not None:
+                        try:
+                            import io
+                            import numpy as np
+                            from PIL import Image
+
+                            frame_for_dyn = np.asarray(Image.open(io.BytesIO(latest_image_bytes)).convert("RGB"))
+                        except Exception:
+                            frame_for_dyn = None
+                    if policy_dyn is not None and frame_for_dyn is not None:
+                        policy_dyn.update(frame_for_dyn)
+                    if classifier_dyn is not None and frame_for_dyn is not None:
+                        cls = classifier_dyn(frame_for_dyn, getattr(policy_dyn, "frame_history", []) or [])
+                        dyn_state_type = str(getattr(cls, "state_type", "uncertain") or "uncertain")
+                        self._dynamic_ui_state_type = dyn_state_type
+                        try:
+                            self._dynamic_ui_state_metrics = dict(getattr(cls, "metrics", {}) or {})
+                        except Exception:
+                            self._dynamic_ui_state_metrics = {}
+                except Exception:
+                    dyn_state_type = "uncertain"
+
+            # Optional meta-learning: reuse historically successful UI clicks for similar scenes.
+            meta_applied = False
+            try:
+                meta = getattr(self, "_meta_learner", None)
+                if (
+                    meta is not None
+                    and action_mask
+                    and ui_elements_cache is not None
+                    and self._input_backend is None
+                    and (forced_ui_click is None)
+                    and (not suppress_policy_clicks)
+                    and (a_disc is not None)
+                ):
+                    gameplay_started = bool(getattr(self, "_gameplay_started", False))
+                    state_for_meta = str(dyn_state_type or "").strip().lower()
+                    if (not state_for_meta) or (state_for_meta == "uncertain"):
+                        state_for_meta = "menu_ui" if not gameplay_started else "gameplay"
+                    if state_for_meta == "menu_ui":
+                        valid = [i for i, m in enumerate(action_mask[:-1]) if int(m) == 1]
+                        scene_hash = None
+                        try:
+                            ve = getattr(self, "_visual_exploration", None)
+                            scene_hash = getattr(ve, "last_scene_hash", None) if ve is not None else None
+                        except Exception:
+                            scene_hash = None
+                        if valid and scene_hash:
+                            sug = meta.suggest_click_index(
+                                now=float(now),
+                                scene_hash=str(scene_hash),
+                                ui_elements=ui_elements_cache,
+                                valid_indices=valid,
+                            )
+                            if sug is not None:
+                                try:
+                                    meta.note_suggestion_considered()
+                                except Exception:
+                                    pass
+                                try:
+                                    step_i = int(getattr(self.trainer, "step_count", 0) or 0)
+                                except Exception:
+                                    step_i = 0
+                                try:
+                                    ep_i = int(getattr(self, "_episode_idx", 0) or 0)
+                                except Exception:
+                                    ep_i = 0
+                                follow = False
+                                try:
+                                    follow = bool(
+                                        meta.should_follow_suggestion(
+                                            instance_id=str(self.instance_id),
+                                            episode_idx=int(ep_i),
+                                            step=int(step_i),
+                                            scene_hash=str(sug.matched_scene_hash),
+                                            suggested_index=int(sug.index),
+                                        )
+                                    )
+                                except Exception:
+                                    follow = True
+                                if follow and len(a_disc) >= 1:
+                                    a_disc[0] = int(sug.index)
+                                    action_source = f"{action_source}+ui_meta" if action_source else "ui_meta"
+                                    try:
+                                        meta.note_suggestion_applied(similarity=float(sug.similarity), reason=str(sug.reason))
+                                        meta.mark_scene_applied(matched_scene_hash=str(sug.matched_scene_hash), now=float(now))
+                                    except Exception:
+                                        pass
+                                    meta_applied = True
+            except Exception:
+                meta_applied = False
+
+            should_ui_explore = bool(stuck) or bool(pre_gameplay_click) or (dyn_enabled and str(dyn_state_type) == "menu_ui")
             if (
-                (bool(stuck) or pre_gameplay_click)
+                should_ui_explore
                 and action_mask
                 and self._input_backend is None
                 and (forced_ui_click is None)
                 and (not suppress_policy_clicks)
+                and (not meta_applied)
             ):
+                eps = 0.0
+                state_for_eps = dyn_state_type
+                if pre_gameplay_click and str(dyn_state_type) != "gameplay":
+                    state_for_eps = "menu_ui"
+                if dyn_enabled:
+                    try:
+                        policy_dyn = getattr(self, "_dynamic_exploration_policy", None)
+                        if policy_dyn is not None:
+                            eps = float(policy_dyn.get_epsilon(state_for_eps))
+                            # Respect the worker's stuck detector as well (it can be more robust than
+                            # the lightweight dynamic policy).
+                            try:
+                                stuck_eps = float(getattr(getattr(policy_dyn, "cfg", None), "stuck_eps", 0.9) or 0.9)
+                            except Exception:
+                                stuck_eps = 0.9
+                            if bool(stuck):
+                                eps = max(float(eps), float(stuck_eps))
+                    except Exception:
+                        eps = 0.0
+                else:
+                    try:
+                        if pre_gameplay_click:
+                            eps = float(str(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0") or "0").strip() or 0.0)
+                        else:
+                            eps = float(str(os.environ.get("METABONK_UI_EPS", "0") or "0").strip() or 0.0)
+                    except Exception:
+                        eps = 0.0
+                    if eps <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)):
+                        eps = float(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0.9")) if pre_gameplay_click else 0.5
+
                 try:
-                    if pre_gameplay_click:
-                        eps = float(str(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0") or "0").strip() or 0.0)
-                    else:
-                        eps = float(str(os.environ.get("METABONK_UI_EPS", "0") or "0").strip() or 0.0)
+                    self._dynamic_ui_epsilon = float(eps)
                 except Exception:
-                    eps = 0.0
-                if eps <= 0.0 and bool(getattr(self, "_pure_vision_mode", False)):
-                    eps = float(os.environ.get("METABONK_UI_PRE_GAMEPLAY_EPS", "0.9")) if pre_gameplay_click else 0.5
+                    self._dynamic_ui_epsilon = 0.0
+
                 if eps > 0.0 and random.random() < eps:
                     try:
                         valid = [i for i, m in enumerate(action_mask[:-1]) if int(m) == 1]
-                        if valid and a_disc:
-                            a_disc[0] = int(random.choice(valid))
-                            action_source = f"{action_source}+ui_eps" if action_source else "ui_eps"
+                        chosen_idx: Optional[int] = None
+                        use_vlm_hints = bool(dyn_enabled) and bool(getattr(self, "_dynamic_ui_use_vlm_hints", False)) and str(
+                            state_for_eps
+                        ) == "menu_ui"
+                        if use_vlm_hints and valid and frame_size is not None and ui_elements_cache is not None:
+                            # Throttle VLM hinting to avoid spamming inference.
+                            hints = None
+                            try:
+                                interval_s = float(getattr(self, "_ui_vlm_hint_interval_s", 1.0) or 1.0)
+                            except Exception:
+                                interval_s = 1.0
+                            last_ts = float(getattr(self, "_ui_vlm_hint_cache_ts", 0.0) or 0.0)
+                            cache = getattr(self, "_ui_vlm_hint_cache", None)
+                            if cache is not None and (now - last_ts) < max(0.0, interval_s):
+                                hints = list(cache)
+                            else:
+                                try:
+                                    from src.worker.vlm_hint_generator import generate_hints
+
+                                    frame_for_hints = reward_frame_hwc
+                                    if frame_for_hints is None and latest_image_bytes is not None:
+                                        import io
+                                        import numpy as np
+                                        from PIL import Image
+
+                                        frame_for_hints = np.asarray(Image.open(io.BytesIO(latest_image_bytes)).convert("RGB"))
+                                    if frame_for_hints is not None:
+                                        hints = generate_hints(frame_for_hints, context={"state": "menu"})
+                                        self._ui_vlm_hint_cache = list(hints or [])
+                                        self._ui_vlm_hint_cache_ts = float(now)
+                                except Exception as e:
+                                    # Rate-limit warnings.
+                                    last_warn = float(getattr(self, "_last_ui_vlm_hint_warn_ts", 0.0) or 0.0)
+                                    if (now - last_warn) > 5.0:
+                                        self._last_ui_vlm_hint_warn_ts = float(now)
+                                        print(
+                                            f"[worker:{self.instance_id}] WARN: VLM hint generation failed ({e})",
+                                            flush=True,
+                                        )
+                                    hints = None
+
+                            if hints:
+                                # Prefer priority=1 UI elements (buttons/selections), then fall back.
+                                high = [h for h in hints if int(h.get("priority", 2) or 2) == 1]
+                                if not high:
+                                    high = [h for h in hints if int(h.get("priority", 2) or 2) == 2]
+                                if not high:
+                                    high = list(hints)
+                                sem = [h for h in high if str(h.get("element_type") or "").lower() in ("button", "selection")]
+                                candidates = sem or high
+                                hint = random.choice(candidates)
+                                try:
+                                    w, h = frame_size
+                                    loc = hint.get("location") or {}
+                                    hx = float(loc.get("x", 0.0)) / float(max(1, int(w)))
+                                    hy = float(loc.get("y", 0.0)) / float(max(1, int(h)))
+                                    best_i = None
+                                    best_d = None
+                                    for i in valid:
+                                        if i < 0 or i >= len(ui_elements_cache):
+                                            continue
+                                        row = ui_elements_cache[i]
+                                        if not (isinstance(row, (list, tuple)) and len(row) >= 2):
+                                            continue
+                                        cx = float(row[0])
+                                        cy = float(row[1])
+                                        d = (cx - hx) * (cx - hx) + (cy - hy) * (cy - hy)
+                                        if best_d is None or d < best_d:
+                                            best_d = d
+                                            best_i = int(i)
+                                    if best_i is not None:
+                                        chosen_idx = int(best_i)
+                                except Exception:
+                                    chosen_idx = None
+
+                        if chosen_idx is None and valid:
+                            chosen_idx = int(random.choice(valid))
+                        if chosen_idx is not None and a_disc:
+                            a_disc[0] = int(chosen_idx)
+                            try:
+                                self._dynamic_ui_exploration_actions = int(
+                                    getattr(self, "_dynamic_ui_exploration_actions", 0) or 0
+                                ) + 1
+                            except Exception:
+                                self._dynamic_ui_exploration_actions = 1
+                            if use_vlm_hints and chosen_idx is not None:
+                                action_source = f"{action_source}+ui_vlm" if action_source else "ui_vlm"
+                            else:
+                                action_source = f"{action_source}+ui_dyn" if action_source else "ui_dyn"
                     except Exception:
                         pass
 
@@ -6540,6 +6923,65 @@ class WorkerService:
                 except Exception:
                     pass
 
+            # Meta-learning: record UI click steps (vision-only) to replay successful menu sequences.
+            try:
+                meta = getattr(self, "_meta_learner", None)
+                if meta is not None:
+                    gameplay_started = bool(getattr(self, "_gameplay_started", False))
+                    st_hint = str(
+                        (locals().get("dyn_state_type") or getattr(self, "_dynamic_ui_state_type", "") or "")
+                    ).strip().lower()
+                    if (not st_hint) or (st_hint == "uncertain"):
+                        st_hint = "menu_ui" if not gameplay_started else "gameplay"
+
+                    scene_hash = None
+                    try:
+                        ve = getattr(self, "_visual_exploration", None)
+                        scene_hash = getattr(ve, "last_scene_hash", None) if ve is not None else None
+                    except Exception:
+                        scene_hash = None
+
+                    click_xy_norm = None
+                    if forced_ui_click is not None and frame_size is not None:
+                        w, h = frame_size
+                        if int(w) > 0 and int(h) > 0:
+                            click_xy_norm = (float(forced_ui_click[0]) / float(w), float(forced_ui_click[1]) / float(h))
+                    elif (not suppress_policy_clicks) and (a_disc is not None) and action_mask and ui_elements_cache is not None:
+                        try:
+                            idx = int(a_disc[0])
+                        except Exception:
+                            idx = -1
+                        noop_idx = len(action_mask) - 1 if action_mask else -1
+                        try:
+                            last_idx = int(getattr(self, "_last_disc_action", -999999))
+                        except Exception:
+                            last_idx = -999999
+                        if (
+                            0 <= idx < len(action_mask)
+                            and idx != noop_idx
+                            and int(action_mask[idx]) == 1
+                            and idx != last_idx
+                            and idx < len(ui_elements_cache)
+                        ):
+                            row = ui_elements_cache[idx]
+                            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                                try:
+                                    click_xy_norm = (float(row[0]), float(row[1]))
+                                except Exception:
+                                    click_xy_norm = None
+
+                    if click_xy_norm is not None and scene_hash is not None:
+                        meta.record_step(
+                            now=float(now),
+                            scene_hash=str(scene_hash),
+                            gameplay_started=bool(gameplay_started),
+                            state_type=str(st_hint),
+                            click_xy_norm=(float(click_xy_norm[0]), float(click_xy_norm[1])),
+                            action_source=str(action_source),
+                        )
+            except Exception:
+                pass
+
             if self._action_clip_enabled and a_cont:
                 raw_cont = [float(x) for x in (a_cont or [])]
                 clipped = []
@@ -6584,7 +7026,8 @@ class WorkerService:
 
             # Flight recorder: store last actions + thumbnails for Context Drawer.
             try:
-                action_label = "random" if (self._gameplay_started and action_source == "random") else "policy"
+                base_action_source = str(action_source or "").split("+", 1)[0].strip().lower()
+                action_label = "random" if (self._gameplay_started and base_action_source == "random") else "policy"
                 if forced_ui_click is not None:
                     action_label = "click_xy"
                 elif a_disc:
@@ -6957,6 +7400,32 @@ class WorkerService:
                     "No reward available (game reward missing and learned reward disabled). "
                     "Enable learned reward (METABONK_USE_LEARNED_REWARD=1) or provide a reward-capable bridge."
                 )
+
+            # Optional intrinsic reward shaping (e.g., UI progression bonuses).
+            try:
+                shaper = getattr(self, "_intrinsic_reward_shaper", None)
+                if shaper is not None:
+                    apply_in_pure = False
+                    try:
+                        apply_in_pure = bool(getattr(getattr(shaper, "cfg", None), "apply_in_pure_vision", False))
+                    except Exception:
+                        apply_in_pure = False
+                    if (not bool(getattr(self, "_pure_vision_mode", False))) or apply_in_pure:
+                        frame_for_intrinsic = reward_frame_hwc if reward_frame_hwc is not None else pixel_tensor
+                        if frame_for_intrinsic is not None:
+                            state_type_hint = getattr(self, "_dynamic_ui_state_type", None)
+                            bonus = float(
+                                shaper.update(
+                                    frame_for_intrinsic,
+                                    gameplay_started=bool(self._gameplay_started),
+                                    stuck=bool(stuck),
+                                    state_type=str(state_type_hint) if state_type_hint is not None else None,
+                                )
+                            )
+                            if abs(bonus) > 0.0:
+                                reward = float(reward) + float(bonus)
+            except Exception:
+                pass
 
             reward_hit = False
             try:
@@ -7787,6 +8256,17 @@ class WorkerService:
                             },
                         )
                         requests.post(f"{self.orch_url}/events", json=ev2.model_dump(), timeout=1.0)
+                        # Meta-learning: finalize episode trace and store successful UI sequences.
+                        try:
+                            meta = getattr(self, "_meta_learner", None)
+                            if meta is not None:
+                                reached = bool(getattr(self, "_meta_reached_gameplay", False)) or bool(
+                                    getattr(self, "_gameplay_started", False)
+                                )
+                                meta.record_episode_end(now=float(now), reached_gameplay=bool(reached))
+                                self._meta_reached_gameplay = False
+                        except Exception:
+                            pass
                     if (not done) and self._last_done_sent:
                         # New episode detected.
                         self._last_done_sent = False
@@ -7807,6 +8287,14 @@ class WorkerService:
                             payload={"ts": now, "episode_idx": self._episode_idx},
                         )
                         requests.post(f"{self.orch_url}/events", json=ev3.model_dump(), timeout=1.0)
+                        try:
+                            meta = getattr(self, "_meta_learner", None)
+                            if meta is not None:
+                                meta.reset_episode()
+                                self._meta_episode_idx = int(getattr(self, "_episode_idx", 0) or 0)
+                                self._meta_reached_gameplay = False
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -8073,6 +8561,37 @@ class WorkerService:
             ve = getattr(self, "_visual_exploration", None)
             if ve is not None and hasattr(ve, "metrics"):
                 out.update(ve.metrics())
+        except Exception:
+            pass
+        try:
+            shaper = getattr(self, "_intrinsic_reward_shaper", None)
+            if shaper is not None and hasattr(shaper, "metrics"):
+                out.update(shaper.metrics())
+        except Exception:
+            pass
+        try:
+            reasoner = getattr(self, "_system2_reasoner", None)
+            if reasoner is not None and hasattr(reasoner, "metrics"):
+                out.update(reasoner.metrics())
+        except Exception:
+            pass
+        try:
+            meta = getattr(self, "_meta_learner", None)
+            if meta is not None and hasattr(meta, "metrics"):
+                out.update(meta.metrics())
+        except Exception:
+            pass
+        try:
+            out["dynamic_ui_state_type"] = str(getattr(self, "_dynamic_ui_state_type", "") or "")
+            out["dynamic_ui_exploration_actions"] = int(getattr(self, "_dynamic_ui_exploration_actions", 0) or 0)
+            out["dynamic_ui_epsilon"] = float(getattr(self, "_dynamic_ui_epsilon", 0.0) or 0.0)
+            metrics = getattr(self, "_dynamic_ui_state_metrics", None)
+            if isinstance(metrics, dict):
+                for k, v in metrics.items():
+                    try:
+                        out[f"dynamic_ui_{k}"] = float(v)
+                    except Exception:
+                        continue
         except Exception:
             pass
         try:

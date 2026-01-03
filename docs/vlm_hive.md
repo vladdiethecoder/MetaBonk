@@ -1,5 +1,8 @@
 # VLM Hive (System2 Cognitive Server)
 
+> **Deprecated (2026-01-03):** The SGLang-based cognitive server has been removed
+> from the active stack. This document is retained for historical context only.
+
 MetaBonk uses a centralized “System2” cognitive server to generate low-frequency,
 vision-language directives that can guide exploration when the policy appears stuck.
 
@@ -37,4 +40,3 @@ Cognitive-server-side (docker):
 - Orchestrator shows worker `vlm_hints_used` in `/status`.
 - The stack verifier includes an optional System2 metrics probe:
   - `python3 scripts/verify_running_stack.py --workers 5 --skip-cognitive=false`
-

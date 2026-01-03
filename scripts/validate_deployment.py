@@ -3,23 +3,18 @@
 Validate a live MetaBonk deployment (best-effort).
 
 Checks:
-- Cognitive server is reachable over ZMQ and responds with metrics.
+- Ollama System2 backend responds (best-effort).
 - Optionally probes worker /status endpoints.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
-
-try:
-    import zmq  # type: ignore
-except Exception:  # pragma: no cover
-    zmq = None  # type: ignore
 
 try:
     import requests  # type: ignore
@@ -27,38 +22,15 @@ except Exception:  # pragma: no cover
     requests = None  # type: ignore
 
 
-def _zmq_get_metrics(server_url: str, *, timeout_s: float) -> Optional[Dict[str, Any]]:
-    if zmq is None:
-        return None
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.DEALER)
-    sock.linger = 0
-    sock.setsockopt_string(zmq.IDENTITY, "metabonk-validator")
-    sock.connect(server_url)
+def _ollama_ok(url: str, *, timeout_s: float) -> bool:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        try:
-            sock.send_json({"type": "metrics", "timestamp": time.time()}, flags=zmq.NOBLOCK)
-        except Exception:
-            return None
-
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        deadline = time.time() + max(0.05, float(timeout_s))
-        while time.time() < deadline:
-            socks = dict(poller.poll(timeout=50))
-            if sock not in socks:
-                continue
-            try:
-                data = sock.recv(flags=zmq.NOBLOCK)
-                return json.loads(data.decode("utf-8"))
-            except Exception:
-                return None
-        return None
-    finally:
-        try:
-            sock.close(0)
-        except Exception:
-            pass
+        with urllib.request.urlopen(req, timeout=max(0.2, float(timeout_s))) as resp:
+            return 200 <= int(getattr(resp, "status", 200)) < 400
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return False
 
 
 def _probe_worker_status(port: int, *, timeout_s: float) -> Optional[Dict[str, Any]]:
@@ -78,10 +50,11 @@ def _probe_worker_status(port: int, *, timeout_s: float) -> Optional[Dict[str, A
 def main() -> int:
     ap = argparse.ArgumentParser(description="Validate a running MetaBonk stack (System2 + workers).")
     ap.add_argument(
-        "--cognitive-url",
-        default=os.environ.get("METABONK_COGNITIVE_SERVER_URL", "tcp://127.0.0.1:5555"),
-        help="ZeroMQ URL for cognitive server",
+        "--ollama-url",
+        default=os.environ.get("METABONK_OLLAMA_URL", "http://127.0.0.1:11434"),
+        help="Ollama base URL (default http://127.0.0.1:11434)",
     )
+    ap.add_argument("--skip-system2", action="store_true", help="Skip System2 (Ollama) validation")
     ap.add_argument("--workers", type=int, default=1, help="Number of worker /status endpoints to probe (0=skip)")
     ap.add_argument("--worker-base-port", type=int, default=5000)
     ap.add_argument("--timeout-s", type=float, default=2.0)
@@ -93,7 +66,7 @@ def main() -> int:
     print("=" * 32)
 
     # If workers are reachable and explicitly report System2 disabled, treat the
-    # cognitive server check as skipped (this script is best-effort and should
+    # System2 check as skipped (this script is best-effort and should
     # not fail deployments that intentionally run without System2).
     system2_enabled = None
     if int(args.workers) > 0 and requests is not None:
@@ -101,25 +74,22 @@ def main() -> int:
         if isinstance(st0, dict) and "system2_enabled" in st0:
             system2_enabled = bool(st0.get("system2_enabled", False))
 
-    if system2_enabled is False:
-        print("✅ Cognitive server: skipped (System2 disabled by worker config)")
+    backend_env = str(os.environ.get("METABONK_SYSTEM2_BACKEND", "") or "").strip().lower()
+    if args.skip_system2:
+        print("✅ System2: skipped (launcher requested)")
+    elif system2_enabled is False:
+        print("✅ System2: skipped (disabled by worker config)")
+    elif backend_env and backend_env != "ollama":
+        ok = False
+        print(f"❌ System2: unsupported backend={backend_env}")
     else:
-        metrics = _zmq_get_metrics(str(args.cognitive_url), timeout_s=float(args.timeout_s))
-        if metrics is None:
-            ok = False
-            if zmq is None:
-                print("❌ Cognitive server: pyzmq not installed (cannot validate ZMQ)")
-            else:
-                print(f"❌ Cognitive server: no response from {args.cognitive_url}")
+        base = str(args.ollama_url).rstrip("/")
+        ok_ollama = _ollama_ok(f"{base}/api/tags", timeout_s=float(args.timeout_s))
+        if ok_ollama:
+            print(f"✅ System2 (ollama): {base}")
         else:
-            print(f"✅ Cognitive server: {args.cognitive_url}")
-            try:
-                req = int(metrics.get("request_count") or 0)
-                agents = int(metrics.get("active_agents") or 0)
-                avg_ms = float(metrics.get("avg_latency_ms") or 0.0)
-                print(f"   requests={req} agents={agents} avg_latency_ms={avg_ms:.1f}")
-            except Exception:
-                pass
+            ok = False
+            print(f"❌ System2 (ollama): no response from {base}")
 
     if int(args.workers) > 0:
         if requests is None:

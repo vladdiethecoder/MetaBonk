@@ -1,10 +1,10 @@
 """Vision-Language menu navigator (optional).
 
 This implements the Apex Protocol's "Generalist Interface" idea:
-use a lightweight local VLM to read MegaBonk menus and propose actions
-without hard-coded coordinates. In recovery mode we expose a simple
-callable wrapper; integration into the worker state machine is left
-to follow-up work once real menu screenshots are plumbed.
+use a lightweight local VLM to read *arbitrary* game/application menus and
+propose actions without hard-coded coordinates. In recovery mode we expose a
+simple callable wrapper; integration into the worker state machine is left to
+follow-up work once real menu screenshots are plumbed.
 
 Backend: Ollama (local) with a vision-capable model (e.g., llava, qwen2.5-vl).
 If Ollama is not available, this module is a no-op.
@@ -29,7 +29,7 @@ class VLMConfig:
     temperature: float = 0.0
     max_tokens: int = 256
     system_prompt: str = (
-        "You are a menu navigation agent for the game MegaBonk. "
+        "You are a menu navigation agent for an unknown game/application. "
         "Given a screenshot and a goal, output a JSON action. "
         "Valid actions: click(target_text), click_xy(x,y), noop. "
         "Always respond with JSON only."
@@ -47,7 +47,7 @@ class VLMNavigator:
 
         Args:
             image_bytes: raw RGB/PNG/JPEG bytes.
-            goal: natural language goal, e.g. "Start Tier 3 run with Calcium".
+            goal: natural language goal, e.g. "Start a new run".
             state_hint: optional high-level state (Main Menu, Character Select).
         Returns:
             Parsed JSON dict, or {"action": "noop"} on failure.
@@ -78,4 +78,3 @@ class VLMNavigator:
             return data
         except Exception:
             return {"action": "noop"}
-

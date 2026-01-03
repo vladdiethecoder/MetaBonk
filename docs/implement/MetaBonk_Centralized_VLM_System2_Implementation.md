@@ -1,6 +1,9 @@
 # MetaBonk: Centralized VLM Inference for Multi-Instance System 2/3 Reasoning
 # Complete Autonomous Implementation Plan
 
+> **Deprecated (2026-01-03):** The SGLang-based cognitive server has been removed from the
+> active stack. This document is retained for historical context only.
+
 ## Executive Summary
 
 **Goal**: Deploy scalable System 2/3 reasoning for 8-16 concurrent MetaBonk instances using a centralized VLM inference architecture.

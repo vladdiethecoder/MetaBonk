@@ -69,6 +69,35 @@ Expected:
 - Game launcher:
   - `MEGABONK_GAME_DIR`, `MEGABONK_APPID`, `MEGABONK_PROTON`
   - `MEGABONK_USE_XVFB=1` for headless X11
+- UI/menu exploration (optional, game-agnostic):
+  - `METABONK_UI_EPS` (default: `0`) epsilon-greedy UI clicks when the screen is static ("stuck")
+  - `METABONK_UI_PRE_GAMEPLAY_GRACE_S` (default: `2.0`) delay before allowing pre-gameplay UI clicks
+  - `METABONK_UI_PRE_GAMEPLAY_EPS` (default: `0`) pre-gameplay epsilon-greedy UI clicks (before gameplay starts)
+  - `METABONK_DYNAMIC_UI_EXPLORATION` (default: `0`) classify menu vs gameplay and adjust epsilon automatically
+  - `METABONK_DYNAMIC_UI_USE_VLM_HINTS` (default: `0`) when exploring in `menu_ui`, bias clicks toward VLM-detected UI elements
+  - `METABONK_UI_VLM_HINTS_INTERVAL_S` (default: `1.0`) minimum seconds between VLM hint generations per worker
+  - `METABONK_DYNAMIC_EPS_BASE` / `METABONK_DYNAMIC_EPS_UI` / `METABONK_DYNAMIC_EPS_STUCK` override dynamic epsilons
+  - `METABONK_DYNAMIC_EPS_STUCK_WINDOW` / `METABONK_DYNAMIC_EPS_STUCK_MOTION_THRESH` tune stuck detection
+  - `METABONK_INTRINSIC_REWARD` (default: `0`) add intrinsic reward shaping on top of base reward (UI progression)
+  - `METABONK_INTRINSIC_UI_CHANGE_BONUS` / `METABONK_INTRINSIC_UI_CHANGE_HAMMING` reward meaningful UI changes (dHash distance)
+  - `METABONK_INTRINSIC_UI_TO_GAMEPLAY_BONUS` reward menu → gameplay transition (rising edge)
+  - `METABONK_INTRINSIC_STUCK_ESCAPE_BONUS` reward escaping stuck screens
+  - `METABONK_INTRINSIC_UI_NEW_SCENE_BONUS` / `METABONK_INTRINSIC_UI_MAX_SCENES` curiosity reward for novel UI screens
+  - `METABONK_INTRINSIC_APPLY_IN_PURE_VISION` apply intrinsic shaping in pure-vision runs (default off)
+  - `METABONK_INTRINSIC_USE_STATE_CLASSIFIER` enable heuristic UI/gameplay classifier inside shaper (default on)
+- System2 trigger/gating (optional, centralized VLM):
+  - `METABONK_SYSTEM2_TRIGGER_MODE` (default: `always`) `always` (legacy) or `smart` (menu/stuck/novel/periodic)
+  - `METABONK_SYSTEM2_TRIGGER_MENU` / `METABONK_SYSTEM2_TRIGGER_STUCK` / `METABONK_SYSTEM2_TRIGGER_NOVEL` enable smart triggers
+  - `METABONK_SYSTEM2_TRIGGER_PERIODIC_STEPS` deterministic periodic trigger (0 disables)
+  - `METABONK_SYSTEM2_TRIGGER_SCENE_COOLDOWN_S` minimum seconds between requests for the same `scene_hash`
+  - `METABONK_SYSTEM2_TRIGGER_CACHE_SIZE` max per-scene entries kept for cooldown tracking
+- UI meta-learning (optional, game-agnostic):
+  - `METABONK_META_LEARNING` (default: `0`) record successful menu click sequences and replay on similar screens
+  - `METABONK_META_LEARNER_PRE_GAMEPLAY_ONLY` (default: `1`) only apply suggestions before gameplay starts
+  - `METABONK_META_LEARNER_MIN_SIMILARITY` / `METABONK_META_LEARNER_FOLLOW_PROB` control match threshold + (deterministic) follow rate
+  - `METABONK_META_LEARNER_SCENE_COOLDOWN_S` throttle repeated clicks on the same matched scene
+  - `METABONK_META_LEARNER_MAX_SEQUENCES` / `METABONK_META_LEARNER_MAX_STEPS` bounds on stored history per worker
+  - `METABONK_META_LEARNER_MAX_SCENES` / `METABONK_META_LEARNER_BIN_GRID` scene memory + click quantization
 
 ## BepInEx + BonkLink
 

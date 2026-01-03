@@ -3,6 +3,10 @@
 **Version:** 2.0  
 **Date:** December 29, 2025  
 **Status:** Active Development  
+
+> **Note (2026-01-03):** The SGLang-based cognitive server has been removed from the
+> active stack. References to SGLang in this PRD are historical and should not
+> guide current deployments.
 **Repository:** https://github.com/vladdiethecoder/MetaBonk
 
 ---

@@ -1,5 +1,5 @@
 {
-  "_comment": "MetaBonk 24-hour stability test profile (headless-first, strict zero-copy, System2 enabled; selected backend: phi3_awq_sglang).",
+  "_comment": "MetaBonk 24-hour stability test profile (headless-first, strict zero-copy, System2 via Ollama).",
   "mode": "train",
   "workers": 5,
   "gamescope": {
@@ -7,7 +7,7 @@
     "height": 720
   },
   "ui": {
-    "enabled": false,
+    "enabled": true,
     "host": "127.0.0.1",
     "port": 5173,
     "install": false
@@ -24,27 +24,8 @@
   },
   "system2": {
     "enabled": true,
-    "server_url": "tcp://127.0.0.1:5555"
-  },
-  "cognitive_server": {
-    "enabled": true,
-    "compose_project": "metabonk-cognitive",
-    "env": {
-      "METABONK_COGNITIVE_BACKEND": "sglang",
-      "METABONK_COGNITIVE_MODEL_PATH": "/models/Phi_3_Vision_128k_Instruct_AWQ_4bit",
-      "METABONK_COGNITIVE_MODEL_SUBDIR": "Phi_3_Vision_128k_Instruct_AWQ_4bit",
-      "METABONK_COGNITIVE_QUANTIZATION": "awq_marlin",
-      "METABONK_COGNITIVE_CONTEXT_LEN": "2048",
-      "METABONK_COGNITIVE_MAX_REQS": "1",
-      "METABONK_COGNITIVE_MAX_CONCURRENCY": "1",
-      "METABONK_COGNITIVE_MAX_NEW_TOKENS": "12",
-      "METABONK_COGNITIVE_ALWAYS_SINGLE_FRAME": "1",
-      "METABONK_COGNITIVE_TILE_EDGE": "64",
-      "METABONK_COGNITIVE_STUCK_SINGLE_FRAME": "1",
-      "METABONK_COGNITIVE_TILE_EDGE_STUCK": "64",
-      "METABONK_COGNITIVE_SGLANG_MEM_FRACTION": "0.5",
-      "METABONK_COGNITIVE_SGLANG_DISABLE_CUDA_GRAPH": "1"
-    }
+    "backend": "ollama",
+    "model": "llava:7b"
   },
   "monitoring": {
     "enabled": true,
@@ -56,4 +37,3 @@
   },
   "optimize_5090": true
 }
-
