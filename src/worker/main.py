@@ -6754,14 +6754,13 @@ class WorkerService:
                     except Exception:
                         pass
 
-            # Optional System 2 (centralized VLM) directive -> UI click via BonkLink/UnityBridge.
+            # Optional System 2 (centralized VLM) directive -> UI click via input backend or BonkLink.
             # This keeps progression vision-only (no game state) while allowing System2 to target
-            # visible affordances.
+            # visible affordances. Works with xdotool, libxdo, or plugin-based backends.
             if (
                 forced_ui_click is None
                 and self._cognitive_client is not None
                 and frame_size is not None
-                and self._input_backend is None
                 and (bool(stuck) or not self._gameplay_started)
             ):
                 try:
@@ -7005,6 +7004,19 @@ class WorkerService:
             input_bootstrap = False
             if self._input_backend is not None:
                 self._input_send_actions(a_cont, a_disc)
+                # Route forced_ui_click through xdotool/libxdo click_at() for game-agnostic UI navigation.
+                if forced_ui_click is not None and frame_size is not None:
+                    try:
+                        w, h = frame_size
+                        if w > 0 and h > 0 and hasattr(self._input_backend, "click_at"):
+                            x_frac = float(forced_ui_click[0]) / float(w)
+                            y_frac = float(forced_ui_click[1]) / float(h)
+                            self._input_backend.click_at(x_frac, y_frac)
+                            self._dynamic_ui_exploration_actions = int(
+                                getattr(self, "_dynamic_ui_exploration_actions", 0) or 0
+                            ) + 1
+                    except Exception:
+                        pass
 
             self._action_guard_check(
                 action_source=action_source,

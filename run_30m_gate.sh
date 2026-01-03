@@ -44,19 +44,26 @@ PY
   echo >> "$LOG"
  done
 
-# GPU memory snapshot
-GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -n1 | tr -d ' ')
-GPU_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1 | tr -d ' ')
+# GPU memory snapshot (best-effort; do not fail gate)
+GPU_USED="unknown"
+GPU_TOTAL="unknown"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || echo "unknown")
+  GPU_TOTAL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || echo "unknown")
+fi
 
-# OOM since start
-OOM_COUNT=$(journalctl -k --since "$START_TS" 2>/dev/null | rg -i "out of memory|nvrm" | wc -l | tr -d ' ')
+# OOM since start (best-effort; journald may be restricted)
+OOM_COUNT=0
+if command -v journalctl >/dev/null 2>&1; then
+  OOM_COUNT=$(journalctl -k --since "$START_TS" 2>/dev/null | rg -i "out of memory|nvrm" | wc -l | tr -d ' ' || echo "0")
+fi
 
 # GO/NO-GO criteria
 GO=1
 if [ "$responding" -lt 4 ]; then GO=0; fi
 if [ "$intrinsic_any" -ne 1 ]; then GO=0; fi
 if [ "$OOM_COUNT" -gt 0 ]; then GO=0; fi
-if [ -n "$GPU_USED" ] && [ "$GPU_USED" -gt 26000 ]; then GO=0; fi
+if [[ "$GPU_USED" =~ ^[0-9]+$ ]] && [ "$GPU_USED" -gt 26000 ]; then GO=0; fi
 
 {
   echo "=== 30-min gate @ ${now} ==="
